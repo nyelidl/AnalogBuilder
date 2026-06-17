@@ -309,6 +309,70 @@ def svg_img(mol, highlight=None, size=(500, 380)):
     return f'<img src="data:image/svg+xml;base64,{b64}" style="max-width:100%;border-radius:10px;border:1px solid #E0D6C8;">'
 
 
+def _render_step1_receptor_and_continue(smiles: str, name: str):
+    """Shared Step-1 footer: receptor loader (structure mode) + continue button.
+    Used by both the paste layout and the full-width draw layout."""
+    md = st.session_state.mode
+
+    if md == "structure":
+        st.markdown("### Protein receptor")
+        info_card("The receptor is the protein your compound binds to. "
+                  "Find its PDB ID on <a href='https://www.rcsb.org' target='_blank'>rcsb.org</a>.")
+        rec_src = st.radio("Load receptor from", ["PDB ID (download)", "Upload PDB file"], horizontal=True)
+
+        if rec_src == "PDB ID (download)":
+            pdb_id = st.text_input("4-letter PDB ID", value="1M17", max_chars=4)
+            hint("Example: 1M17 is EGFR. Type the code and click Load.")
+            if st.button("Load receptor", key="load_rec"):
+                with st.spinner("Downloading from RCSB…"):
+                    try:
+                        work = get_work_dir()
+                        path = core.download_pdb(pdb_id.strip().upper(), work)
+                        prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                        st.session_state.receptor_path   = path
+                        st.session_state.protein_path    = prot
+                        st.session_state.complex_path    = path
+                        st.session_state.ref_ligand_path = lig
+                        st.success(f"Receptor loaded ({pdb_id.upper()}) ✅")
+                    except Exception as e:
+                        st.error(f"Could not download: {e}")
+        else:
+            up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"])
+            if up:
+                work = get_work_dir()
+                raw = work / up.name
+                raw.write_bytes(up.read())
+                try:
+                    path = core.cif_to_pdb_if_needed(str(raw))
+                    prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                    st.session_state.receptor_path   = path
+                    st.session_state.protein_path    = prot
+                    st.session_state.complex_path    = path
+                    st.session_state.ref_ligand_path = lig
+                    st.success("Receptor uploaded ✅")
+                except Exception as e:
+                    st.error(f"Could not process file: {e}")
+
+    st.write("")
+    if md == "structure" and not st.session_state.receptor_path:
+        st.caption("⚠️ Load a receptor above before continuing.")
+
+    if st.button("Load compound & continue →", type="primary", disabled=not bool(smiles and smiles.strip())):
+        mol = Chem.MolFromSmiles(smiles.strip())
+        if mol is None:
+            st.error("That SMILES doesn't look right. Check for typos and try again.")
+        elif md == "structure" and not st.session_state.receptor_path:
+            st.error("Please load a receptor before continuing.")
+        else:
+            AllChem.Compute2DCoords(mol)
+            st.session_state.parent_smiles  = smiles.strip()
+            st.session_state.parent_name    = name.strip() or "compound"
+            st.session_state.parent_mol     = mol
+            st.session_state.selected_atoms = set()
+            st.session_state.analogs_df     = None
+            go(2)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar – progress tracker
 # ─────────────────────────────────────────────────────────────────────────────
@@ -486,17 +550,57 @@ st.markdown(f"## {steps[step-1]}")
 # ─────────────────────────────────────────────────────────────────────────────
 
 if step == 1:
-    col_form, col_mol = st.columns([1, 1], gap="large")
+    # Input-mode toggle spans full width so it's visible in both layouts
+    input_tab = st.radio(
+        "How do you want to enter your compound?",
+        ["⌨️ Paste SMILES", "✏️ Draw it"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with col_form:
-        input_tab = st.radio(
-            "How do you want to enter your compound?",
-            ["⌨️ Paste SMILES", "✏️ Draw it"],
-            horizontal=True,
-            label_visibility="collapsed",
+    draw_mode = (input_tab == "✏️ Draw it") and _KETCHER_OK
+
+    # ── DRAW MODE: full-width sketcher, preview + form below ──────────────────
+    if draw_mode:
+        hint("Draw your molecule, then click **Apply** in the sketcher to capture it.")
+        drawn = st_ketcher(
+            st.session_state.parent_smiles or "",
+            key="ketcher_draw",
+            height=480,
         )
+        smiles = drawn or st.session_state.parent_smiles
 
-        if input_tab == "⌨️ Paste SMILES":
+        prev_col, form_col = st.columns([1, 1], gap="large")
+        with prev_col:
+            mol_preview = Chem.MolFromSmiles(smiles.strip()) if smiles and smiles.strip() else None
+            if mol_preview:
+                AllChem.Compute2DCoords(mol_preview)
+                c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
+                st.markdown("**Preview** — highlighted atoms can be modified")
+                st.markdown(svg_img(mol_preview, highlight=c_sites), unsafe_allow_html=True)
+                st.caption(f"Captured SMILES: `{smiles}`  ·  {mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
+            else:
+                st.markdown(
+                    '<div style="background:#F0EAE0;border-radius:12px;height:240px;'
+                    'display:flex;align-items:center;justify-content:center;color:#A89070;">'
+                    '<span style="font-size:0.9rem;">Draw a molecule and click Apply to see the preview</span></div>',
+                    unsafe_allow_html=True
+                )
+        with form_col:
+            name = st.text_input("Give it a short name", value=st.session_state.parent_name, placeholder="e.g. compound_1")
+            hint("Used to label your output files.")
+            _render_step1_receptor_and_continue(smiles, name)
+
+    # ── PASTE MODE (or sketcher unavailable): side-by-side ───────────────────
+    else:
+        col_form, col_mol = st.columns([1, 1], gap="large")
+
+        with col_form:
+            if input_tab == "✏️ Draw it" and not _KETCHER_OK:
+                st.warning(
+                    "The drawing tool isn't installed here. Add `streamlit-ketcher` to "
+                    "requirements.txt to enable it. For now, paste a SMILES instead."
+                )
             smiles = st.text_area(
                 "Paste your compound SMILES",
                 value=st.session_state.parent_smiles,
@@ -504,115 +608,32 @@ if step == 1:
                 placeholder="e.g. CC1=CC=CC=C1",
             )
             hint("SMILES is a text code for a molecule. Copy it from ChemDraw, PubChem, or any chemistry database.")
-        else:
-            if _KETCHER_OK:
-                hint("Draw your molecule, then click **Apply** in the sketcher to capture it.")
-                drawn = st_ketcher(
-                    st.session_state.parent_smiles or "",
-                    key="ketcher_draw",
-                    height=400,
-                )
-                smiles = drawn or st.session_state.parent_smiles
-                if smiles:
-                    st.caption(f"Captured SMILES: `{smiles}`")
+
+            name = st.text_input("Give it a short name", value=st.session_state.parent_name, placeholder="e.g. compound_1")
+            hint("Used to label your output files.")
+            _render_step1_receptor_and_continue(smiles, name)
+
+        with col_mol:
+            mol_preview = Chem.MolFromSmiles(smiles.strip()) if smiles.strip() else None
+            if mol_preview:
+                AllChem.Compute2DCoords(mol_preview)
+                c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
+                st.markdown("**Preview** — highlighted atoms can be modified")
+                st.markdown(svg_img(mol_preview, highlight=c_sites), unsafe_allow_html=True)
+                st.caption(f"{mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
             else:
-                st.warning(
-                    "The drawing tool isn't installed here. Add `streamlit-ketcher` to "
-                    "requirements.txt to enable it. For now, paste a SMILES instead."
-                )
-                smiles = st.text_area(
-                    "Paste your compound SMILES",
-                    value=st.session_state.parent_smiles,
-                    height=90,
-                    placeholder="e.g. CC1=CC=CC=C1",
+                st.markdown(
+                    '<div style="background:#F0EAE0;border-radius:12px;height:320px;'
+                    'display:flex;align-items:center;justify-content:center;color:#A89070;">'
+                    '<span style="font-size:0.9rem;">Molecule preview appears here</span></div>',
+                    unsafe_allow_html=True
                 )
 
-        name = st.text_input("Give it a short name", value=st.session_state.parent_name, placeholder="e.g. compound_1")
-        hint("Used to label your output files.")
-
-        # Structure-based: receptor
-        if mode == "structure":
-            st.markdown("### Protein receptor")
-            info_card("The receptor is the protein your compound binds to. "
-                      "Find its PDB ID on <a href='https://www.rcsb.org' target='_blank'>rcsb.org</a>.")
-            rec_src = st.radio("Load receptor from", ["PDB ID (download)", "Upload PDB file"], horizontal=True)
-
-            if rec_src == "PDB ID (download)":
-                pdb_id = st.text_input("4-letter PDB ID", value="1M17", max_chars=4)
-                hint("Example: 1M17 is EGFR. Type the code and click Load.")
-                load_rec = st.button("Load receptor", key="load_rec")
-                if load_rec:
-                    with st.spinner("Downloading from RCSB…"):
-                        try:
-                            work = get_work_dir()
-                            path = core.download_pdb(pdb_id.strip().upper(), work)
-                            prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
-                            st.session_state.receptor_path = path
-                            st.session_state.protein_path  = prot
-                            st.session_state.complex_path  = path
-                            st.session_state.ref_ligand_path = lig
-                            st.success(f"Receptor loaded ({pdb_id.upper()}) ✅")
-                        except Exception as e:
-                            st.error(f"Could not download: {e}")
-            else:
-                up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"])
-                if up:
-                    work = get_work_dir()
-                    raw = work / up.name
-                    raw.write_bytes(up.read())
-                    try:
-                        path = core.cif_to_pdb_if_needed(str(raw))
-                        prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
-                        st.session_state.receptor_path   = path
-                        st.session_state.protein_path    = prot
-                        st.session_state.complex_path    = path
-                        st.session_state.ref_ligand_path = lig
-                        st.success("Receptor uploaded ✅")
-                    except Exception as e:
-                        st.error(f"Could not process file: {e}")
-
-        st.write("")
-        can_proceed = True
-        if mode == "structure" and not st.session_state.receptor_path:
-            can_proceed = False
-            st.caption("⚠️ Load a receptor above before continuing.")
-
-        if st.button("Load compound & continue →", type="primary", disabled=not bool(smiles.strip())):
-            mol = Chem.MolFromSmiles(smiles.strip())
-            if mol is None:
-                st.error("That SMILES doesn't look right. Check for typos and try again.")
-            elif mode == "structure" and not st.session_state.receptor_path:
-                st.error("Please load a receptor before continuing.")
-            else:
-                AllChem.Compute2DCoords(mol)
-                st.session_state.parent_smiles  = smiles.strip()
-                st.session_state.parent_name    = name.strip() or "compound"
-                st.session_state.parent_mol     = mol
-                st.session_state.selected_atoms = set()
-                st.session_state.analogs_df     = None
-                go(2)
-
-    with col_mol:
-        mol_preview = Chem.MolFromSmiles(smiles.strip()) if smiles.strip() else None
-        if mol_preview:
-            AllChem.Compute2DCoords(mol_preview)
-            c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
-            st.markdown("**Preview** — highlighted atoms can be modified")
-            st.markdown(svg_img(mol_preview, highlight=c_sites), unsafe_allow_html=True)
-            st.caption(f"{mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
-        else:
-            st.markdown(
-                '<div style="background:#F0EAE0;border-radius:12px;height:320px;'
-                'display:flex;align-items:center;justify-content:center;color:#A89070;">'
-                '<span style="font-size:0.9rem;">Molecule preview appears here</span></div>',
-                unsafe_allow_html=True
-            )
-
-        if mode == "structure" and st.session_state.receptor_path:
-            st.markdown("**Receptor status**")
-            st.success(f"✅ {Path(st.session_state.receptor_path).name}")
-            if st.session_state.ref_ligand_path:
-                st.info("Co-crystal ligand detected — will be used as reference pose")
+            if mode == "structure" and st.session_state.receptor_path:
+                st.markdown("**Receptor status**")
+                st.success(f"✅ {Path(st.session_state.receptor_path).name}")
+                if st.session_state.ref_ligand_path:
+                    st.info("Co-crystal ligand detected — will be used as reference pose")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
