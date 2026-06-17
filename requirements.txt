@@ -1,30 +1,27 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Analog Builder — Python dependencies for cloud deployment
+# Analog Builder — Python dependencies
 #
-# CORE ONLY. These four run the full design workflow (Steps 1–4 + export).
-# The app degrades gracefully: docking / PLIP / cIFP features show an
-# "install X" hint instead of crashing when their tools are absent.
-#
-# rdkit pinned <2026 (2025.9.6 is newest compatible) so that if you later
-# add anyonecandock locally, its dimorphite-dl dependency still resolves.
+# CORE — full design workflow (Steps 1–4 + export)
 # ─────────────────────────────────────────────────────────────────────────────
 streamlit==1.58.0
+streamlit-ketcher==0.0.1
 rdkit==2025.9.6
 pandas==3.0.3
 numpy==2.4.6
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCKING (Step 5)
+# anyonecandock auto-downloads the AutoDock Vina 1.2.7 binary at runtime,
+# but needs the `obabel` system binary — provided via packages.txt (apt).
+# rdkit is pinned <2026 because anyonecandock -> dimorphite-dl needs rdkit<2026.
+# ─────────────────────────────────────────────────────────────────────────────
 anyonecandock==1.1.3
 gemmi==0.7.5
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOCAL-ONLY — do NOT uncomment for Streamlit Cloud.
-#
-# These do not build on Streamlit Cloud's Python 3.14 image:
-#   - plip pulls in the `openbabel` PIP package, which compiles from C++/SWIG
-#     and fails ("SWIG failed. Is Open Babel installed?").
-#   - anyonecandock is heavy (prody, meeko, biopython, scipy) and needs the
-#     AutoDock Vina binary at runtime, which Cloud cannot provide.
-#
-# To run docking locally instead:
-#   conda install -c conda-forge openbabel vina
-#   pip install anyonecandock gemmi plip pkanet-cloud
+# DO NOT add `plip` or `openbabel` here.
+# The PIP `openbabel` package compiles from C++/SWIG and FAILS on Streamlit
+# Cloud ("SWIG failed"). PLIP pulls it in, so PLIP is unavailable on Cloud —
+# the app automatically falls back to distance-contact cIFP instead.
+# For PLIP locally:  conda install -c conda-forge openbabel && pip install plip
 # ─────────────────────────────────────────────────────────────────────────────
