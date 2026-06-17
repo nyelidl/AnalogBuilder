@@ -953,6 +953,33 @@ def run_command(cmd: List[str], log_path: Optional[str] = None) -> Tuple[int, st
     return proc.returncode, output
 
 
+def best_score_for_compound(out_dir: str, compound: str) -> Optional[float]:
+    """Read the best (lowest) docking score for one named compound.
+    Matches CSVs whose path contains the compound's safe token, so it returns
+    that compound's score rather than the global best across all runs."""
+    token = _safe_file_token(compound)
+    best = None
+    for csv_path in glob.glob(str(Path(out_dir) / "**" / "*.csv"), recursive=True):
+        if token not in Path(csv_path).name and token not in str(Path(csv_path).parent.name):
+            continue
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        score_cols = [c for c in df.columns if re.search(r"score|energy|affinity|binding", c, re.I)]
+        if not score_cols:
+            continue
+        sc = score_cols[0]
+        vals = pd.to_numeric(df[sc], errors="coerce").dropna()
+        if vals.empty:
+            continue
+        m = float(vals.min())
+        best = m if best is None else min(best, m)
+    return best
+
+
 def parse_acd_score_csvs(out_dir: str) -> Optional[Dict]:
     best_rows = []
     for csv_path in glob.glob(str(Path(out_dir) / "**" / "*.csv"), recursive=True):
