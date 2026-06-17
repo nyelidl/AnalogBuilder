@@ -1,4 +1,17 @@
+# ── Core (always required) ──────────────────────────────────────────────────
 streamlit>=1.35.0
 rdkit>=2023.9.1
 pandas>=2.0.0
 numpy>=1.24.0
+ 
+# ── Docking (required for Step 5 docking features) ─────────────────────────
+anyonecandock
+ 
+# ── Optional: better protonation state assignment ──────────────────────────
+# pkanet-cloud[recommended]
+ 
+# ── Optional: PLIP interaction fingerprints ────────────────────────────────
+# plip
+ 
+# ── Optional: mmCIF → PDB conversion (needed if you upload .cif files) ─────
+# gemmi
