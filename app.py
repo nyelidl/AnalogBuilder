@@ -1,91 +1,241 @@
 """
-app.py — Streamlit web application for the Analog Designer.
-
-Workflow mirrors the original notebook:
-  Step 1  · Parent ligand + design route
-  Step 2  · Atom selection
-  Step 3  · Design settings (goals, fragment options, pocket guidance)
-  Step 4  · Generate analogs
-  Step 5  · Docking + PLIP/cIFP validation (optional)
-  Export  · Download results
+app.py — ⌬+⌬ Analog Builder · Streamlit web application
+Redesigned UX: warm tones, student-friendly, two separate tracks,
+sidebar progress indicator, advanced options collapsed.
 """
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
 import shlex
 import shutil
-import subprocess
 import tempfile
 import zipfile
-from pathlib import Path
 from collections import Counter
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
-from rdkit.Chem.Draw import rdMolDraw2D
 
 import core
 
-# ---------------------------------------------------------------------------
-# Page configuration
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Page config + global CSS
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Analog Designer",
-    page_icon="🧬",
+    page_title="⌬+⌬ Analog Builder",
+    page_icon="⌬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ---------------------------------------------------------------------------
-# Session-state defaults
-# ---------------------------------------------------------------------------
+st.markdown("""
+<style>
+/* ── Warm base ── */
+[data-testid="stAppViewContainer"] {
+    background: #FAF7F2;
+}
+[data-testid="stSidebar"] {
+    background: #F0EAE0;
+    border-right: 1px solid #E0D6C8;
+}
+
+/* ── Typography ── */
+html, body, [class*="css"] {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #2C2C2C;
+}
+h1 { font-size: 1.6rem !important; font-weight: 700; color: #2C2C2C; }
+h2 { font-size: 1.2rem !important; font-weight: 600; color: #2C2C2C; }
+h3 { font-size: 1.0rem !important; font-weight: 600; color: #3D7A74; }
+
+/* ── Primary button: amber ── */
+[data-testid="stButton"] > button[kind="primary"] {
+    background: #E8A020 !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    padding: 0.5rem 1.4rem !important;
+}
+[data-testid="stButton"] > button[kind="primary"]:hover {
+    background: #C88010 !important;
+}
+
+/* ── Secondary button ── */
+[data-testid="stButton"] > button {
+    border-radius: 8px !important;
+    border: 1px solid #C8B89A !important;
+    background: #FAF7F2 !important;
+    color: #2C2C2C !important;
+}
+
+/* ── Mode cards on landing ── */
+.mode-card {
+    background: #FFFFFF;
+    border: 2px solid #E0D6C8;
+    border-radius: 14px;
+    padding: 2rem 1.5rem;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+.mode-card:hover {
+    border-color: #E8A020;
+    box-shadow: 0 4px 16px rgba(232,160,32,0.15);
+}
+.mode-card .icon { font-size: 3rem; margin-bottom: 0.5rem; }
+.mode-card h2 { color: #2C2C2C; margin: 0.4rem 0 0.6rem; }
+.mode-card p { color: #6B5E4E; font-size: 0.9rem; line-height: 1.5; margin: 0; }
+
+/* ── Step progress in sidebar ── */
+.step-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 10px;
+    border-radius: 8px;
+    margin-bottom: 4px;
+    font-size: 0.88rem;
+    color: #6B5E4E;
+    cursor: pointer;
+}
+.step-item.active {
+    background: #E8A020;
+    color: #fff;
+    font-weight: 600;
+}
+.step-item.done {
+    color: #3D7A74;
+    font-weight: 500;
+}
+.step-dot {
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: #E0D6C8;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.75rem; font-weight: 700; flex-shrink: 0;
+    color: #6B5E4E;
+}
+.step-item.active .step-dot { background: rgba(255,255,255,0.3); color: #fff; }
+.step-item.done .step-dot { background: #3D7A74; color: #fff; }
+
+/* ── Hint text ── */
+.hint { color: #8B7355; font-size: 0.82rem; margin-top: -6px; margin-bottom: 10px; }
+
+/* ── Info cards ── */
+.info-card {
+    background: #FFF8EE;
+    border-left: 3px solid #E8A020;
+    border-radius: 0 8px 8px 0;
+    padding: 0.7rem 1rem;
+    margin: 0.5rem 0 1rem;
+    font-size: 0.88rem;
+    color: #5A4A35;
+}
+
+/* ── Metric row ── */
+.metric-row {
+    display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0;
+}
+.metric-box {
+    background: #fff;
+    border: 1px solid #E0D6C8;
+    border-radius: 10px;
+    padding: 0.8rem 1.2rem;
+    min-width: 120px;
+    text-align: center;
+}
+.metric-box .val { font-size: 1.5rem; font-weight: 700; color: #E8A020; }
+.metric-box .lbl { font-size: 0.78rem; color: #8B7355; margin-top: 2px; }
+
+/* ── Dataframe tweaks ── */
+[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
+
+/* ── Expander (Advanced) ── */
+[data-testid="stExpander"] summary {
+    font-size: 0.85rem;
+    color: #8B7355;
+}
+
+/* ── Fixed page footer ── */
+.page-footer {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    background: #F0EAE0;
+    border-top: 1px solid #E0D6C8;
+    padding: 6px 20px;
+    font-size: 0.75rem;
+    color: #A89070;
+    z-index: 999;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.page-footer a { color: #A89070; text-decoration: none; }
+.page-footer a:hover { color: #E8A020; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown(
+    '<div class="page-footer">' +
+    '⌬+⌬ Analog Builder &nbsp;—&nbsp;' +
+    '<a href="mailto:kowith@ccs.tsukuba.ac.jp">kowith@ccs.tsukuba.ac.jp</a>' +
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session state
+# ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULTS = {
-    "parent_smiles": "O=C1OC2=C(C=CC=C2)C(O)=C1C(C3=CC=CC=C3)C4=C(O)C5=CC=CC=C5OC4=O",
-    "parent_name": "parent",
+    # Navigation
+    "mode": None,               # "ligand" | "structure"
+    "step": 1,                  # current step within a track
+    # Step 1
+    "parent_smiles": "",
+    "parent_name": "compound",
     "parent_mol": None,
-    "design_workflow": "Ligand-based",
+    # Step 1B (structure only)
+    "receptor_path": None,
+    "protein_path": None,
+    "complex_path": None,
+    "ref_ligand_path": None,
     # Step 2
     "selected_atoms": set(),
     "concerted": False,
-    # Step 3
+    "allow_heteroatom_H": False,
+    # Step 3 – quick (always visible)
+    "risk": "Moderate",
+    "n_analogs": 50,
+    "rank_by": "Balanced",
+    # Step 3 – advanced (collapsed)
     "weights": {"potency": 30, "selectivity": 10, "solubility": 25,
                 "metabolic": 15, "synthesis": 10, "novelty": 10},
     "categories_on": {k: True for k in core.CATEGORY_BASE_GOALS},
-    "risk": "Moderate",
-    "n_analogs": 50,
     "max_MW": 600.0,
     "avoid_nitro": True,
     "avoid_aldehyde": True,
     "avoid_reactive": True,
     "avoid_toxic": True,
-    "avoid_large_MW": True,
-    "rank_by": "Balanced (100-pt weights)",
     "custom_frags_text": "",
-    "allow_heteroatom_H": False,
-    "pocket_guidance_source": "Off",
+    # Step 3C pocket guidance (structure track)
     "pocket_residue_text": "",
     "accept_pocket_suggestions": True,
-    "pocket_mode": "Blend with selected options",
     "max_pocket_frags": 6,
-    # Step 4 results
-    "analogs_df": None,
     "pocket_frags": [],
-    "strategy_df": None,
+    # Step 4
+    "analogs_df": None,
     # Step 5 docking
-    "receptor_pdb_id": "1M17",
-    "receptor_path": None,
-    "protein_path": None,
-    "complex_path": None,
-    "ref_ligand_path": None,
     "docking_ligands": None,
-    "docking_summary": None,
     "cifp_results": None,
     "work_dir": None,
 }
@@ -97,414 +247,572 @@ for k, v in DEFAULTS.items():
 
 def get_work_dir() -> Path:
     if st.session_state.work_dir is None:
-        st.session_state.work_dir = Path(tempfile.mkdtemp(prefix="analog_designer_"))
+        st.session_state.work_dir = Path(tempfile.mkdtemp(prefix="analog_"))
     return Path(st.session_state.work_dir)
 
 
-# ---------------------------------------------------------------------------
-# Sidebar navigation
-# ---------------------------------------------------------------------------
-
-st.sidebar.title("🧬 Analog Designer")
-st.sidebar.markdown("**Structure-guided analog generation**")
-
-PAGES = [
-    "1 · Parent Ligand",
-    "2 · Atom Selection",
-    "3 · Design Settings",
-    "4 · Generate Analogs",
-    "5 · Docking & cIFP",
-    "📦 Export",
-]
-page = st.sidebar.radio("Navigate", PAGES, label_visibility="collapsed")
-
-st.sidebar.divider()
-st.sidebar.caption(
-    "Powered by RDKit · Anyone Can Dock · pKaNET · PLIP\n\n"
-    "Fragment library: " + str(len(core.BUILTIN_LIBRARY)) + " built-in fragments"
-)
+def go(step: int):
+    st.session_state.step = step
+    st.rerun()
 
 
-# ---------------------------------------------------------------------------
-# Helper: molecule SVG
-# ---------------------------------------------------------------------------
+def hint(text: str):
+    st.markdown(f'<p class="hint">💡 {text}</p>', unsafe_allow_html=True)
 
-def mol_svg(mol, highlight=None, size=(480, 380)):
+
+def info_card(text: str):
+    st.markdown(f'<div class="info-card">{text}</div>', unsafe_allow_html=True)
+
+
+def svg_img(mol, highlight=None, size=(500, 380)):
     if mol is None:
         return ""
-    return core.draw_mol_svg(mol, highlight=list(highlight or []), size=size)
-
-
-def svg_to_img_tag(svg: str) -> str:
-    import base64
+    svg = core.draw_mol_svg(mol, highlight=list(highlight or []), size=size)
     b64 = base64.b64encode(svg.encode()).decode()
-    return f'<img src="data:image/svg+xml;base64,{b64}" style="max-width:100%;">'
+    return f'<img src="data:image/svg+xml;base64,{b64}" style="max-width:100%;border-radius:10px;border:1px solid #E0D6C8;">'
 
 
-# ---------------------------------------------------------------------------
-# PAGE 1 · Parent Ligand
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar – progress tracker
+# ─────────────────────────────────────────────────────────────────────────────
 
-if page == "1 · Parent Ligand":
-    st.title("Step 1 · Parent Ligand & Design Route")
+LIGAND_STEPS  = ["Parent compound", "Choose atoms", "Design options", "View results", "Export"]
+STRUCT_STEPS  = ["Parent + receptor", "Choose atoms", "Pocket guidance", "View results", "Docking & cIFP", "Export"]
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        smiles_input = st.text_area(
-            "Parent SMILES",
+def render_sidebar():
+    st.sidebar.markdown("## ⌬+⌬ Analog Builder")
+    st.sidebar.caption("Ligand design for everyone")
+    st.sidebar.divider()
+
+    mode = st.session_state.mode
+    if mode is None:
+        st.sidebar.markdown('<p style="color:#8B7355;font-size:0.85rem;">Select a mode to begin.</p>',
+                            unsafe_allow_html=True)
+        return
+
+    steps = LIGAND_STEPS if mode == "ligand" else STRUCT_STEPS
+    current = st.session_state.step
+
+    st.sidebar.markdown(
+        f'<p style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.08em;'
+        f'color:#8B7355;margin-bottom:8px;">{"Ligand-based" if mode=="ligand" else "Structure-based"} track</p>',
+        unsafe_allow_html=True
+    )
+
+    for i, label in enumerate(steps, start=1):
+        cls = "active" if i == current else ("done" if i < current else "")
+        if st.sidebar.button(
+            f"{'●' if i == current else ('✓' if i < current else str(i))}  {label}",
+            key=f"nav_{i}",
+            use_container_width=True,
+            type="primary" if i == current else "secondary",
+        ):
+            if i < current or (i == current + 1 and _step_complete(current)):
+                go(i)
+
+    st.sidebar.divider()
+    if st.sidebar.button("↩ Change mode", use_container_width=True):
+        st.session_state.mode = None
+        st.session_state.step = 1
+        st.session_state.parent_mol = None
+        st.session_state.analogs_df = None
+        st.rerun()
+
+    st.sidebar.caption(f"Fragment library: {len(core.BUILTIN_LIBRARY)} groups")
+    st.sidebar.divider()
+    st.sidebar.markdown(
+        '<p style="font-size:0.75rem;color:#A89070;line-height:1.5;margin:0;">'
+        '⌬+⌬ Analog Builder<br>'
+        '<a href="mailto:kowith@ccs.tsukuba.ac.jp" style="color:#A89070;">kowith@ccs.tsukuba.ac.jp</a>'
+        '</p>',
+        unsafe_allow_html=True,
+    )
+
+
+def _step_complete(step: int) -> bool:
+    if step == 1:
+        return st.session_state.parent_mol is not None
+    if step == 2:
+        return len(st.session_state.selected_atoms) > 0
+    if step == 3:
+        return True
+    if step == 4:
+        return st.session_state.analogs_df is not None
+    return True
+
+
+render_sidebar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LANDING – mode picker
+# ─────────────────────────────────────────────────────────────────────────────
+
+if st.session_state.mode is None:
+    st.markdown("## ⌬+⌬ Analog Builder")
+    st.markdown(
+        "Design new drug candidates by modifying a parent compound. "
+        "Choose how you want to work:"
+    )
+    st.write("")
+
+    col_l, col_r = st.columns(2, gap="large")
+
+    with col_l:
+        st.markdown("""
+        <div class="mode-card">
+            <div class="icon">💊</div>
+            <h2>Ligand-based</h2>
+            <p>Start with just a SMILES string.<br>
+            Great for exploring substitutions quickly — no protein structure needed.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        st.write("")
+        if st.button("Start ligand-based →", type="primary", use_container_width=True, key="pick_ligand"):
+            st.session_state.mode = "ligand"
+            st.session_state.step = 1
+            st.rerun()
+
+    with col_r:
+        st.markdown("""
+        <div class="mode-card">
+            <div class="icon">🔬</div>
+            <h2>Structure-based</h2>
+            <p>Upload or fetch a protein structure.<br>
+            Analogs are guided by the actual binding pocket environment.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        st.write("")
+        if st.button("Start structure-based →", type="primary", use_container_width=True, key="pick_struct"):
+            st.session_state.mode = "structure"
+            st.session_state.step = 1
+            st.rerun()
+
+    st.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared header
+# ─────────────────────────────────────────────────────────────────────────────
+
+mode  = st.session_state.mode
+step  = st.session_state.step
+steps = LIGAND_STEPS if mode == "ligand" else STRUCT_STEPS
+
+track_label = "💊 Ligand-based" if mode == "ligand" else "🔬 Structure-based"
+st.markdown(
+    f'<p style="font-size:0.8rem;color:#8B7355;margin-bottom:0;">{track_label} &nbsp;›&nbsp; '
+    f'Step {step} of {len(steps)}: <strong>{steps[step-1]}</strong></p>',
+    unsafe_allow_html=True
+)
+st.markdown(f"## {steps[step-1]}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 – Parent compound  (both tracks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if step == 1:
+    col_form, col_mol = st.columns([1, 1], gap="large")
+
+    with col_form:
+        smiles = st.text_area(
+            "Paste your compound SMILES",
             value=st.session_state.parent_smiles,
-            height=80,
-            help="Paste the SMILES of the parent compound you want to elaborate.",
+            height=90,
+            placeholder="e.g. CC1=CC=CC=C1",
         )
-        parent_name = st.text_input("Compound name", value=st.session_state.parent_name)
-        workflow = st.radio(
-            "Design workflow",
-            ["Ligand-based", "Structure-based"],
-            index=0 if st.session_state.design_workflow == "Ligand-based" else 1,
-            horizontal=True,
-            help=(
-                "**Ligand-based**: skip receptor docking; use the library and pocket residues you paste manually.\n\n"
-                "**Structure-based**: dock the parent into a receptor first, then use the pocket environment automatically."
-            ),
-        )
+        hint("SMILES is a text code for a molecule. You can copy it from ChemDraw, PubChem, or any chemistry database.")
 
-        if st.button("Load parent", type="primary"):
-            mol = Chem.MolFromSmiles(smiles_input.strip())
+        name = st.text_input("Give it a short name", value=st.session_state.parent_name, placeholder="e.g. compound_1")
+        hint("Used to label your output files.")
+
+        # Structure-based: receptor
+        if mode == "structure":
+            st.markdown("### Protein receptor")
+            info_card("The receptor is the protein your compound binds to. "
+                      "Find its PDB ID on <a href='https://www.rcsb.org' target='_blank'>rcsb.org</a>.")
+            rec_src = st.radio("Load receptor from", ["PDB ID (download)", "Upload PDB file"], horizontal=True)
+
+            if rec_src == "PDB ID (download)":
+                pdb_id = st.text_input("4-letter PDB ID", value="1M17", max_chars=4)
+                hint("Example: 1M17 is EGFR. Type the code and click Load.")
+                load_rec = st.button("Load receptor", key="load_rec")
+                if load_rec:
+                    with st.spinner("Downloading from RCSB…"):
+                        try:
+                            work = get_work_dir()
+                            path = core.download_pdb(pdb_id.strip().upper(), work)
+                            prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                            st.session_state.receptor_path = path
+                            st.session_state.protein_path  = prot
+                            st.session_state.complex_path  = path
+                            st.session_state.ref_ligand_path = lig
+                            st.success(f"Receptor loaded ({pdb_id.upper()}) ✅")
+                        except Exception as e:
+                            st.error(f"Could not download: {e}")
+            else:
+                up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"])
+                if up:
+                    work = get_work_dir()
+                    raw = work / up.name
+                    raw.write_bytes(up.read())
+                    try:
+                        path = core.cif_to_pdb_if_needed(str(raw))
+                        prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                        st.session_state.receptor_path   = path
+                        st.session_state.protein_path    = prot
+                        st.session_state.complex_path    = path
+                        st.session_state.ref_ligand_path = lig
+                        st.success("Receptor uploaded ✅")
+                    except Exception as e:
+                        st.error(f"Could not process file: {e}")
+
+        st.write("")
+        can_proceed = True
+        if mode == "structure" and not st.session_state.receptor_path:
+            can_proceed = False
+            st.caption("⚠️ Load a receptor above before continuing.")
+
+        if st.button("Load compound & continue →", type="primary", disabled=not bool(smiles.strip())):
+            mol = Chem.MolFromSmiles(smiles.strip())
             if mol is None:
-                st.error("Invalid SMILES. Please check and try again.")
+                st.error("That SMILES doesn't look right. Check for typos and try again.")
+            elif mode == "structure" and not st.session_state.receptor_path:
+                st.error("Please load a receptor before continuing.")
             else:
                 AllChem.Compute2DCoords(mol)
-                st.session_state.parent_smiles = smiles_input.strip()
-                st.session_state.parent_name = parent_name.strip() or "parent"
-                st.session_state.parent_mol = mol
-                st.session_state.design_workflow = workflow
+                st.session_state.parent_smiles  = smiles.strip()
+                st.session_state.parent_name    = name.strip() or "compound"
+                st.session_state.parent_mol     = mol
                 st.session_state.selected_atoms = set()
-                st.session_state.analogs_df = None
-                st.success("Parent loaded ✅")
+                st.session_state.analogs_df     = None
+                go(2)
 
-    with col2:
-        mol = st.session_state.parent_mol
-        if mol:
-            attachable = core.attachable_atom_indices(mol, carbon_only=False)
-            c_only = core.attachable_atom_indices(mol, carbon_only=True)
-            st.markdown("**Molecule preview**")
-            svg = mol_svg(mol, highlight=c_only)
-            st.markdown(svg_to_img_tag(svg), unsafe_allow_html=True)
-            st.caption(
-                f"Atoms: {mol.GetNumAtoms()} | "
-                f"Recommended C–H sites: {c_only} | "
-                f"All H-bearing: {attachable}"
-            )
+    with col_mol:
+        mol_preview = Chem.MolFromSmiles(smiles.strip()) if smiles.strip() else None
+        if mol_preview:
+            AllChem.Compute2DCoords(mol_preview)
+            c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
+            st.markdown("**Preview** — highlighted atoms can be modified")
+            st.markdown(svg_img(mol_preview, highlight=c_sites), unsafe_allow_html=True)
+            st.caption(f"{mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
         else:
-            st.info("Load a valid SMILES to see the molecule.")
-
-    # Structure-based: receptor download
-    if st.session_state.design_workflow == "Structure-based" and st.session_state.parent_mol:
-        st.divider()
-        st.subheader("1B · Receptor / Complex Setup")
-        st.info(
-            "For structure-based design, provide a receptor PDB. "
-            "The parent ligand will be docked and the pocket environment analyzed automatically."
-        )
-        rec_col1, rec_col2 = st.columns(2)
-        with rec_col1:
-            rec_src = st.radio("Receptor source", ["PDB ID", "Upload PDB file"], horizontal=True)
-            if rec_src == "PDB ID":
-                pdb_id = st.text_input("PDB ID", value=st.session_state.receptor_pdb_id, max_chars=4)
-                if st.button("Download receptor"):
-                    work = get_work_dir()
-                    with st.spinner("Downloading from RCSB..."):
-                        try:
-                            path = core.download_pdb(pdb_id.strip().upper(), work)
-                            protein_path, ref_lig, cands = core.split_protein_ligand(
-                                path, work_dir=work / "receptor"
-                            )
-                            st.session_state.receptor_pdb_id = pdb_id.strip().upper()
-                            st.session_state.receptor_path = path
-                            st.session_state.protein_path = protein_path
-                            st.session_state.ref_ligand_path = ref_lig
-                            st.session_state.complex_path = path
-                            st.success(f"Receptor downloaded: {path}")
-                            if ref_lig:
-                                st.info(f"Reference ligand detected: {ref_lig}")
-                        except Exception as e:
-                            st.error(f"Download failed: {e}")
-            else:
-                uploaded = st.file_uploader("Upload receptor PDB", type=["pdb", "cif"])
-                if uploaded and st.button("Process uploaded receptor"):
-                    work = get_work_dir()
-                    raw_path = work / uploaded.name
-                    raw_path.write_bytes(uploaded.read())
-                    try:
-                        pdb_path = core.cif_to_pdb_if_needed(str(raw_path))
-                        protein_path, ref_lig, cands = core.split_protein_ligand(
-                            pdb_path, work_dir=work / "receptor"
-                        )
-                        st.session_state.receptor_path = pdb_path
-                        st.session_state.protein_path = protein_path
-                        st.session_state.ref_ligand_path = ref_lig
-                        st.session_state.complex_path = pdb_path
-                        st.success("Receptor processed ✅")
-                    except Exception as e:
-                        st.error(f"Processing failed: {e}")
-
-        with rec_col2:
-            if st.session_state.receptor_path:
-                st.success(f"Receptor ready: `{st.session_state.receptor_path}`")
-                if st.session_state.ref_ligand_path:
-                    st.success(f"Reference ligand: `{st.session_state.ref_ligand_path}`")
-
-
-# ---------------------------------------------------------------------------
-# PAGE 2 · Atom Selection
-# ---------------------------------------------------------------------------
-
-elif page == "2 · Atom Selection":
-    st.title("Step 2 · Select Attachment Atom(s)")
-    mol = st.session_state.parent_mol
-
-    if mol is None:
-        st.warning("Go back to Step 1 and load a parent SMILES first.")
-    else:
-        attachable = core.attachable_atom_indices(mol, carbon_only=False)
-        c_only = core.attachable_atom_indices(mol, carbon_only=True)
-
-        st.markdown(
-            "Select one or more atoms where a new substituent will be attached. "
-            "Tick atoms in the list below and they will be highlighted in the structure."
-        )
-
-        col_mol, col_sel = st.columns([1, 1])
-
-        with col_sel:
-            st.markdown("**Recommended C–H sites**")
-            new_selected = set()
-            for idx in attachable:
-                atom = mol.GetAtomWithIdx(idx)
-                label = (
-                    f"Atom {idx} ({atom.GetSymbol()}) "
-                    f"[{('C–H' if atom.GetAtomicNum()==6 else 'N/O/S–H')}]"
-                )
-                default = idx in st.session_state.selected_atoms
-                if st.checkbox(label, value=default, key=f"atom_{idx}"):
-                    new_selected.add(idx)
-
-            st.session_state.selected_atoms = new_selected
-
-            st.divider()
-            concerted = st.checkbox(
-                "Concerted multi-position mode",
-                value=st.session_state.concerted,
-                help=(
-                    "If ON: one analog modifies **all** selected atoms together with the same fragment.\n\n"
-                    "If OFF (default): one analog modifies **one** selected atom at a time."
-                ),
+            st.markdown(
+                '<div style="background:#F0EAE0;border-radius:12px;height:320px;'
+                'display:flex;align-items:center;justify-content:center;color:#A89070;">'
+                '<span style="font-size:0.9rem;">Molecule preview appears here</span></div>',
+                unsafe_allow_html=True
             )
-            st.session_state.concerted = concerted
 
-            allow_het = st.checkbox(
-                "Allow heteroatom–H substitution (N–H, O–H, S–H)",
+        if mode == "structure" and st.session_state.receptor_path:
+            st.markdown("**Receptor status**")
+            st.success(f"✅ {Path(st.session_state.receptor_path).name}")
+            if st.session_state.ref_ligand_path:
+                st.info("Co-crystal ligand detected — will be used as reference pose")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 – Choose atoms
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif step == 2:
+    mol = st.session_state.parent_mol
+    if mol is None:
+        st.warning("Go back to Step 1 and load a compound first.")
+        st.stop()
+
+    attachable = core.attachable_atom_indices(mol, carbon_only=False)
+    c_only     = core.attachable_atom_indices(mol, carbon_only=True)
+
+    info_card("Click an atom index in the list to select it. "
+              "Selected atoms will be highlighted on the structure — those are the spots where new groups will be added.")
+
+    col_pick, col_view = st.columns([1, 1], gap="large")
+
+    with col_pick:
+        st.markdown("### Pick attachment points")
+        hint("Stick to C–H sites (carbon atoms) unless you have a specific reason to modify N–H or O–H.")
+
+        new_sel = set()
+        for idx in attachable:
+            atom  = mol.GetAtomWithIdx(idx)
+            atype = "C–H" if atom.GetAtomicNum() == 6 else f"{atom.GetSymbol()}–H"
+            label = f"Atom {idx}  ({atype})"
+            if idx not in c_only:
+                label += "  *(heteroatom)*"
+            if st.checkbox(label, value=idx in st.session_state.selected_atoms, key=f"atm_{idx}"):
+                new_sel.add(idx)
+
+        st.session_state.selected_atoms = new_sel
+
+        st.write("")
+        with st.expander("⚙️ Advanced atom options"):
+            st.session_state.allow_heteroatom_H = st.checkbox(
+                "Allow N–H / O–H / S–H substitution",
                 value=st.session_state.allow_heteroatom_H,
             )
-            st.session_state.allow_heteroatom_H = allow_het
+            st.session_state.concerted = st.checkbox(
+                "Concerted mode — attach the same group to all selected atoms simultaneously",
+                value=st.session_state.concerted,
+            )
+            hint("Concerted mode creates larger, multi-substituted analogs.")
 
-        with col_mol:
-            svg = mol_svg(mol, highlight=sorted(st.session_state.selected_atoms))
-            st.markdown(svg_to_img_tag(svg), unsafe_allow_html=True)
-
-        if st.session_state.selected_atoms:
-            st.success(f"Selected atoms: {sorted(st.session_state.selected_atoms)}")
+    with col_view:
+        st.markdown("### Structure")
+        svg = svg_img(mol, highlight=sorted(new_sel), size=(480, 380))
+        st.markdown(svg, unsafe_allow_html=True)
+        if new_sel:
+            st.caption(f"Selected: atoms {sorted(new_sel)}")
         else:
-            st.info("No atoms selected yet. Tick at least one atom above.")
+            st.caption("No atoms selected yet")
+
+    st.write("")
+    col_back, col_next = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            go(1)
+    with col_next:
+        if st.button("Continue →", type="primary", disabled=len(new_sel) == 0):
+            go(3)
+        if not new_sel:
+            st.caption("Select at least one atom to continue.")
 
 
-# ---------------------------------------------------------------------------
-# PAGE 3 · Design Settings
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 – Design options  (ligand track)
+# ─────────────────────────────────────────────────────────────────────────────
 
-elif page == "3 · Design Settings":
-    st.title("Step 3 · Design Settings")
+elif step == 3 and mode == "ligand":
+    info_card("These settings control what kinds of groups are added and how the results are ranked. "
+              "The defaults work well — you can leave them and click Generate.")
 
-    tabs = st.tabs(["3A Goals", "3B Fragment Options", "3C Pocket Guidance"])
+    col_a, col_b = st.columns(2, gap="large")
 
-    # ---- 3A Goal weights ----
-    with tabs[0]:
-        st.subheader("Goal weights (auto-normalised)")
-        w = st.session_state.weights
-        cols = st.columns(3)
-        keys = list(w.keys())
-        new_w = {}
-        for i, k in enumerate(keys):
-            with cols[i % 3]:
-                new_w[k] = st.slider(k.capitalize(), 0, 100, int(w[k]), step=5)
-        st.session_state.weights = new_w
-        tot = sum(new_w.values()) or 1
-        norm = {k: round(v / tot, 3) for k, v in new_w.items()}
-        st.markdown("**Normalised weights:** " + " | ".join(f"{k}: {v:.2f}" for k, v in norm.items()))
+    with col_a:
+        st.markdown("### How many analogs?")
+        st.session_state.n_analogs = st.slider(
+            "Number of analogs to generate", 10, 200,
+            st.session_state.n_analogs, step=10,
+        )
+        hint("More analogs = more diversity, but slower to review. 50 is a good starting point.")
 
-    # ---- 3B Fragment options ----
-    with tabs[1]:
-        st.subheader("Fragment categories and filters")
-        cat_col1, cat_col2 = st.columns(2)
+        st.markdown("### How adventurous?")
+        risk_map = {
+            "Conservative — small groups only": "Conservative",
+            "Moderate — balanced (recommended)": "Moderate",
+            "Exploratory — larger groups allowed": "Exploratory",
+        }
+        risk_label = st.radio(
+            "Substitution size",
+            list(risk_map.keys()),
+            index=list(risk_map.values()).index(st.session_state.risk),
+        )
+        st.session_state.risk = risk_map[risk_label]
+        hint("Conservative keeps modifications small and drug-like. Exploratory allows bigger substituents.")
+
+    with col_b:
+        st.markdown("### Rank results by")
+        rank_map = {
+            "Overall drug-likeness (recommended)": "Balanced",
+            "Most similar to parent": "Similarity to parent",
+            "Best predicted solubility": "Solubility (ESOL)",
+            "Easiest to synthesise": "Synthetic feasibility",
+        }
+        rank_label = st.radio(
+            "Sort analogs by",
+            list(rank_map.keys()),
+            index=list(rank_map.values()).index(
+                next((k for k, v in rank_map.items() if v == st.session_state.rank_by),
+                     "Overall drug-likeness (recommended)")
+            ),
+        )
+        st.session_state.rank_by = rank_map[rank_label]
+
+        st.markdown("### Fragment categories")
+        hint("Uncheck any group types you want to exclude from the library.")
+        cat_cols = st.columns(2)
         cats = list(core.CATEGORY_BASE_GOALS.keys())
         new_cats = {}
         for i, cat in enumerate(cats):
-            col = cat_col1 if i < len(cats) // 2 else cat_col2
-            with col:
-                new_cats[cat] = st.checkbox(cat.replace("_", " ").capitalize(),
-                                             value=st.session_state.categories_on.get(cat, True),
-                                             key=f"cat_{cat}")
+            with cat_cols[i % 2]:
+                new_cats[cat] = st.checkbox(
+                    cat.replace("_", " ").capitalize(),
+                    value=st.session_state.categories_on.get(cat, True),
+                    key=f"cat_{cat}",
+                )
         st.session_state.categories_on = new_cats
 
-        st.divider()
-        filter_col1, filter_col2 = st.columns(2)
-        with filter_col1:
-            risk = st.selectbox("Risk / size cap", ["Conservative", "Moderate", "Exploratory", "Scaffold hopping"],
-                                index=["Conservative", "Moderate", "Exploratory", "Scaffold hopping"].index(
-                                    st.session_state.risk))
-            st.session_state.risk = risk
-
-            n_analogs = st.slider("Target analog count", 5, 500, st.session_state.n_analogs, step=5)
-            st.session_state.n_analogs = n_analogs
-
-            max_MW = st.number_input("Max MW (Da)", value=st.session_state.max_MW, step=25.0)
-            st.session_state.max_MW = max_MW
-
-        with filter_col2:
+    # Advanced
+    with st.expander("⚙️ Advanced options"):
+        adv1, adv2 = st.columns(2)
+        with adv1:
             st.markdown("**Structural filters**")
-            st.session_state.avoid_nitro = st.checkbox("Avoid nitro groups", value=st.session_state.avoid_nitro)
-            st.session_state.avoid_aldehyde = st.checkbox("Avoid aldehydes", value=st.session_state.avoid_aldehyde)
-            st.session_state.avoid_reactive = st.checkbox("Avoid reactive acyl halides / Michael acceptors",
-                                                           value=st.session_state.avoid_reactive)
-            st.session_state.avoid_toxic = st.checkbox("Avoid toxic flags (azides, epoxides)",
-                                                        value=st.session_state.avoid_toxic)
-            st.session_state.avoid_large_MW = st.checkbox("Enforce MW cap", value=st.session_state.avoid_large_MW)
+            st.session_state.avoid_nitro     = st.checkbox("Remove nitro groups",   value=st.session_state.avoid_nitro)
+            st.session_state.avoid_aldehyde  = st.checkbox("Remove aldehydes",      value=st.session_state.avoid_aldehyde)
+            st.session_state.avoid_reactive  = st.checkbox("Remove reactive groups",value=st.session_state.avoid_reactive)
+            st.session_state.avoid_toxic     = st.checkbox("Remove toxic flags",    value=st.session_state.avoid_toxic)
+            st.session_state.max_MW = st.number_input("Max molecular weight (Da)", value=st.session_state.max_MW, step=25.0)
 
-        st.divider()
-        st.session_state.rank_by = st.selectbox(
-            "Rank analogs by",
-            ["Balanced (100-pt weights)", "Similarity to parent", "Solubility (ESOL)",
-             "ADMET (QED)", "Synthetic feasibility", "Binding proxy (heuristic)"],
-            index=["Balanced (100-pt weights)", "Similarity to parent", "Solubility (ESOL)",
-                   "ADMET (QED)", "Synthetic feasibility", "Binding proxy (heuristic)"].index(
-                st.session_state.rank_by),
-        )
+        with adv2:
+            st.markdown("**Goal weights** (must sum to ~100)")
+            w = st.session_state.weights
+            new_w = {}
+            for k in w:
+                new_w[k] = st.slider(k.capitalize(), 0, 100, int(w[k]), step=5, key=f"w_{k}")
+            st.session_state.weights = new_w
 
-        st.divider()
-        st.markdown("**Custom fragments** (one SMILES with `[*]` per line)")
+        st.markdown("**Custom fragments** — one SMILES with `[*]` per line")
         st.session_state.custom_frags_text = st.text_area(
-            "Custom fragment SMILES",
-            value=st.session_state.custom_frags_text,
-            height=100,
-            label_visibility="collapsed",
+            "Custom fragments", value=st.session_state.custom_frags_text,
+            height=80, label_visibility="collapsed",
+            placeholder="[*]C1CC1\n[*]OCC"
         )
 
-    # ---- 3C Pocket guidance ----
-    with tabs[2]:
-        st.subheader("Pocket-guided functional group suggestions")
-        source = st.radio(
-            "Pocket guidance source",
-            ["Off", "Manual pasted residues", "Auto from uploaded complex"],
-            index=["Off", "Manual pasted residues", "Auto from uploaded complex"].index(
-                st.session_state.pocket_guidance_source
-            ),
-        )
-        st.session_state.pocket_guidance_source = source
+    st.write("")
+    col_back, col_next = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            go(2)
+    with col_next:
+        if st.button("Generate analogs →", type="primary"):
+            go(4)
 
-        if source == "Manual pasted residues":
-            st.session_state.pocket_residue_text = st.text_area(
-                "Pocket residues (e.g. ASP315, LYS89, TYR102 or D315 K89 Y102)",
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 – Pocket guidance  (structure track)
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif step == 3 and mode == "structure":
+    info_card("We'll analyse which residues are near the binding site and suggest the best functional groups to add.")
+
+    # Auto pocket analysis
+    if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
+        col_analysis, col_result = st.columns([1, 1], gap="large")
+
+        with col_analysis:
+            st.markdown("### Automatic pocket analysis")
+            hint("Click the button to detect residues within 6 Å of the co-crystal ligand.")
+            cutoff = st.slider("Pocket distance cutoff (Å)", 4.0, 10.0, 6.0, 0.5)
+
+            if st.button("Analyse pocket", type="primary"):
+                with st.spinner("Analysing binding pocket…"):
+                    try:
+                        pocket_df, contact_df, growth_df, lig_atoms = core.analyze_complex_distance_shell(
+                            st.session_state.complex_path,
+                            pocket_cutoff=cutoff,
+                        )
+                        residue_codes = [x for x in growth_df["aa_one"].tolist() if x]
+                        st.session_state.pocket_residue_text = " ".join(
+                            core.AA_ONE_TO_THREE.get(r, r) for r in residue_codes
+                        )
+                        active_lib = [f for f in core.BUILTIN_LIBRARY]
+                        _, _, pocket_frags = core.suggest_fragments_from_residues(
+                            residue_codes, active_lib, st.session_state.max_pocket_frags
+                        )
+                        st.session_state.pocket_frags = pocket_frags
+                        st.success(
+                            f"Found {len(pocket_df)} pocket residues, "
+                            f"{len(growth_df)} growth opportunities"
+                        )
+                    except Exception as e:
+                        st.error(f"Analysis failed: {e}")
+
+            st.markdown("### Or paste residues manually")
+            hint("Type residue names like: ASP315 LYS89 TYR102 — useful if you already know the key contacts.")
+            manual = st.text_input(
+                "Pocket residues",
                 value=st.session_state.pocket_residue_text,
-                height=80,
+                placeholder="ASP315 LYS89 TYR102",
+                label_visibility="collapsed",
             )
+            if manual != st.session_state.pocket_residue_text:
+                st.session_state.pocket_residue_text = manual
+                codes = core.parse_pocket_residues(manual)
+                if codes:
+                    _, _, pf = core.suggest_fragments_from_residues(codes, core.BUILTIN_LIBRARY, 6)
+                    st.session_state.pocket_frags = pf
 
-        elif source == "Auto from uploaded complex":
-            if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
-                st.success(f"Using complex: `{st.session_state.complex_path}`")
-                if st.button("Run pocket analysis"):
-                    with st.spinner("Analyzing pocket environment..."):
-                        try:
-                            pocket_df, contact_df, growth_df, lig_atoms = core.analyze_complex_distance_shell(
-                                st.session_state.complex_path
-                            )
-                            residue_codes = [x for x in growth_df["aa_one"].tolist() if x]
-                            st.session_state.pocket_residue_text = " ".join(
-                                [core.AA_ONE_TO_THREE.get(r, r) for r in residue_codes]
-                            )
-                            st.success(
-                                f"Pocket: {len(pocket_df)} residues | "
-                                f"Contacted: {len(contact_df)} | "
-                                f"Growth opportunities: {len(growth_df)}"
-                            )
-                            st.dataframe(growth_df[["residue_label", "min_dist_to_ligand_A", "property_tags"]].head(20))
-                        except Exception as e:
-                            st.error(f"Pocket analysis failed: {e}")
-            else:
-                st.warning("No complex file found. Go to Step 1B and load/download a receptor first.")
-
-        if source != "Off":
-            st.divider()
-            pc1, pc2 = st.columns(2)
-            with pc1:
-                st.session_state.accept_pocket_suggestions = st.checkbox(
-                    "Accept pocket-guided suggestions in Step 4",
-                    value=st.session_state.accept_pocket_suggestions,
-                )
-                st.session_state.max_pocket_frags = st.slider(
-                    "Max suggested fragments", 3, 20, st.session_state.max_pocket_frags
-                )
-            with pc2:
-                st.session_state.pocket_mode = st.radio(
-                    "Pocket guidance mode",
-                    ["Blend with selected options", "Use pocket-guided groups only"],
-                    index=0 if st.session_state.pocket_mode == "Blend with selected options" else 1,
-                )
-
-            residue_codes = core.parse_pocket_residues(st.session_state.pocket_residue_text)
-            if residue_codes:
-                active_lib = [f for f in core.BUILTIN_LIBRARY if st.session_state.categories_on.get(f.category, True)]
-                strategy_df, ratio_df, pocket_frags = core.suggest_fragments_from_residues(
-                    residue_codes, active_lib, st.session_state.max_pocket_frags
-                )
-                st.session_state.pocket_frags = pocket_frags
-                st.session_state.strategy_df = strategy_df
-
-                st.markdown("**Pocket property profile**")
-                if not ratio_df.empty:
-                    st.dataframe(ratio_df, use_container_width=True)
-                if not strategy_df.empty:
-                    st.markdown("**Suggested interaction strategies**")
-                    st.dataframe(strategy_df, use_container_width=True)
-                st.markdown("**Suggested fragments**")
-                frag_df = pd.DataFrame([
-                    {"name": f.name, "smiles": f.smiles, "category": f.category}
-                    for f in pocket_frags
+        with col_result:
+            if st.session_state.pocket_frags:
+                st.markdown("### Suggested functional groups")
+                hint("These groups match the chemistry of your binding pocket residues.")
+                fdf = pd.DataFrame([
+                    {"Group": f.name, "Category": f.category, "Why": f.notes or f.category}
+                    for f in st.session_state.pocket_frags
                 ])
-                if not frag_df.empty:
-                    st.dataframe(frag_df, use_container_width=True)
+                st.dataframe(fdf, use_container_width=True, hide_index=True)
             else:
-                if source != "Off":
-                    st.info("No residues parsed yet. Paste residue names or run pocket analysis above.")
+                st.markdown(
+                    '<div style="background:#F0EAE0;border-radius:12px;padding:2rem;'
+                    'text-align:center;color:#A89070;margin-top:1rem;">'
+                    'Suggested groups will appear here after analysis</div>',
+                    unsafe_allow_html=True
+                )
+    else:
+        st.warning("No receptor file found. Go back to Step 1 and load a receptor.")
+
+    # Shared quick settings
+    st.divider()
+    st.markdown("### Generation settings")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.session_state.n_analogs = st.slider("Number of analogs", 10, 200, st.session_state.n_analogs, step=10)
+    with c2:
+        risk_map = {
+            "Conservative": "Conservative",
+            "Moderate (recommended)": "Moderate",
+            "Exploratory": "Exploratory",
+        }
+        r = st.radio("Substitution size", list(risk_map.keys()),
+                     index=list(risk_map.values()).index(st.session_state.risk), horizontal=True)
+        st.session_state.risk = risk_map[r]
+
+    with st.expander("⚙️ Advanced options"):
+        st.session_state.max_MW      = st.number_input("Max MW (Da)", value=st.session_state.max_MW, step=25.0)
+        st.session_state.avoid_nitro = st.checkbox("Remove nitro groups",    value=st.session_state.avoid_nitro)
+        st.session_state.avoid_toxic = st.checkbox("Remove toxic flags",     value=st.session_state.avoid_toxic)
+        st.session_state.max_pocket_frags = st.slider("Max pocket-guided fragments", 3, 20,
+                                                       st.session_state.max_pocket_frags)
+
+    st.write("")
+    col_back, col_next = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            go(2)
+    with col_next:
+        if st.button("Generate analogs →", type="primary"):
+            go(4)
 
 
-# ---------------------------------------------------------------------------
-# PAGE 4 · Generate Analogs
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 – View results
+# ─────────────────────────────────────────────────────────────────────────────
 
-elif page == "4 · Generate Analogs":
-    st.title("Step 4 · Generate Analogs")
-
+elif step == 4:
     mol = st.session_state.parent_mol
-    if mol is None:
-        st.warning("Return to Step 1 and load a parent SMILES.")
-        st.stop()
 
+    # ── Build fragment pool ──────────────────────────────────────────────────
+    size_cap = {"Conservative": 4, "Moderate": 8, "Exploratory": 14}[st.session_state.risk]
+    active_lib = [
+        f for f in core.BUILTIN_LIBRARY
+        if st.session_state.categories_on.get(f.category, True) and f.heavy <= size_cap
+    ]
+    pocket_frags = st.session_state.pocket_frags or []
+    if mode == "structure" and pocket_frags and st.session_state.accept_pocket_suggestions:
+        chosen = pocket_frags + [f for f in active_lib if f.name not in {g.name for g in pocket_frags}]
+    else:
+        chosen = active_lib
+
+    # Custom fragments
+    for smi in st.session_state.custom_frags_text.strip().splitlines():
+        smi = smi.strip()
+        ok, _ = core.validate_fragment_smiles(smi)
+        if ok:
+            chosen.append(core.Frag(f"custom_{len(chosen)}", smi, "custom", core.G()))
+
+    # Valid sites
     selected = st.session_state.selected_atoms
-    if not selected:
-        st.warning("Return to Step 2 and select at least one attachment atom.")
-        st.stop()
-
-    # Determine valid sites
     allow_het = st.session_state.allow_heteroatom_H
     valid_sites = [
         s for s in sorted(selected)
@@ -513,59 +821,17 @@ elif page == "4 · Generate Analogs":
     ]
 
     if not valid_sites:
-        st.error(
-            "None of the selected atoms have replaceable H. "
-            "Enable heteroatom–H substitution in Step 2, or choose different atoms."
-        )
+        st.error("No valid attachment sites. Go back to Step 2 and select atoms.")
+        if st.button("← Back to atom selection"):
+            go(2)
         st.stop()
 
-    # Build site groups
-    concerted = st.session_state.concerted
-    site_groups = [tuple(valid_sites)] if (concerted and len(valid_sites) > 1) else [(s,) for s in valid_sites]
+    site_groups = [tuple(valid_sites)] if (st.session_state.concerted and len(valid_sites) > 1) \
+                  else [(s,) for s in valid_sites]
 
-    # Build fragment pool
-    size_cap = {"Conservative": 4, "Moderate": 8, "Exploratory": 14, "Scaffold hopping": 20}[
-        st.session_state.risk
-    ]
-    active_lib = [
-        f for f in core.BUILTIN_LIBRARY
-        if st.session_state.categories_on.get(f.category, True) and f.heavy <= size_cap
-    ]
-
-    pocket_frags = st.session_state.pocket_frags or []
-    pocket_names = {f.name for f in pocket_frags}
-    pocket_accepted = (
-        st.session_state.accept_pocket_suggestions
-        and bool(pocket_frags)
-        and st.session_state.pocket_guidance_source != "Off"
-    )
-
-    # Custom fragments
-    custom_smis = [
-        s.strip()
-        for s in st.session_state.custom_frags_text.strip().splitlines()
-        if s.strip()
-    ]
-    custom_frags = []
-    for smi in custom_smis:
-        ok, _ = core.validate_fragment_smiles(smi)
-        if ok:
-            custom_frags.append(core.Frag(f"custom_{len(custom_frags)+1}", smi, "custom", core.G()))
-
-    # Choose final fragment pool
-    if pocket_accepted and st.session_state.pocket_mode == "Use pocket-guided groups only":
-        chosen = pocket_frags[:st.session_state.n_analogs]
-    elif pocket_accepted:
-        combined = list(active_lib) + [f for f in pocket_frags if f.name not in {g.name for g in active_lib}]
-        chosen = combined + custom_frags
-    else:
-        chosen = active_lib + custom_frags
-
-    # Weights
     tot = sum(st.session_state.weights.values()) or 1
     weights = {k: v / tot for k, v in st.session_state.weights.items()}
 
-    # Avoid options
     avoid_opts = {
         "nitro": st.session_state.avoid_nitro,
         "aldehyde": st.session_state.avoid_aldehyde,
@@ -575,23 +841,9 @@ elif page == "4 · Generate Analogs":
         "epoxide": st.session_state.avoid_toxic,
     }
 
-    col_info, col_run = st.columns([2, 1])
-    with col_info:
-        st.markdown(
-            f"**Sites:** {valid_sites} | "
-            f"**Mode:** {'concerted' if concerted else 'individual'} | "
-            f"**Pool:** {len(chosen)} fragments | "
-            f"**Target:** {st.session_state.n_analogs} analogs"
-        )
-
-    with col_run:
-        run = st.button("Generate analogs 🚀", type="primary")
-
-    if run:
-        if not chosen:
-            st.error("Fragment pool is empty. Adjust category/risk filters in Step 3.")
-            st.stop()
-        with st.spinner(f"Enumerating analogs from {len(chosen)} fragments × {len(site_groups)} site group(s)..."):
+    # ── Auto-generate on first visit ────────────────────────────────────────
+    if st.session_state.analogs_df is None:
+        with st.spinner(f"Generating analogs from {len(chosen)} fragments…"):
             df = core.generate_analogs(
                 mol,
                 selected_atoms=list(selected),
@@ -601,279 +853,244 @@ elif page == "4 · Generate Analogs":
                 avoid_opts=avoid_opts,
                 max_MW=st.session_state.max_MW,
                 max_analogs=st.session_state.n_analogs,
-                rank_by=st.session_state.rank_by,
-                parent_name=st.session_state.parent_name,
+                rank_by=st.session_state.rank_by if st.session_state.rank_by in [
+                    "Balanced (100-pt weights)", "Similarity to parent", "Solubility (ESOL)",
+                    "ADMET (QED)", "Synthetic feasibility", "Binding proxy (heuristic)"
+                ] else "Balanced (100-pt weights)",
             )
         st.session_state.analogs_df = df
-        if df.empty:
-            st.error("No analogs survived the filters. Relax filters in Step 3B.")
-        else:
-            st.success(f"Generated **{len(df)}** analogs ✅")
 
     df = st.session_state.analogs_df
-    if df is not None and not df.empty:
-        st.divider()
-        st.subheader(f"Results — {len(df)} analogs")
 
-        # Property distribution
-        pcol1, pcol2, pcol3, pcol4 = st.columns(4)
-        pcol1.metric("Median MW", f"{df.MW.median():.0f}")
-        pcol2.metric("Median QED", f"{df.QED.median():.3f}")
-        pcol3.metric("Median ESOL logS", f"{df.ESOL.median():.2f}")
-        pcol4.metric("Median Tanimoto sim", f"{df.sim.median():.3f}")
-
-        # Filter controls
-        with st.expander("Filter results"):
-            f1, f2, f3 = st.columns(3)
-            mw_max = f1.slider("Max MW", 200.0, 900.0, float(df.MW.max()), step=10.0)
-            qed_min = f2.slider("Min QED", 0.0, 1.0, 0.0, step=0.05)
-            cat_filter = f3.multiselect(
-                "Fragment category",
-                options=sorted(df.fragment_category.unique()),
-                default=sorted(df.fragment_category.unique()),
-            )
-        df_show = df[
-            (df.MW <= mw_max) & (df.QED >= qed_min) & (df.fragment_category.isin(cat_filter))
-        ]
-        st.dataframe(df_show, use_container_width=True, height=400)
-
-        # Grid depiction
-        st.subheader("Structure grid (top 20)")
-        mols_grid = [Chem.MolFromSmiles(s) for s in df_show.smiles.head(20)]
-        legs = [f"{i+1}. {c}" for i, c in enumerate(df_show.change.head(20))]
-        img = Draw.MolsToGridImage(
-            mols_grid, legends=legs, molsPerRow=4, subImgSize=(260, 200), maxMols=20
-        )
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        st.image(buf.getvalue(), use_container_width=True)
-
-
-# ---------------------------------------------------------------------------
-# PAGE 5 · Docking & cIFP
-# ---------------------------------------------------------------------------
-
-elif page == "5 · Docking & cIFP":
-    st.title("Step 5 · Docking & PLIP/cIFP Validation")
-
-    df_analogs = st.session_state.analogs_df
-    if df_analogs is None or df_analogs.empty:
-        st.warning("Generate analogs in Step 4 first.")
+    if df is None or df.empty:
+        st.error("No analogs were generated. Try relaxing your filters in Step 3.")
+        if st.button("← Back to settings"):
+            go(3)
         st.stop()
 
-    acd_available = bool(shutil.which("acd"))
-    obabel_available = bool(shutil.which("obabel"))
+    # ── Metrics row ─────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div class="metric-row">
+      <div class="metric-box"><div class="val">{len(df)}</div><div class="lbl">Analogs generated</div></div>
+      <div class="metric-box"><div class="val">{df.MW.median():.0f}</div><div class="lbl">Median MW (Da)</div></div>
+      <div class="metric-box"><div class="val">{df.QED.median():.2f}</div><div class="lbl">Median QED</div></div>
+      <div class="metric-box"><div class="val">{df.sim.median():.2f}</div><div class="lbl">Median similarity</div></div>
+      <div class="metric-box"><div class="val">{df.fragment_category.value_counts().index[0]}</div><div class="lbl">Top category</div></div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    if not acd_available or not obabel_available:
-        st.error(
-            "Anyone Can Dock (`acd`) or `obabel` not found in PATH. "
-            "Install via `pip install anyonecandock` and `apt install openbabel`."
+    # ── Filter bar ───────────────────────────────────────────────────────────
+    with st.expander("🔍 Filter results"):
+        fc1, fc2, fc3 = st.columns(3)
+        mw_max  = fc1.slider("Max MW", 200.0, 900.0, float(df.MW.max()), 10.0)
+        qed_min = fc2.slider("Min QED", 0.0, 1.0, 0.0, 0.05)
+        cats_f  = fc3.multiselect("Category", sorted(df.fragment_category.unique()),
+                                   default=sorted(df.fragment_category.unique()))
+
+    df_show = df[(df.MW <= mw_max) & (df.QED >= qed_min) & (df.fragment_category.isin(cats_f))]
+
+    # ── Tabs: table / grid ───────────────────────────────────────────────────
+    tab_tbl, tab_grid = st.tabs(["📋 Table", "🖼️ Structure grid"])
+
+    with tab_tbl:
+        cols_show = ["change", "fragment_category", "MW", "logP", "QED", "ESOL", "SA", "sim", "smiles"]
+        st.dataframe(
+            df_show[[c for c in cols_show if c in df_show.columns]],
+            use_container_width=True, height=380, hide_index=True,
         )
 
-    # 5A · Prepare ligand list
-    st.subheader("5A · Docking ligand list")
-    include_parent = st.checkbox("Include original parent ligand", value=True)
+    with tab_grid:
+        n_grid = min(len(df_show), 20)
+        if n_grid == 0:
+            st.info("No analogs match the current filters.")
+        else:
+            mols_g = [Chem.MolFromSmiles(s) for s in df_show.smiles.head(n_grid)]
+            legs   = [f"{i+1}. {c}" for i, c in enumerate(df_show.change.head(n_grid))]
+            img    = Draw.MolsToGridImage(mols_g, legends=legs, molsPerRow=4,
+                                          subImgSize=(280, 210), maxMols=n_grid)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            st.image(buf.getvalue(), use_container_width=True)
 
-    work = get_work_dir()
-    dock_in = work / "docking_inputs"
+    # ── Navigation ───────────────────────────────────────────────────────────
+    st.write("")
+    col_back, col_regen, col_next = st.columns([1, 2, 3])
+    with col_back:
+        if st.button("← Back"):
+            go(3)
+    with col_regen:
+        if st.button("↺ Regenerate"):
+            st.session_state.analogs_df = None
+            st.rerun()
+    with col_next:
+        next_label = "Docking & cIFP →" if mode == "structure" else "Export →"
+        next_step  = 5 if mode == "structure" else (len(LIGAND_STEPS))
+        if st.button(next_label, type="primary"):
+            go(next_step)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 – Docking & cIFP  (structure track only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif step == 5 and mode == "structure":
+    df_analogs = st.session_state.analogs_df
+    if df_analogs is None or df_analogs.empty:
+        st.warning("No analogs yet. Go back to Step 4.")
+        st.stop()
+
+    acd_ok    = bool(shutil.which("acd"))
+    obabel_ok = bool(shutil.which("obabel"))
+    work      = get_work_dir()
+    dock_in   = work / "docking_inputs"
     dock_in.mkdir(parents=True, exist_ok=True)
 
-    rows = []
-    if include_parent:
-        rows.append({"compound": "original_ligand", "smiles": st.session_state.parent_smiles})
+    info_card("Docking predicts how tightly each analog binds to the protein. "
+              "Requires <strong>Anyone Can Dock</strong> (acd) and <strong>OpenBabel</strong> to be installed.")
+
+    # Status badges
+    bcol1, bcol2 = st.columns(2)
+    bcol1.markdown(
+        f'<div style="padding:0.6rem 1rem;border-radius:8px;'
+        f'background:{"#E6F4EA" if acd_ok else "#FDECEA"};'
+        f'color:{"#1E7E34" if acd_ok else "#B00020"};font-size:0.85rem;">'
+        f'{"✅ acd available" if acd_ok else "❌ acd not found — pip install anyonecandock"}</div>',
+        unsafe_allow_html=True
+    )
+    bcol2.markdown(
+        f'<div style="padding:0.6rem 1rem;border-radius:8px;'
+        f'background:{"#E6F4EA" if obabel_ok else "#FDECEA"};'
+        f'color:{"#1E7E34" if obabel_ok else "#B00020"};font-size:0.85rem;">'
+        f'{"✅ obabel available" if obabel_ok else "❌ obabel not found — apt install openbabel"}</div>',
+        unsafe_allow_html=True
+    )
+
+    st.write("")
+    # Ligand list
+    rows = [{"compound": "original_ligand", "smiles": st.session_state.parent_smiles}]
     for i, r in df_analogs.iterrows():
         rows.append({"compound": f"{st.session_state.parent_name}_A{i+1}", "smiles": r.smiles})
-
     lig_df = pd.DataFrame(rows).drop_duplicates("smiles").reset_index(drop=True)
     st.session_state.docking_ligands = lig_df
-    st.dataframe(lig_df, use_container_width=True, height=200)
 
     smi_path = dock_in / "compounds.smi"
     with open(smi_path, "w") as fh:
         for _, r in lig_df.iterrows():
             fh.write(f"{r.smiles}\t{r.compound}\n")
-    st.caption(f"Ligand SMI file written: `{smi_path}`")
 
-    # 5B · Run docking
+    with st.expander(f"Ligand list — {len(lig_df)} compounds"):
+        st.dataframe(lig_df, use_container_width=True, hide_index=True, height=200)
+
     st.divider()
-    st.subheader("5B · ACD Batch Docking")
-
-    receptor_for_docking = st.session_state.receptor_path or st.session_state.complex_path
-    if not receptor_for_docking:
-        st.warning("No receptor defined. Go to Step 1B and load a receptor first.")
-    else:
-        st.success(f"Receptor: `{receptor_for_docking}`")
-
-    bcol1, bcol2 = st.columns(2)
-    with bcol1:
+    st.markdown("### Docking settings")
+    d1, d2 = st.columns(2)
+    with d1:
         exhaustiveness = st.slider("Exhaustiveness", 1, 32, 8)
-        num_poses = st.slider("Poses per ligand", 1, 20, 10)
-        dock_ph = st.number_input("pH for protonation", value=7.4, step=0.1)
-    with bcol2:
-        box_x = st.number_input("Box X (Å)", value=16.0)
-        box_y = st.number_input("Box Y (Å)", value=16.0)
-        box_z = st.number_input("Box Z (Å)", value=16.0)
+        hint("Higher = more thorough but slower. 8 is standard.")
+        num_poses = st.slider("Poses per compound", 1, 20, 10)
+    with d2:
+        dock_ph = st.number_input("pH", value=7.4, step=0.1)
+        hint("Used for protonation state assignment.")
         dock_out_dir = str(work / "docking_out")
 
-    if acd_available and obabel_available and receptor_for_docking:
-        if st.button("Run ACD batch docking", type="primary", disabled=not acd_available):
+    with st.expander("⚙️ Advanced docking options"):
+        bx = st.number_input("Box X (Å)", value=16.0)
+        by = st.number_input("Box Y (Å)", value=16.0)
+        bz = st.number_input("Box Z (Å)", value=16.0)
+
+    receptor = st.session_state.receptor_path
+    if acd_ok and obabel_ok and receptor:
+        if st.button("Run docking", type="primary"):
             cmd = core.build_acd_batch_cmd(
-                receptor=receptor_for_docking,
+                receptor=receptor,
                 ligands_smi=str(smi_path),
                 output_dir=dock_out_dir,
                 exhaustiveness=exhaustiveness,
                 num_poses=num_poses,
                 ph=dock_ph,
-                box_x=box_x, box_y=box_y, box_z=box_z,
             )
-            cmd_str = " ".join(shlex.quote(str(x)) for x in cmd)
-            st.code(cmd_str, language="bash")
-            with st.spinner("Docking in progress…"):
-                rc, output = core.run_command(cmd, log_path=str(work / "acd_batch_log.txt"))
+            with st.spinner(f"Docking {len(lig_df)} compounds…"):
+                rc, output = core.run_command(cmd, log_path=str(work / "acd_batch.log"))
             if rc == 0:
-                st.success("Docking completed ✅")
+                st.success("Docking finished ✅")
+                best = core.parse_acd_score_csvs(dock_out_dir)
+                if best:
+                    st.write("Best score:", best)
             else:
-                st.error(f"ACD returned exit code {rc}")
-            with st.expander("ACD output log"):
+                st.error("Docking failed. See log below.")
+            with st.expander("ACD log"):
                 st.text(output[-3000:])
     else:
-        st.info("Install ACD and OpenBabel to enable docking. You can still download ligand SMILES for external docking.")
+        st.info("Download the ligand SMILES file and dock externally if ACD is not installed.")
+        st.download_button("⬇️ Download compounds.smi", data=smi_path.read_text(),
+                           file_name="compounds.smi", mime="text/plain")
 
-    # 5C · Parse results
-    st.divider()
-    st.subheader("5C · Parse & Score")
-
-    dock_out = Path(dock_out_dir)
-    if st.button("Parse docking results") and dock_out.exists():
-        best = core.parse_acd_score_csvs(str(dock_out))
-        if best:
-            st.write("Best score row:", best)
-        pose_sdf = core.find_pose_sdf(str(dock_out))
-        if pose_sdf:
-            st.success(f"Top pose SDF: `{pose_sdf}`")
-        else:
-            st.warning("No SDF pose files found in docking output directory.")
-
-    # 5D · cIFP
-    st.divider()
-    st.subheader("5D · PLIP / Distance cIFP")
-
-    protein_for_plip = st.session_state.protein_path
-    if not protein_for_plip:
-        st.info("Protein-only PDB not available (Step 1B receptor split). cIFP will be skipped.")
-    else:
-        cifp_cutoff = st.slider("Contact distance cutoff (Å)", 3.0, 8.0, 4.0, 0.5)
-        prefer_plip = st.checkbox("Prefer PLIP (if installed)", value=True)
-
-        if st.button("Run cIFP analysis"):
-            plip_available = bool(shutil.which("plipcmd") or shutil.which("plip"))
-            cifp_dir = work / "plip_cifp"
-            complex_dir = cifp_dir / "complexes"
-            cifp_dir.mkdir(parents=True, exist_ok=True)
-            complex_dir.mkdir(parents=True, exist_ok=True)
-
-            # Find pose PDB files
-            pose_pdbs = list((work / "docking_out" / "selected_pose_pdbs").glob("*.pdb")) if (
-                work / "docking_out" / "selected_pose_pdbs"
-            ).exists() else []
-
-            if not pose_pdbs:
-                st.warning("No pose PDB files found. Run docking first.")
-            else:
-                rows_cifp = []
-                all_features: set = set()
-                for p in pose_pdbs[:30]:
-                    compound = p.stem
-                    complex_pdb = str(complex_dir / f"{compound}_complex.pdb")
-                    core.combine_protein_ligand_pdb(protein_for_plip, str(p), complex_pdb)
-                    feats = []
-                    method = "distance_fallback"
-                    if prefer_plip and plip_available:
-                        xml_path, err = core.run_plip(complex_pdb, str(cifp_dir / "plip_out"), compound)
-                        feats = core.parse_plip_xml(xml_path) if xml_path else []
-                        method = "PLIP" if feats else "distance_fallback"
-                    if not feats:
-                        feats = core.distance_contact_cifp(complex_pdb, cutoff=cifp_cutoff)
-                    all_features.update(feats)
-                    rows_cifp.append({
-                        "compound": compound, "cifp_method": method,
-                        "n_interactions": len(feats), "cifp_features": ";".join(feats),
-                    })
-
-                cifp_df = pd.DataFrame(rows_cifp)
-                st.session_state.cifp_results = cifp_df
-                st.success(f"cIFP computed for {len(cifp_df)} complexes")
-                st.dataframe(cifp_df, use_container_width=True)
-
-    cifp_df = st.session_state.cifp_results
-    if cifp_df is not None and len(cifp_df) > 0 and len(cifp_df.columns) > 3:
-        st.subheader("cIFP interaction matrix")
-        features = sorted({f for row in cifp_df.cifp_features for f in str(row).split(";") if f})
-        mat_rows = []
-        for _, r in cifp_df.iterrows():
-            present = set(str(r.cifp_features).split(";"))
-            row = {"compound": r.compound}
-            for f in features:
-                row[f] = 1 if f in present else 0
-            mat_rows.append(row)
-        if mat_rows:
-            mat_df = pd.DataFrame(mat_rows)
-            st.dataframe(mat_df.set_index("compound"), use_container_width=True)
+    st.write("")
+    col_back, col_next = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            go(4)
+    with col_next:
+        if st.button("Export results →", type="primary"):
+            go(len(STRUCT_STEPS))
 
 
-# ---------------------------------------------------------------------------
-# PAGE Export
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 (ligand) / STEP 6 (structure) – Export
+# ─────────────────────────────────────────────────────────────────────────────
 
-elif page == "📦 Export":
-    st.title("📦 Export Results")
-
+elif step == len(steps):
     df = st.session_state.analogs_df
     if df is None or df.empty:
-        st.warning("No analogs generated yet. Complete Step 4 first.")
+        st.warning("No analogs generated yet. Complete the earlier steps first.")
         st.stop()
 
-    parent_name = st.session_state.parent_name or "parent"
+    parent_name = st.session_state.parent_name or "compound"
     work = get_work_dir()
 
-    # CSV download
-    st.subheader("Analog table")
-    csv_bytes = df.to_csv(index=False).encode()
-    st.download_button(
-        "⬇️ Download analogs CSV",
-        data=csv_bytes,
-        file_name=f"{parent_name}_analogs.csv",
-        mime="text/csv",
-    )
+    info_card("Your analogs are ready. Download the table, SMILES file, 3D structures, or a full ZIP archive.")
 
-    # SMILES download
-    smi_lines = "\n".join(f"{r.smiles}\t{parent_name}_A{i+1}" for i, r in df.iterrows())
-    st.download_button(
-        "⬇️ Download analogs SMI",
-        data=smi_lines.encode(),
-        file_name=f"{parent_name}_analogs.smi",
-        mime="text/plain",
-    )
+    # ── Quick downloads ──────────────────────────────────────────────────────
+    st.markdown("### Download analogs")
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "⬇️ Analog table (CSV)",
+            data=df.to_csv(index=False).encode(),
+            file_name=f"{parent_name}_analogs.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with dl2:
+        smi_lines = "\n".join(f"{r.smiles}\t{parent_name}_A{i+1}" for i, r in df.iterrows())
+        st.download_button(
+            "⬇️ SMILES file (.smi)",
+            data=smi_lines.encode(),
+            file_name=f"{parent_name}_analogs.smi",
+            mime="text/plain",
+            use_container_width=True,
+        )
 
-    # 3D SDF generation
+    # ── 3D SDF ───────────────────────────────────────────────────────────────
     st.divider()
-    st.subheader("3D ligand files (SDF / PDB)")
-    formats_sel = st.multiselect(
-        "Output formats", ["SDF", "PDB", "MOL2"], default=["SDF"]
-    )
-    mmff_opt = st.checkbox("MMFF geometry optimisation", value=True)
+    st.markdown("### Generate 3D structures")
+    hint("Creates a 3D conformer for each analog — useful for visualisation or further docking.")
 
-    if st.button("Generate 3D ligands"):
+    g1, g2 = st.columns(2)
+    with g1:
+        fmt_sel = st.multiselect("Output formats", ["SDF", "PDB", "MOL2"], default=["SDF"])
+    with g2:
+        mmff_opt = st.checkbox("MMFF geometry optimisation", value=True)
+
+    if st.button("Generate 3D structures", type="primary"):
         lig_table = df[["smiles"]].copy()
         lig_table["compound"] = [f"{parent_name}_A{i+1}" for i in range(len(df))]
         out_dir = work / "ligands_3d"
-        with st.spinner("Generating 3D conformers…"):
-            manifest = core.generate_3d_ligand_files(lig_table, out_dir, formats=formats_sel, mmff=mmff_opt)
-        ok = manifest[manifest.status == "ok"]
-        st.success(f"3D files generated: {len(ok)}/{len(manifest)}")
-        st.dataframe(manifest, use_container_width=True)
-
-        # Combined SDF download
+        with st.spinner("Building 3D conformers…"):
+            manifest = core.generate_3d_ligand_files(lig_table, out_dir, formats=fmt_sel, mmff=mmff_opt)
+        ok_count = int((manifest.status == "ok").sum())
+        st.success(f"3D files generated: {ok_count} / {len(manifest)}")
+        st.dataframe(manifest, use_container_width=True, hide_index=True)
         combined = out_dir / "all_ligands_3d.sdf"
         if combined.exists():
             st.download_button(
@@ -881,64 +1098,61 @@ elif page == "📦 Export":
                 data=combined.read_bytes(),
                 file_name=f"{parent_name}_3d.sdf",
                 mime="chemical/x-mdl-sdfile",
+                use_container_width=True,
             )
 
-    # ZIP all outputs
+    # ── Full ZIP ─────────────────────────────────────────────────────────────
     st.divider()
-    st.subheader("Full results ZIP")
-    if st.button("Build ZIP archive"):
+    st.markdown("### Full archive")
+    hint("Everything in one ZIP — analog table, SMILES, 3D files, docking results, and a session summary.")
+
+    if st.button("Build ZIP archive", use_container_width=True):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            # Analog CSV
             z.writestr(f"{parent_name}_analogs.csv", df.to_csv(index=False))
             z.writestr(f"{parent_name}_analogs.smi", smi_lines)
-            # 3D files if they exist
-            lig3d = work / "ligands_3d"
-            if lig3d.exists():
-                for f in lig3d.glob("**/*.*"):
-                    z.write(f, arcname=f"ligands_3d/{f.name}")
-            # cIFP if available
-            cifp_df = st.session_state.cifp_results
-            if cifp_df is not None and not cifp_df.empty:
-                z.writestr("cifp_results.csv", cifp_df.to_csv(index=False))
-            # Docking outputs if present
-            dock_out = work / "docking_out"
-            if dock_out.exists():
-                for f in dock_out.rglob("*.*"):
-                    if f.is_file():
-                        z.write(f, arcname=f"docking_out/{f.relative_to(dock_out)}")
-            # Session snapshot
-            snap = {
-                "parent_smiles": st.session_state.parent_smiles,
-                "parent_name": parent_name,
-                "design_workflow": st.session_state.design_workflow,
-                "selected_atoms": sorted(st.session_state.selected_atoms),
-                "n_analogs_generated": len(df),
-                "rank_by": st.session_state.rank_by,
-            }
-            z.writestr("session_info.json", json.dumps(snap, indent=2))
-
+            for subdir in ["ligands_3d", "docking_out"]:
+                p = work / subdir
+                if p.exists():
+                    for f in p.rglob("*.*"):
+                        if f.is_file():
+                            z.write(f, arcname=f"{subdir}/{f.relative_to(p)}")
+            cifp = st.session_state.cifp_results
+            if cifp is not None and not cifp.empty:
+                z.writestr("cifp_results.csv", cifp.to_csv(index=False))
+            z.writestr("session_info.json", json.dumps({
+                "parent_smiles":    st.session_state.parent_smiles,
+                "parent_name":      parent_name,
+                "mode":             mode,
+                "n_analogs":        len(df),
+                "selected_atoms":   sorted(st.session_state.selected_atoms),
+                "risk":             st.session_state.risk,
+                "rank_by":          st.session_state.rank_by,
+            }, indent=2))
         buf.seek(0)
         st.download_button(
             "⬇️ Download full ZIP",
             data=buf.getvalue(),
-            file_name=f"{parent_name}_analog_designer_results.zip",
+            file_name=f"{parent_name}_analog_builder_results.zip",
             mime="application/zip",
+            use_container_width=True,
         )
 
-    # Quick stats
+    # ── Session summary ──────────────────────────────────────────────────────
     st.divider()
-    st.subheader("Session summary")
-    st.json({
-        "parent_smiles": st.session_state.parent_smiles,
-        "parent_name": parent_name,
-        "design_workflow": st.session_state.design_workflow,
-        "selected_atoms": sorted(st.session_state.selected_atoms),
-        "analogs_generated": len(df) if df is not None else 0,
-        "fragment_categories": dict(
-            Counter(df.fragment_category.tolist()) if df is not None else {}
-        ),
-        "receptor_loaded": bool(st.session_state.receptor_path),
-        "docking_run": st.session_state.docking_ligands is not None,
-        "cifp_computed": st.session_state.cifp_results is not None,
-    })
+    with st.expander("Session summary"):
+        st.json({
+            "mode":            mode,
+            "parent_smiles":   st.session_state.parent_smiles,
+            "parent_name":     parent_name,
+            "selected_atoms":  sorted(st.session_state.selected_atoms),
+            "analogs_generated": len(df),
+            "top_category":    df.fragment_category.value_counts().index[0] if len(df) else "—",
+            "receptor_loaded": bool(st.session_state.receptor_path),
+            "docking_run":     st.session_state.docking_ligands is not None,
+        })
+
+    col_back, _ = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            go(step - 1)
