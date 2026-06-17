@@ -11,19 +11,15 @@ pandas==3.0.3
 numpy==2.4.6
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPTIONAL — uncomment only if you need them. The app degrades gracefully:
-# missing tools show an "install X" hint instead of crashing.
-#
-# Docking (Step 5) — heavy; pulls in prody + meeko + openbabel. Best run
-# locally, not on Streamlit Cloud. Requires Vina + obabel on PATH.
-#   anyonecandock==1.1.3
+
+anyonecandock==1.1.3
 #
 # Upload .cif receptors (auto-converts to .pdb):
-#   gemmi==0.7.5
+gemmi==0.7.5
 #
 # PLIP interaction fingerprints (else distance-contact fallback is used):
-#   plip==3.0.0
+plip==3.0.0
 #
 # Smarter protonation states for docking:
-#   pkanet-cloud[recommended]==0.9.0
+pkanet-cloud[recommended]==0.9.0
 # ─────────────────────────────────────────────────────────────────────────────
