@@ -1,25 +1,30 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Analog Builder — Python dependencies
+# Analog Builder — Python dependencies for cloud deployment
 #
-# CORE: these four run the full design workflow (Steps 1–4 + export).
-# rdkit pinned <2026 because anyonecandock/pkanet pull in dimorphite-dl,
-# which caps rdkit at <2026. 2025.9.6 is the newest compatible release.
+# CORE ONLY. These four run the full design workflow (Steps 1–4 + export).
+# The app degrades gracefully: docking / PLIP / cIFP features show an
+# "install X" hint instead of crashing when their tools are absent.
+#
+# rdkit pinned <2026 (2025.9.6 is newest compatible) so that if you later
+# add anyonecandock locally, its dimorphite-dl dependency still resolves.
 # ─────────────────────────────────────────────────────────────────────────────
 streamlit==1.58.0
 rdkit==2025.9.6
 pandas==3.0.3
 numpy==2.4.6
+anyonecandock==1.1.3
+gemmi==0.7.5
 
 # ─────────────────────────────────────────────────────────────────────────────
-
-anyonecandock==1.1.3
+# LOCAL-ONLY — do NOT uncomment for Streamlit Cloud.
 #
-# Upload .cif receptors (auto-converts to .pdb):
-gemmi==0.7.5
+# These do not build on Streamlit Cloud's Python 3.14 image:
+#   - plip pulls in the `openbabel` PIP package, which compiles from C++/SWIG
+#     and fails ("SWIG failed. Is Open Babel installed?").
+#   - anyonecandock is heavy (prody, meeko, biopython, scipy) and needs the
+#     AutoDock Vina binary at runtime, which Cloud cannot provide.
 #
-# PLIP interaction fingerprints (else distance-contact fallback is used):
-plip==3.0.0
-#
-# Smarter protonation states for docking:
-pkanet-cloud[recommended]==0.9.0
+# To run docking locally instead:
+#   conda install -c conda-forge openbabel vina
+#   pip install anyonecandock gemmi plip pkanet-cloud
 # ─────────────────────────────────────────────────────────────────────────────
