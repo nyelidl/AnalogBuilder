@@ -902,13 +902,34 @@ elif step == 4:
         if n_grid == 0:
             st.info("No analogs match the current filters.")
         else:
-            mols_g = [Chem.MolFromSmiles(s) for s in df_show.smiles.head(n_grid)]
-            legs   = [f"{i+1}. {c}" for i, c in enumerate(df_show.change.head(n_grid))]
-            img    = Draw.MolsToGridImage(mols_g, legends=legs, molsPerRow=4,
-                                          subImgSize=(280, 210), maxMols=n_grid)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            st.image(buf.getvalue(), use_container_width=True)
+            # Build (mol, legend) pairs, dropping any SMILES that fail to parse
+            pairs = []
+            for i, (smi, chg) in enumerate(
+                zip(df_show.smiles.head(n_grid), df_show.change.head(n_grid))
+            ):
+                m = Chem.MolFromSmiles(str(smi))
+                if m is not None:
+                    try:
+                        AllChem.Compute2DCoords(m)
+                        pairs.append((m, f"{i+1}. {chg}"))
+                    except Exception:
+                        pass
+
+            if not pairs:
+                st.info("Could not render any structures from the current results.")
+            else:
+                mols_g = [p[0] for p in pairs]
+                legs = [p[1] for p in pairs]
+                try:
+                    png = Draw.MolsToGridImage(
+                        mols_g, legends=legs, molsPerRow=4,
+                        subImgSize=(280, 210),
+                        returnPNG=True,
+                    )
+                    st.image(png, use_container_width=True)
+                except Exception as e:
+                    st.warning(f"Structure grid could not be rendered ({e}). "
+                               "See the Table tab for full results.")
 
     # ── Navigation ───────────────────────────────────────────────────────────
     st.write("")
