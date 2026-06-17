@@ -311,20 +311,61 @@ def svg_img(mol, highlight=None, size=(500, 380)):
 
 
 def _render_step1_receptor_and_continue(smiles: str, name: str):
-    """Shared Step-1 footer: receptor loader (structure mode) + continue button.
-    Used by both the paste layout and the full-width draw layout."""
+    """Shared Step-1 footer: receptor loader (structure mode) + continue button."""
     md = st.session_state.mode
 
     if md == "structure":
         st.markdown("### Protein receptor")
         info_card("The receptor is the protein your compound binds to. "
-                  "Find its PDB ID on <a href='https://www.rcsb.org' target='_blank'>rcsb.org</a>.")
-        rec_src = st.radio("Load receptor from", ["PDB ID (download)", "Upload PDB file"], horizontal=True)
+                  "Search by name, enter a PDB ID, or upload a file.")
+        rec_src = st.radio(
+            "Load receptor from",
+            ["🔍 Search RCSB", "#️⃣ PDB ID", "📁 Upload file"],
+            horizontal=True,
+        )
 
-        if rec_src == "PDB ID (download)":
-            pdb_id = st.text_input("4-letter PDB ID", value="1M17", max_chars=4)
-            hint("Example: 1M17 is EGFR. Type the code and click Load.")
-            if st.button("Load receptor", key="load_rec"):
+        if rec_src == "🔍 Search RCSB":
+            rcsb_query = st.text_input(
+                "Search RCSB PDB",
+                value="",
+                placeholder="e.g. EGFR kinase, JAK2, insulin receptor",
+                key="rcsb_search_q",
+            )
+            hint("Search by protein name, gene, UniProt ID, or keyword.")
+
+            if st.button("Search RCSB", key="rcsb_search_btn") and rcsb_query.strip():
+                with st.spinner("Searching RCSB PDB…"):
+                    st.session_state["_rcsb_results"] = core.search_rcsb(rcsb_query.strip(), max_results=8)
+
+            rcsb_results = st.session_state.get("_rcsb_results", [])
+            if rcsb_results:
+                st.markdown(f"**{len(rcsb_results)} results**")
+                for r in rcsb_results:
+                    cols = st.columns([1, 6, 2])
+                    with cols[0]:
+                        st.markdown(f"**{r['id']}**")
+                    with cols[1]:
+                        st.caption(f"{r['title']}")
+                        st.caption(f"{r['resolution']} · {r['method']} · {r['organism']}")
+                    with cols[2]:
+                        if st.button("Use", key=f"rcsb_use_{r['id']}"):
+                            with st.spinner(f"Downloading {r['id']}…"):
+                                try:
+                                    work = get_work_dir()
+                                    path = core.download_pdb(r["id"], work)
+                                    prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                                    st.session_state.receptor_path   = path
+                                    st.session_state.protein_path    = prot
+                                    st.session_state.complex_path    = path
+                                    st.session_state.ref_ligand_path = lig
+                                    st.success(f"Receptor loaded ({r['id']}) ✅")
+                                except Exception as e:
+                                    st.error(f"Could not download: {e}")
+
+        elif rec_src == "#️⃣ PDB ID":
+            pdb_id = st.text_input("4-letter PDB ID", value="", max_chars=4, placeholder="e.g. 1M17")
+            hint("Example: 1M17 is EGFR, 6VXX is SARS-CoV-2 spike.")
+            if st.button("Load receptor", key="load_rec") and pdb_id.strip():
                 with st.spinner("Downloading from RCSB…"):
                     try:
                         work = get_work_dir()
@@ -337,7 +378,8 @@ def _render_step1_receptor_and_continue(smiles: str, name: str):
                         st.success(f"Receptor loaded ({pdb_id.upper()}) ✅")
                     except Exception as e:
                         st.error(f"Could not download: {e}")
-        else:
+
+        else:  # Upload file
             up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"])
             if up:
                 work = get_work_dir()
@@ -353,6 +395,11 @@ def _render_step1_receptor_and_continue(smiles: str, name: str):
                     st.success("Receptor uploaded ✅")
                 except Exception as e:
                     st.error(f"Could not process file: {e}")
+
+        if st.session_state.receptor_path:
+            st.success(f"✅ Receptor ready: `{Path(st.session_state.receptor_path).name}`")
+            if st.session_state.ref_ligand_path:
+                st.info("Co-crystal ligand detected — will be used as reference pose")
 
     st.write("")
     if md == "structure" and not st.session_state.receptor_path:
@@ -551,18 +598,91 @@ st.markdown(f"## {steps[step-1]}")
 # ─────────────────────────────────────────────────────────────────────────────
 
 if step == 1:
-    # Input-mode toggle spans full width so it's visible in both layouts
+    # ── Input-mode toggle ────────────────────────────────────────────────────
+    input_options = ["🔍 Search PubChem", "⌨️ Paste SMILES", "✏️ Draw it"]
     input_tab = st.radio(
         "How do you want to enter your compound?",
-        ["⌨️ Paste SMILES", "✏️ Draw it"],
+        input_options,
         horizontal=True,
         label_visibility="collapsed",
     )
 
-    draw_mode = (input_tab == "✏️ Draw it") and _KETCHER_OK
+    draw_mode  = (input_tab == "✏️ Draw it") and _KETCHER_OK
+    paste_mode = (input_tab == "⌨️ Paste SMILES") or (input_tab == "✏️ Draw it" and not _KETCHER_OK)
+    pubchem_mode = (input_tab == "🔍 Search PubChem")
 
-    # ── DRAW MODE: full-width sketcher, preview + form below ──────────────────
-    if draw_mode:
+    # ── PUBCHEM SEARCH ───────────────────────────────────────────────────────
+    if pubchem_mode:
+        info_card("Search PubChem by compound name, synonym, or CAS number. The SMILES and structure are fetched automatically.")
+        pc_col1, pc_col2 = st.columns([2, 1])
+        with pc_col1:
+            pc_query = st.text_input(
+                "Compound name",
+                value="",
+                placeholder="e.g. imatinib, aspirin, caffeine, 50-78-2",
+                key="pubchem_query",
+            )
+        with pc_col2:
+            st.write("")  # vertical spacer
+            pc_search = st.button("Search PubChem", type="primary", key="pc_search_btn")
+
+        hint("Powered by PubChem PUG REST API. Results include name, CID, molecular weight, and SMILES.")
+
+        if pc_search and pc_query.strip():
+            with st.spinner(f'Searching PubChem for "{pc_query.strip()}"…'):
+                st.session_state["_pc_results"] = core.search_pubchem(pc_query.strip(), max_results=8)
+            if not st.session_state.get("_pc_results"):
+                st.warning(f'No results found for "{pc_query.strip()}". Try a different name or spelling.')
+
+        pc_results = st.session_state.get("_pc_results", [])
+        smiles = st.session_state.parent_smiles
+
+        if pc_results:
+            st.markdown(f"**{len(pc_results)} result{'s' if len(pc_results)>1 else ''}**")
+            for r in pc_results:
+                is_picked = (st.session_state.get("_pc_picked_cid") == r["cid"])
+                with st.container():
+                    rc1, rc2, rc3 = st.columns([5, 2, 1])
+                    with rc1:
+                        st.markdown(f"**{r['name'][:60]}**")
+                        st.caption(f"CID: {r['cid']} · MW: {r['mw']} Da · {r['formula']}")
+                        st.caption(f"`{r['smiles'][:80]}{'…' if len(r['smiles'])>80 else ''}`")
+                    with rc2:
+                        mol_tmp = Chem.MolFromSmiles(r["smiles"])
+                        if mol_tmp:
+                            AllChem.Compute2DCoords(mol_tmp)
+                            st.markdown(svg_img(mol_tmp, size=(140, 100)), unsafe_allow_html=True)
+                    with rc3:
+                        if st.button(
+                            "✓ Use" if is_picked else "Use",
+                            key=f"pc_use_{r['cid']}",
+                            type="primary" if is_picked else "secondary",
+                        ):
+                            st.session_state["_pc_picked_cid"] = r["cid"]
+                            st.session_state.parent_smiles = r["smiles"]
+                            st.session_state.parent_name = r["name"][:30].lower().replace(" ", "_")
+                            smiles = r["smiles"]
+                            st.rerun()
+                    st.divider()
+
+        # Preview + name + continue
+        if smiles and smiles.strip():
+            prev_c, form_c = st.columns([1, 1], gap="large")
+            with prev_c:
+                mol_preview = Chem.MolFromSmiles(smiles.strip())
+                if mol_preview:
+                    AllChem.Compute2DCoords(mol_preview)
+                    c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
+                    st.markdown("**Preview** — highlighted atoms can be modified")
+                    st.markdown(svg_img(mol_preview, highlight=c_sites), unsafe_allow_html=True)
+                    st.caption(f"{mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
+            with form_c:
+                name = st.text_input("Compound name", value=st.session_state.parent_name, key="pc_name")
+                hint("Used to label your output files.")
+                _render_step1_receptor_and_continue(smiles, name)
+
+    # ── DRAW MODE: full-width sketcher, preview + form below ─────────────────
+    elif draw_mode:
         hint("Draw your molecule, then click **Apply** in the sketcher to capture it.")
         drawn = st_ketcher(
             st.session_state.parent_smiles or "",
@@ -1112,13 +1232,39 @@ elif step == 5:
     if mode == "ligand" and not st.session_state.receptor_path:
         st.divider()
         st.markdown("### Choose a target protein")
-        info_card("You designed analogs without a structure. To dock them, pick the protein they're "
-                  "meant to bind. Find a PDB ID on <a href='https://www.rcsb.org' target='_blank'>rcsb.org</a>.")
-        rec_src = st.radio("Load receptor from", ["PDB ID (download)", "Upload PDB file"], horizontal=True)
-        if rec_src == "PDB ID (download)":
-            pdb_id = st.text_input("4-letter PDB ID", value="1M17", max_chars=4)
+        info_card("You designed analogs without a structure. To dock them, pick the protein they bind to.")
+        rec_src = st.radio(
+            "Load receptor from",
+            ["🔍 Search RCSB", "#️⃣ PDB ID", "📁 Upload file"],
+            horizontal=True, key="dock_rec_src",
+        )
+        if rec_src == "🔍 Search RCSB":
+            dq = st.text_input("Search RCSB PDB", placeholder="e.g. EGFR kinase, JAK2", key="dock_rcsb_q")
+            if st.button("Search", key="dock_rcsb_btn") and dq.strip():
+                with st.spinner("Searching RCSB PDB…"):
+                    st.session_state["_dock_rcsb_results"] = core.search_rcsb(dq.strip(), max_results=6)
+            for r in st.session_state.get("_dock_rcsb_results", []):
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    st.caption(f"**{r['id']}** — {r['title']}  ({r['resolution']} · {r['organism']})")
+                with c2:
+                    if st.button("Use", key=f"dock_rcsb_{r['id']}"):
+                        with st.spinner(f"Downloading {r['id']}…"):
+                            try:
+                                path = core.download_pdb(r["id"], work)
+                                prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                                st.session_state.receptor_path   = path
+                                st.session_state.protein_path    = prot
+                                st.session_state.complex_path    = path
+                                st.session_state.ref_ligand_path = lig
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Could not download: {e}")
+
+        elif rec_src == "#️⃣ PDB ID":
+            pdb_id = st.text_input("4-letter PDB ID", value="", max_chars=4, placeholder="e.g. 1M17", key="dock_pdb_id")
             hint("Example: 1M17 is EGFR.")
-            if st.button("Load receptor", key="dock_load_rec"):
+            if st.button("Load receptor", key="dock_load_rec") and pdb_id.strip():
                 with st.spinner("Downloading from RCSB…"):
                     try:
                         path = core.download_pdb(pdb_id.strip().upper(), work)
@@ -1132,7 +1278,7 @@ elif step == 5:
                     except Exception as e:
                         st.error(f"Could not download: {e}")
         else:
-            up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"])
+            up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"], key="dock_upload")
             if up:
                 raw = work / up.name
                 raw.write_bytes(up.read())
@@ -1191,13 +1337,23 @@ elif step == 5:
             n = len(lig_df)
             progress = st.progress(0.0, text=f"Preparing to dock {n} compounds…")
             status = st.empty()
-            results_area = st.empty()
+            live_table = st.empty()
             dock_results = []
             any_fail = False
             full_log = []
 
+            # Load reference ligand for RMSD (if available)
+            ref_mol = None
+            ref_pdb = st.session_state.ref_ligand_path
+            if ref_pdb and os.path.exists(str(ref_pdb)):
+                try:
+                    ref_mol = Chem.MolFromPDBFile(str(ref_pdb), removeHs=True)
+                except Exception:
+                    pass
+
             for i, row in lig_df.iterrows():
                 compound = str(row["compound"])
+                smi = str(row["smiles"])
                 frac = i / n
                 progress.progress(frac, text=f"Docking {i+1} of {n}:  {compound}")
                 status.markdown(
@@ -1208,7 +1364,7 @@ elif step == 5:
 
                 cmd = core.build_acd_dock_cmd(
                     receptor=receptor,
-                    smiles=str(row["smiles"]),
+                    smiles=smi,
                     name=compound,
                     ph=dock_ph,
                     output_dir=dock_out_dir,
@@ -1219,22 +1375,25 @@ elif step == 5:
                 if rc != 0:
                     any_fail = True
 
-                # Try to read this compound's best score
-                score = None
-                try:
-                    score = core.best_score_for_compound(dock_out_dir, compound)
-                except Exception:
-                    pass
-
-                dock_results.append({
-                    "compound": compound,
-                    "status": "✅ done" if rc == 0 else "❌ failed",
-                    "best_score": round(float(score), 2) if isinstance(score, (int, float)) else "—",
-                })
-                results_area.dataframe(
-                    pd.DataFrame(dock_results),
-                    use_container_width=True, hide_index=True,
+                # Analyse poses: BE + RMSD for top pose and min-RMSD pose
+                summary = core.summarize_docking_for_compound(
+                    out_dir=dock_out_dir,
+                    compound=compound,
+                    smiles=smi,
+                    ref_mol=ref_mol,
+                    ref_pdb_path=ref_pdb,
                 )
+                summary["dock_status"] = "✅" if rc == 0 else "❌"
+                dock_results.append(summary)
+
+                # Live preview table (lightweight columns)
+                preview_df = pd.DataFrame([{
+                    "compound": r["compound"],
+                    "status": r["dock_status"],
+                    "top_BE": r.get("top_BE", "—"),
+                    "top_RMSD": r.get("top_RMSD", "—"),
+                } for r in dock_results])
+                live_table.dataframe(preview_df, use_container_width=True, hide_index=True)
 
             progress.progress(1.0, text=f"Finished docking {n} compounds")
             status.empty()
@@ -1245,13 +1404,100 @@ elif step == 5:
             else:
                 st.success(f"Docking finished — all {n} compounds ✅")
 
-            # Rank the successful results
-            ok_rows = [r for r in dock_results if isinstance(r["best_score"], (int, float))]
-            if ok_rows:
-                ranked = pd.DataFrame(ok_rows).sort_values("best_score").reset_index(drop=True)
-                st.markdown("### Ranked by best docking score")
-                st.dataframe(ranked, use_container_width=True, hide_index=True)
-                st.session_state.docking_summary = ranked
+            # ── Full results table ───────────────────────────────────────────
+            st.divider()
+            st.markdown("### Docking results")
+
+            if ref_mol:
+                st.info("RMSD computed against the co-crystal ligand pose.")
+            else:
+                st.caption("No reference ligand available — RMSD columns will be empty.")
+
+            # Build full results DataFrame
+            result_rows = []
+            for r in dock_results:
+                result_rows.append({
+                    "compound": r["compound"],
+                    "SMILES": r["smiles"],
+                    "status": r["dock_status"],
+                    "n_poses": r.get("n_poses", 0),
+                    "top_BE (kcal/mol)": r.get("top_BE"),
+                    "top_RMSD (Å)": r.get("top_RMSD"),
+                    "minRMSD_BE (kcal/mol)": r.get("minRMSD_BE"),
+                    "minRMSD (Å)": r.get("minRMSD_RMSD"),
+                })
+            results_df = pd.DataFrame(result_rows)
+
+            # Sort by top_BE
+            if "top_BE (kcal/mol)" in results_df.columns:
+                results_df = results_df.sort_values("top_BE (kcal/mol)", na_position="last").reset_index(drop=True)
+
+            st.dataframe(results_df, use_container_width=True, hide_index=True)
+            st.session_state.docking_summary = results_df
+
+            # ── 2D structure gallery ─────────────────────────────────────────
+            st.markdown("### 2D Structures")
+            grid_mols, grid_legs = [], []
+            for r in result_rows:
+                m = Chem.MolFromSmiles(str(r["SMILES"]))
+                if m:
+                    try:
+                        AllChem.Compute2DCoords(m)
+                        be_str = f"BE={r['top_BE (kcal/mol)']}" if r.get("top_BE (kcal/mol)") else ""
+                        rmsd_str = f"RMSD={r['top_RMSD (Å)']}" if r.get("top_RMSD (Å)") else ""
+                        grid_mols.append(m)
+                        grid_legs.append(f"{r['compound']}\n{be_str}  {rmsd_str}")
+                    except Exception:
+                        pass
+            if grid_mols:
+                try:
+                    png = Draw.MolsToGridImage(
+                        grid_mols, legends=grid_legs, molsPerRow=4,
+                        subImgSize=(280, 210), returnPNG=True,
+                    )
+                    st.image(png, use_container_width=True)
+                except Exception as e:
+                    st.warning(f"Could not render structure grid: {e}")
+
+            # ── CSV download ─────────────────────────────────────────────────
+            st.divider()
+            st.markdown("### Download docking results")
+
+            # Build CSV with all columns
+            csv_rows = []
+            for r in result_rows:
+                csv_rows.append({
+                    "compound": r["compound"],
+                    "SMILES": r["SMILES"],
+                    "status": r["status"],
+                    "n_poses": r["n_poses"],
+                    "top_pose_BE_kcal_mol": r["top_BE (kcal/mol)"],
+                    "top_pose_RMSD_vs_crystal_A": r["top_RMSD (Å)"],
+                    "min_RMSD_pose_BE_kcal_mol": r["minRMSD_BE (kcal/mol)"],
+                    "min_RMSD_vs_crystal_A": r["minRMSD (Å)"],
+                })
+            csv_df = pd.DataFrame(csv_rows)
+            csv_bytes = csv_df.to_csv(index=False).encode()
+
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button(
+                    "⬇️ Docking results CSV",
+                    data=csv_bytes,
+                    file_name=f"{st.session_state.parent_name}_docking_results.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            with dl2:
+                # Combined SMI file
+                smi_out = "\n".join(f"{r['SMILES']}\t{r['compound']}" for r in result_rows)
+                st.download_button(
+                    "⬇️ Docked compounds SMILES",
+                    data=smi_out.encode(),
+                    file_name=f"{st.session_state.parent_name}_docked.smi",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
 
             with st.expander("ACD log"):
                 st.text("\n".join(full_log)[-4000:])
