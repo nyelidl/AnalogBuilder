@@ -180,6 +180,35 @@ h3 { font-size: 1.0rem !important; font-weight: 600; color: #3D7A74; }
 }
 .page-footer a { color: #A89070; text-decoration: none; }
 .page-footer a:hover { color: #E8A020; }
+
+/* ── Mode tab bar (first two buttons under the footer markup) ── */
+/* Tabs are the two columns at the very top of the main area.
+   We style them to read as underline tabs rather than filled buttons. */
+.main .block-container div[data-testid="stHorizontalBlock"]:first-of-type
+    button {
+    background: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
+    border-bottom: 3px solid transparent !important;
+    color: #8B7355 !important;
+    font-size: 1rem !important;
+    font-weight: 500 !important;
+    padding: 0.55rem 0.2rem !important;
+    box-shadow: none !important;
+}
+.main .block-container div[data-testid="stHorizontalBlock"]:first-of-type
+    button:hover {
+    color: #2C2C2C !important;
+    background: transparent !important;
+}
+/* active tab = the primary-typed button */
+.main .block-container div[data-testid="stHorizontalBlock"]:first-of-type
+    button[kind="primary"] {
+    background: transparent !important;
+    color: #2C2C2C !important;
+    border-bottom: 3px solid #E8A020 !important;
+    font-weight: 700 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -277,7 +306,7 @@ def svg_img(mol, highlight=None, size=(500, 380)):
 # Sidebar – progress tracker
 # ─────────────────────────────────────────────────────────────────────────────
 
-LIGAND_STEPS  = ["Parent compound", "Choose atoms", "Design options", "View results", "Export"]
+LIGAND_STEPS  = ["Parent compound", "Choose atoms", "Design options", "View results", "Docking", "Export"]
 STRUCT_STEPS  = ["Parent + receptor", "Choose atoms", "Pocket guidance", "View results", "Docking & cIFP", "Export"]
 
 def render_sidebar():
@@ -393,16 +422,52 @@ if st.session_state.mode is None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared header
+# Mode tab bar  (switch tracks anytime after picking)
 # ─────────────────────────────────────────────────────────────────────────────
 
 mode  = st.session_state.mode
 step  = st.session_state.step
+
+def switch_mode(new_mode: str):
+    """Switch track. Keeps the parent compound + atom selection so the user
+    doesn't lose work, but resets downstream results that are mode-specific."""
+    if new_mode == st.session_state.mode:
+        return
+    st.session_state.mode = new_mode
+    # Keep step if it still exists in the new track, else clamp.
+    new_len = len(LIGAND_STEPS if new_mode == "ligand" else STRUCT_STEPS)
+    st.session_state.step = min(st.session_state.step, new_len)
+    st.rerun()
+
+tab_l, tab_r = st.columns(2)
+with tab_l:
+    if st.button(
+        "💊 Ligand-based",
+        key="tab_ligand",
+        use_container_width=True,
+        type="primary" if mode == "ligand" else "secondary",
+    ):
+        switch_mode("ligand")
+with tab_r:
+    if st.button(
+        "🔬 Structure-based",
+        key="tab_structure",
+        use_container_width=True,
+        type="primary" if mode == "structure" else "secondary",
+    ):
+        switch_mode("structure")
+
+st.markdown('<hr style="margin:0.2rem 0 1.2rem 0;border:none;border-top:1px solid #E0D6C8;">',
+            unsafe_allow_html=True)
+
+# Re-read in case mode changed above
+mode  = st.session_state.mode
+step  = st.session_state.step
 steps = LIGAND_STEPS if mode == "ligand" else STRUCT_STEPS
 
-track_label = "💊 Ligand-based" if mode == "ligand" else "🔬 Structure-based"
+# Step breadcrumb
 st.markdown(
-    f'<p style="font-size:0.8rem;color:#8B7355;margin-bottom:0;">{track_label} &nbsp;›&nbsp; '
+    f'<p style="font-size:0.8rem;color:#8B7355;margin-bottom:0;">'
     f'Step {step} of {len(steps)}: <strong>{steps[step-1]}</strong></p>',
     unsafe_allow_html=True
 )
@@ -548,16 +613,17 @@ elif step == 2:
         st.session_state.selected_atoms = new_sel
 
         st.write("")
-        with st.expander("⚙️ Advanced atom options"):
-            st.session_state.allow_heteroatom_H = st.checkbox(
-                "Allow N–H / O–H / S–H substitution",
-                value=st.session_state.allow_heteroatom_H,
-            )
-            st.session_state.concerted = st.checkbox(
-                "Concerted mode — attach the same group to all selected atoms simultaneously",
-                value=st.session_state.concerted,
-            )
-            hint("Concerted mode creates larger, multi-substituted analogs.")
+        st.markdown("### Options")
+        st.session_state.allow_heteroatom_H = st.checkbox(
+            "Allow N–H / O–H / S–H substitution",
+            value=st.session_state.allow_heteroatom_H,
+        )
+        hint("By default only carbon (C–H) sites are modified. Turn this on to also substitute on nitrogen, oxygen, or sulfur.")
+        st.session_state.concerted = st.checkbox(
+            "Concerted mode — attach the same group to all selected atoms at once",
+            value=st.session_state.concerted,
+        )
+        hint("Off: each analog changes one site. On: each analog changes all selected sites together (larger, multi-substituted analogs).")
 
     with col_view:
         st.markdown("### Structure")
@@ -942,17 +1008,16 @@ elif step == 4:
             st.session_state.analogs_df = None
             st.rerun()
     with col_next:
-        next_label = "Docking & cIFP →" if mode == "structure" else "Export →"
-        next_step  = 5 if mode == "structure" else (len(LIGAND_STEPS))
+        next_label = "Docking & cIFP →" if mode == "structure" else "Docking →"
         if st.button(next_label, type="primary"):
-            go(next_step)
+            go(5)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 5 – Docking & cIFP  (structure track only)
 # ─────────────────────────────────────────────────────────────────────────────
 
-elif step == 5 and mode == "structure":
+elif step == 5:
     df_analogs = st.session_state.analogs_df
     if df_analogs is None or df_analogs.empty:
         st.warning("No analogs yet. Go back to Step 4.")
@@ -964,10 +1029,10 @@ elif step == 5 and mode == "structure":
     dock_in   = work / "docking_inputs"
     dock_in.mkdir(parents=True, exist_ok=True)
 
-    info_card("Docking predicts how tightly each analog binds to the protein. "
-              "Requires <strong>Anyone Can Dock</strong> (acd) and <strong>OpenBabel</strong> to be installed.")
+    info_card("Docking predicts how tightly each designed analog binds to the target protein. "
+              "Requires <strong>Anyone Can Dock</strong> (acd) and <strong>OpenBabel</strong>.")
 
-    # Status badges
+    # ── Status badges ────────────────────────────────────────────────────────
     bcol1, bcol2 = st.columns(2)
     bcol1.markdown(
         f'<div style="padding:0.6rem 1rem;border-radius:8px;'
@@ -984,8 +1049,52 @@ elif step == 5 and mode == "structure":
         unsafe_allow_html=True
     )
 
-    st.write("")
-    # Ligand list
+    # ── Receptor: ligand track must load one here ────────────────────────────
+    if mode == "ligand" and not st.session_state.receptor_path:
+        st.divider()
+        st.markdown("### Choose a target protein")
+        info_card("You designed analogs without a structure. To dock them, pick the protein they're "
+                  "meant to bind. Find a PDB ID on <a href='https://www.rcsb.org' target='_blank'>rcsb.org</a>.")
+        rec_src = st.radio("Load receptor from", ["PDB ID (download)", "Upload PDB file"], horizontal=True)
+        if rec_src == "PDB ID (download)":
+            pdb_id = st.text_input("4-letter PDB ID", value="1M17", max_chars=4)
+            hint("Example: 1M17 is EGFR.")
+            if st.button("Load receptor", key="dock_load_rec"):
+                with st.spinner("Downloading from RCSB…"):
+                    try:
+                        path = core.download_pdb(pdb_id.strip().upper(), work)
+                        prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                        st.session_state.receptor_path   = path
+                        st.session_state.protein_path    = prot
+                        st.session_state.complex_path    = path
+                        st.session_state.ref_ligand_path = lig
+                        st.success(f"Receptor loaded ({pdb_id.upper()}) ✅")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not download: {e}")
+        else:
+            up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"])
+            if up:
+                raw = work / up.name
+                raw.write_bytes(up.read())
+                try:
+                    path = core.cif_to_pdb_if_needed(str(raw))
+                    prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                    st.session_state.receptor_path   = path
+                    st.session_state.protein_path    = prot
+                    st.session_state.complex_path    = path
+                    st.session_state.ref_ligand_path = lig
+                    st.success("Receptor uploaded ✅")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not process file: {e}")
+
+    receptor = st.session_state.receptor_path
+    if receptor:
+        st.success(f"Target receptor: `{Path(receptor).name}`")
+
+    # ── Ligand list (parent + all analogs) ───────────────────────────────────
+    st.divider()
     rows = [{"compound": "original_ligand", "smiles": st.session_state.parent_smiles}]
     for i, r in df_analogs.iterrows():
         rows.append({"compound": f"{st.session_state.parent_name}_A{i+1}", "smiles": r.smiles})
@@ -997,10 +1106,10 @@ elif step == 5 and mode == "structure":
         for _, r in lig_df.iterrows():
             fh.write(f"{r.smiles}\t{r.compound}\n")
 
-    with st.expander(f"Ligand list — {len(lig_df)} compounds"):
+    with st.expander(f"Ligand list — {len(lig_df)} compounds (parent + analogs)"):
         st.dataframe(lig_df, use_container_width=True, hide_index=True, height=200)
 
-    st.divider()
+    # ── Docking settings ─────────────────────────────────────────────────────
     st.markdown("### Docking settings")
     d1, d2 = st.columns(2)
     with d1:
@@ -1017,7 +1126,7 @@ elif step == 5 and mode == "structure":
         by = st.number_input("Box Y (Å)", value=16.0)
         bz = st.number_input("Box Z (Å)", value=16.0)
 
-    receptor = st.session_state.receptor_path
+    # ── Run / fallback ───────────────────────────────────────────────────────
     if acd_ok and obabel_ok and receptor:
         if st.button("Run docking", type="primary"):
             cmd = core.build_acd_batch_cmd(
@@ -1039,11 +1148,46 @@ elif step == 5 and mode == "structure":
                 st.error("Docking failed. See log below.")
             with st.expander("ACD log"):
                 st.text(output[-3000:])
+    elif not receptor:
+        st.info("Load a target receptor above to enable docking.")
     else:
-        st.info("Download the ligand SMILES file and dock externally if ACD is not installed.")
+        st.info("ACD or OpenBabel is not installed here. Download the ligand file and dock externally.")
         st.download_button("⬇️ Download compounds.smi", data=smi_path.read_text(),
                            file_name="compounds.smi", mime="text/plain")
 
+    # ── cIFP (structure track only — needs split protein) ────────────────────
+    if mode == "structure" and st.session_state.protein_path:
+        st.divider()
+        st.markdown("### Interaction fingerprints (cIFP)")
+        hint("After docking, compute which residues each pose contacts.")
+        if st.button("Run cIFP analysis"):
+            plip_available = bool(shutil.which("plipcmd") or shutil.which("plip"))
+            cifp_dir = work / "plip_cifp" / "complexes"
+            cifp_dir.mkdir(parents=True, exist_ok=True)
+            pose_dir = work / "docking_out" / "selected_pose_pdbs"
+            pose_pdbs = list(pose_dir.glob("*.pdb")) if pose_dir.exists() else []
+            if not pose_pdbs:
+                st.warning("No docked poses found yet. Run docking first.")
+            else:
+                rows_c = []
+                for p in pose_pdbs[:30]:
+                    cpx = str(cifp_dir / f"{p.stem}_complex.pdb")
+                    core.combine_protein_ligand_pdb(st.session_state.protein_path, str(p), cpx)
+                    feats, method = [], "distance"
+                    if plip_available:
+                        xml, _ = core.run_plip(cpx, str(work / "plip_cifp" / "plip_out"), p.stem)
+                        feats = core.parse_plip_xml(xml) if xml else []
+                        method = "PLIP" if feats else "distance"
+                    if not feats:
+                        feats = core.distance_contact_cifp(cpx, cutoff=4.0)
+                    rows_c.append({"compound": p.stem, "method": method,
+                                   "n_interactions": len(feats), "features": ";".join(feats)})
+                cifp_df = pd.DataFrame(rows_c)
+                st.session_state.cifp_results = cifp_df
+                st.success(f"cIFP computed for {len(cifp_df)} poses")
+                st.dataframe(cifp_df, use_container_width=True, hide_index=True)
+
+    # ── Navigation ───────────────────────────────────────────────────────────
     st.write("")
     col_back, col_next = st.columns([1, 4])
     with col_back:
@@ -1051,7 +1195,7 @@ elif step == 5 and mode == "structure":
             go(4)
     with col_next:
         if st.button("Export results →", type="primary"):
-            go(len(STRUCT_STEPS))
+            go(len(steps))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
