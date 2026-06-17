@@ -1,8 +1,8 @@
 streamlit==1.58.0
 rdkit==2026.3.3
-pandas==3.0.2
-numpy==2.4.4
+pandas==3.0.3
+numpy==2.4.6
 anyonecandock==1.1.3
-pkanet-cloud[recommended]==0.9.0
-plip==3.0.0
-gemmi==0.7.5
+gemmi==0.7.5                       # convert uploaded .cif receptors to .pdb
+plip==3.0.0                        # PLIP interaction fingerprints (else distance fallback)
+pkanet-cloud[recommended]==0.9.0   # smarter protonation states for docking
