@@ -697,6 +697,146 @@ def _pdb_reskey(line: str) -> Tuple:
     return (line[21].strip() or "_", line[17:20].strip().upper(), line[22:26].strip(), line[26].strip())
 
 
+# ---------------------------------------------------------------------------
+# PubChem PUG REST API
+# ---------------------------------------------------------------------------
+
+def search_pubchem(query: str, max_results: int = 10) -> List[Dict]:
+    """Search PubChem by compound name / synonym / CAS number.
+    Returns a list of dicts: {name, cid, smiles, mw, formula}."""
+    query = query.strip()
+    if not query:
+        return []
+
+    # Step 1: name → CID list
+    url = (
+        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+        f"{urllib.request.quote(query)}/cids/JSON"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        cids = data.get("IdentifierList", {}).get("CID", [])[:max_results]
+    except Exception:
+        cids = []
+
+    if not cids:
+        return []
+
+    # Step 2: CID list → properties
+    cid_str = ",".join(str(c) for c in cids)
+    prop_url = (
+        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid_str}/"
+        f"property/MolecularFormula,MolecularWeight,CanonicalSMILES,IUPACName/JSON"
+    )
+    try:
+        req = urllib.request.Request(prop_url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            prop_data = json.loads(resp.read())
+        props = prop_data.get("PropertyTable", {}).get("Properties", [])
+    except Exception:
+        props = []
+
+    results = []
+    for p in props:
+        results.append({
+            "cid": p.get("CID"),
+            "name": p.get("IUPACName", query),
+            "smiles": p.get("CanonicalSMILES", ""),
+            "mw": p.get("MolecularWeight", ""),
+            "formula": p.get("MolecularFormula", ""),
+        })
+    return results
+
+
+def pubchem_cid_to_smiles(cid: int) -> Optional[str]:
+    """Fetch canonical SMILES for a single PubChem CID."""
+    url = (
+        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/"
+        f"property/CanonicalSMILES/JSON"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        return data["PropertyTable"]["Properties"][0]["CanonicalSMILES"]
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# RCSB PDB Search API
+# ---------------------------------------------------------------------------
+
+def search_rcsb(query: str, max_results: int = 10) -> List[Dict]:
+    """Search RCSB PDB by text (protein name, gene, UniProt ID, etc.).
+    Returns a list of dicts: {id, title, resolution, method, organism}."""
+    query = query.strip()
+    if not query:
+        return []
+
+    # RCSB search API v2
+    search_body = json.dumps({
+        "query": {
+            "type": "terminal",
+            "service": "full_text",
+            "parameters": {"value": query},
+        },
+        "return_type": "entry",
+        "request_options": {
+            "paginate": {"start": 0, "rows": max_results},
+            "results_content_type": ["experimental"],
+            "sort": [{"sort_by": "score", "direction": "desc"}],
+        },
+    })
+    search_url = "https://search.rcsb.org/rcsbsearch/v2/query"
+    try:
+        req = urllib.request.Request(
+            search_url, data=search_body.encode(),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        pdb_ids = [r["identifier"] for r in data.get("result_set", [])][:max_results]
+    except Exception:
+        pdb_ids = []
+
+    if not pdb_ids:
+        return []
+
+    # Fetch summary for each PDB ID
+    results = []
+    for pdb_id in pdb_ids:
+        summary_url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+        try:
+            req = urllib.request.Request(summary_url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                entry = json.loads(resp.read())
+            struct = entry.get("struct", {})
+            cell = entry.get("rcsb_entry_info", {})
+            exptl = entry.get("exptl", [{}])[0] if entry.get("exptl") else {}
+            refine = entry.get("refine", [{}])[0] if entry.get("refine") else {}
+            src = entry.get("rcsb_entity_source_organism", [{}])
+            organism = src[0].get("ncbi_scientific_name", "") if src else ""
+            results.append({
+                "id": pdb_id.upper(),
+                "title": struct.get("title", ""),
+                "resolution": f"{refine.get('ls_d_res_high', '?')} Å",
+                "method": exptl.get("method", ""),
+                "organism": organism,
+            })
+        except Exception:
+            results.append({
+                "id": pdb_id.upper(),
+                "title": "(details unavailable)",
+                "resolution": "?",
+                "method": "",
+                "organism": "",
+            })
+    return results
+
+
 def download_pdb(pdb_id: str, out_dir: Path) -> str:
     pdb_id = pdb_id.strip().upper()
     assert re.fullmatch(r"[A-Za-z0-9]{4}", pdb_id), "PDB ID must be 4 characters."
@@ -1012,6 +1152,237 @@ def find_pose_sdf(out_dir: str) -> Optional[str]:
     sdfs = sorted(glob.glob(str(Path(out_dir) / "**" / "*.sdf"), recursive=True))
     ranked = [p for p in sdfs if re.search(r"out|pose|dock|result", Path(p).name, re.I)] + sdfs
     return ranked[0] if ranked else None
+
+
+def find_pose_sdfs_for_compound(out_dir: str, compound: str) -> List[str]:
+    """Find all SDF files for a given compound name in the docking output."""
+    token = _safe_file_token(compound)
+    sdfs = sorted(glob.glob(str(Path(out_dir) / "**" / "*.sdf"), recursive=True))
+    matched = [s for s in sdfs if token in Path(s).name or token in str(Path(s).parent.name)]
+    return matched if matched else sdfs[:1]
+
+
+# ---------------------------------------------------------------------------
+# RMSD calculation (docked pose vs crystal ligand)
+# ---------------------------------------------------------------------------
+
+def _read_heavy_coords_from_pdb(pdb_path: str) -> np.ndarray:
+    """Read heavy-atom (x,y,z) from a PDB file. Returns Nx3 array."""
+    coords = []
+    with open(pdb_path, "r", errors="ignore") as f:
+        for line in f:
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            if _pdb_is_h(line):
+                continue
+            try:
+                coords.append(_pdb_xyz(line))
+            except Exception:
+                continue
+    return np.array(coords, dtype=float) if coords else np.empty((0, 3))
+
+
+def _read_heavy_coords_from_sdf(sdf_path: str, mol_index: int = 0) -> Tuple[Optional[Chem.Mol], np.ndarray]:
+    """Read a molecule and its heavy-atom 3D coordinates from an SDF file."""
+    suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=True)
+    idx = 0
+    for mol in suppl:
+        if mol is None:
+            idx += 1
+            continue
+        if idx == mol_index:
+            conf = mol.GetConformer()
+            coords = np.array([
+                list(conf.GetAtomPosition(i))
+                for i in range(mol.GetNumAtoms())
+                if mol.GetAtomWithIdx(i).GetAtomicNum() > 1
+            ], dtype=float)
+            return mol, coords
+        idx += 1
+    return None, np.empty((0, 3))
+
+
+def compute_rmsd_rdkit(mol_ref: Chem.Mol, mol_probe: Chem.Mol) -> Optional[float]:
+    """Compute best-fit RMSD between two RDKit molecules using substructure alignment."""
+    try:
+        from rdkit.Chem import AllChem as _AC
+        # Try GetBestRMS which handles atom reordering
+        rmsd = _AC.GetBestRMS(Chem.RemoveHs(mol_ref), Chem.RemoveHs(mol_probe))
+        return float(rmsd)
+    except Exception:
+        pass
+    # Fallback: simple coordinate RMSD if same number of heavy atoms
+    try:
+        ref_conf = mol_ref.GetConformer()
+        prb_conf = mol_probe.GetConformer()
+        ref_c = np.array([list(ref_conf.GetAtomPosition(i))
+                          for i in range(mol_ref.GetNumAtoms())
+                          if mol_ref.GetAtomWithIdx(i).GetAtomicNum() > 1])
+        prb_c = np.array([list(prb_conf.GetAtomPosition(i))
+                          for i in range(mol_probe.GetNumAtoms())
+                          if mol_probe.GetAtomWithIdx(i).GetAtomicNum() > 1])
+        if ref_c.shape == prb_c.shape and len(ref_c) > 0:
+            return float(np.sqrt(np.mean(np.sum((ref_c - prb_c) ** 2, axis=1))))
+    except Exception:
+        pass
+    return None
+
+
+def compute_rmsd_coords(ref_coords: np.ndarray, probe_coords: np.ndarray) -> Optional[float]:
+    """Simple coordinate RMSD when atom counts match. No fitting."""
+    if ref_coords.shape != probe_coords.shape or len(ref_coords) == 0:
+        return None
+    return float(np.sqrt(np.mean(np.sum((ref_coords - probe_coords) ** 2, axis=1))))
+
+
+def parse_docked_poses(
+    sdf_path: str,
+    ref_mol: Optional[Chem.Mol] = None,
+    ref_pdb_path: Optional[str] = None,
+) -> List[Dict]:
+    """Parse all poses from a docked SDF file.
+
+    For each pose, returns:
+      - pose_index, score (binding energy), rmsd_vs_crystal
+    The reference can be an RDKit Mol (from co-crystal SDF) or a PDB file path.
+    """
+    suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
+    ref_mol_noH = None
+    if ref_mol is not None:
+        try:
+            ref_mol_noH = Chem.RemoveHs(ref_mol)
+        except Exception:
+            pass
+    elif ref_pdb_path and os.path.exists(str(ref_pdb_path)):
+        try:
+            ref_mol_noH = Chem.MolFromPDBFile(str(ref_pdb_path), removeHs=True)
+        except Exception:
+            pass
+
+    poses = []
+    idx = 0
+    for mol in suppl:
+        if mol is None:
+            idx += 1
+            continue
+        # Extract score from SDF properties
+        score = None
+        for prop_name in mol.GetPropsAsDict():
+            if re.search(r"score|energy|affinity|minimizedAffinity|binding", prop_name, re.I):
+                try:
+                    score = float(mol.GetProp(prop_name))
+                except Exception:
+                    pass
+                if score is not None:
+                    break
+
+        # Compute RMSD vs crystal
+        rmsd = None
+        if ref_mol_noH is not None:
+            try:
+                probe_noH = Chem.RemoveHs(mol)
+                rmsd = compute_rmsd_rdkit(ref_mol_noH, probe_noH)
+            except Exception:
+                pass
+
+        poses.append({
+            "pose_index": idx,
+            "score": score,
+            "rmsd_vs_crystal": round(rmsd, 3) if rmsd is not None else None,
+            "mol": mol,
+        })
+        idx += 1
+
+    return poses
+
+
+def summarize_docking_for_compound(
+    out_dir: str,
+    compound: str,
+    smiles: str,
+    ref_mol: Optional[Chem.Mol] = None,
+    ref_pdb_path: Optional[str] = None,
+) -> Dict:
+    """Produce a summary row for one docked compound:
+      - smiles, compound name
+      - top_pose: BE + RMSD (pose with best score)
+      - min_rmsd_pose: BE + RMSD (pose with lowest RMSD vs crystal)
+    """
+    result = {
+        "compound": compound,
+        "smiles": smiles,
+        "top_BE": None,
+        "top_RMSD": None,
+        "minRMSD_BE": None,
+        "minRMSD_RMSD": None,
+        "n_poses": 0,
+        "status": "no_sdf",
+    }
+    sdfs = find_pose_sdfs_for_compound(out_dir, compound)
+    if not sdfs:
+        return result
+
+    all_poses = []
+    for sdf in sdfs:
+        all_poses.extend(parse_docked_poses(sdf, ref_mol=ref_mol, ref_pdb_path=ref_pdb_path))
+
+    if not all_poses:
+        result["status"] = "no_poses"
+        return result
+
+    result["n_poses"] = len(all_poses)
+    result["status"] = "ok"
+
+    # Top pose = best (lowest) binding energy
+    scored = [p for p in all_poses if p["score"] is not None]
+    if scored:
+        top = min(scored, key=lambda p: p["score"])
+        result["top_BE"] = round(top["score"], 2)
+        result["top_RMSD"] = top["rmsd_vs_crystal"]
+
+    # Min-RMSD pose = closest to crystal structure
+    with_rmsd = [p for p in all_poses if p["rmsd_vs_crystal"] is not None]
+    if with_rmsd:
+        best_rmsd = min(with_rmsd, key=lambda p: p["rmsd_vs_crystal"])
+        result["minRMSD_RMSD"] = best_rmsd["rmsd_vs_crystal"]
+        result["minRMSD_BE"] = round(best_rmsd["score"], 2) if best_rmsd["score"] is not None else None
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 2D molecule image generation (PNG bytes for tables/CSV)
+# ---------------------------------------------------------------------------
+
+def mol_to_png_base64(smiles: str, size: Tuple[int, int] = (250, 180)) -> str:
+    """Generate a 2D structure image as a base64-encoded PNG string."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return ""
+    try:
+        AllChem.Compute2DCoords(mol)
+        d = rdMolDraw2D.MolDraw2DCairo(*size)
+        rdMolDraw2D.PrepareAndDrawMolecule(d, mol)
+        d.FinishDrawing()
+        import base64
+        return base64.b64encode(d.GetDrawingText()).decode()
+    except Exception:
+        return ""
+
+
+def mol_to_png_bytes(smiles: str, size: Tuple[int, int] = (250, 180)) -> bytes:
+    """Generate a 2D structure image as raw PNG bytes."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return b""
+    try:
+        AllChem.Compute2DCoords(mol)
+        d = rdMolDraw2D.MolDraw2DCairo(*size)
+        rdMolDraw2D.PrepareAndDrawMolecule(d, mol)
+        d.FinishDrawing()
+        return d.GetDrawingText()
+    except Exception:
+        return b""
 
 
 # ---------------------------------------------------------------------------
