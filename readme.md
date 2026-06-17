@@ -1,3 +1,5 @@
+# ⌬+⌬ Analog Builder
+
 **⌬+⌬ Analog Builder** is a Colab-based workflow for practical analog generation and early-stage computational prioritization. It supports both **ligand-guided** and **structure-guided** design, with optional docking, interaction profiling, and 3D ligand export.
 
 This notebook is intended as a lightweight research workflow, not a full drug-discovery platform. It helps generate and organize candidate derivatives/analogs for follow-up docking, visualization, and downstream analysis.
