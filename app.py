@@ -273,6 +273,7 @@ DEFAULTS = {
     "analogs_df": None,
     # Step 5 docking
     "docking_ligands": None,
+    "docking_summary": None,
     "cifp_results": None,
     "work_dir": None,
 }
@@ -1187,25 +1188,73 @@ elif step == 5:
     # ── Run / fallback ───────────────────────────────────────────────────────
     if acd_ok and obabel_ok and receptor:
         if st.button("Run docking", type="primary"):
-            cmd = core.build_acd_batch_cmd(
-                receptor=receptor,
-                ligands_smi=str(smi_path),
-                output_dir=dock_out_dir,
-                exhaustiveness=exhaustiveness,
-                num_poses=num_poses,
-                ph=dock_ph,
-            )
-            with st.spinner(f"Docking {len(lig_df)} compounds…"):
-                rc, output = core.run_command(cmd, log_path=str(work / "acd_batch.log"))
-            if rc == 0:
-                st.success("Docking finished ✅")
-                best = core.parse_acd_score_csvs(dock_out_dir)
-                if best:
-                    st.write("Best score:", best)
+            n = len(lig_df)
+            progress = st.progress(0.0, text=f"Preparing to dock {n} compounds…")
+            status = st.empty()
+            results_area = st.empty()
+            dock_results = []
+            any_fail = False
+            full_log = []
+
+            for i, row in lig_df.iterrows():
+                compound = str(row["compound"])
+                frac = i / n
+                progress.progress(frac, text=f"Docking {i+1} of {n}:  {compound}")
+                status.markdown(
+                    f'<div style="font-size:0.85rem;color:#8B7355;">'
+                    f'⏳ Running AutoDock Vina on <strong>{compound}</strong>…</div>',
+                    unsafe_allow_html=True,
+                )
+
+                cmd = core.build_acd_dock_cmd(
+                    receptor=receptor,
+                    smiles=str(row["smiles"]),
+                    name=compound,
+                    ph=dock_ph,
+                    output_dir=dock_out_dir,
+                    save_poses=True,
+                )
+                rc, output = core.run_command(cmd)
+                full_log.append(f"=== {compound} (exit {rc}) ===\n{output}\n")
+                if rc != 0:
+                    any_fail = True
+
+                # Try to read this compound's best score
+                score = None
+                try:
+                    score = core.best_score_for_compound(dock_out_dir, compound)
+                except Exception:
+                    pass
+
+                dock_results.append({
+                    "compound": compound,
+                    "status": "✅ done" if rc == 0 else "❌ failed",
+                    "best_score": round(float(score), 2) if isinstance(score, (int, float)) else "—",
+                })
+                results_area.dataframe(
+                    pd.DataFrame(dock_results),
+                    use_container_width=True, hide_index=True,
+                )
+
+            progress.progress(1.0, text=f"Finished docking {n} compounds")
+            status.empty()
+            (work / "acd_batch.log").write_text("\n".join(full_log))
+
+            if any_fail:
+                st.warning("Docking finished, but some compounds failed. See the log below.")
             else:
-                st.error("Docking failed. See log below.")
+                st.success(f"Docking finished — all {n} compounds ✅")
+
+            # Rank the successful results
+            ok_rows = [r for r in dock_results if isinstance(r["best_score"], (int, float))]
+            if ok_rows:
+                ranked = pd.DataFrame(ok_rows).sort_values("best_score").reset_index(drop=True)
+                st.markdown("### Ranked by best docking score")
+                st.dataframe(ranked, use_container_width=True, hide_index=True)
+                st.session_state.docking_summary = ranked
+
             with st.expander("ACD log"):
-                st.text(output[-3000:])
+                st.text("\n".join(full_log)[-4000:])
     elif not receptor:
         st.info("Load a target receptor above to enable docking.")
     else:
