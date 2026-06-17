@@ -1,4 +1,4 @@
-# Analog Designer — Streamlit App
+# Analog Builder — Streamlit App
 
 Interactive ligand analog generation with optional structure-based docking and PLIP/cIFP analysis.
 
