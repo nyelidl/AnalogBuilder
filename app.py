@@ -24,6 +24,13 @@ from rdkit.Chem import AllChem, Draw
 
 import core
 
+# Optional in-browser molecule sketcher
+try:
+    from streamlit_ketcher import st_ketcher
+    _KETCHER_OK = True
+except Exception:
+    _KETCHER_OK = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config + global CSS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,7 +251,7 @@ DEFAULTS = {
     "allow_heteroatom_H": False,
     # Step 3 – quick (always visible)
     "risk": "Moderate",
-    "n_analogs": 50,
+    "n_analogs": 20,
     "rank_by": "Overall drug-likeness (recommended)",
     "rank_code": "Balanced (100-pt weights)",
     # Step 3 – advanced (collapsed)
@@ -482,13 +489,43 @@ if step == 1:
     col_form, col_mol = st.columns([1, 1], gap="large")
 
     with col_form:
-        smiles = st.text_area(
-            "Paste your compound SMILES",
-            value=st.session_state.parent_smiles,
-            height=90,
-            placeholder="e.g. CC1=CC=CC=C1",
+        input_tab = st.radio(
+            "How do you want to enter your compound?",
+            ["⌨️ Paste SMILES", "✏️ Draw it"],
+            horizontal=True,
+            label_visibility="collapsed",
         )
-        hint("SMILES is a text code for a molecule. You can copy it from ChemDraw, PubChem, or any chemistry database.")
+
+        if input_tab == "⌨️ Paste SMILES":
+            smiles = st.text_area(
+                "Paste your compound SMILES",
+                value=st.session_state.parent_smiles,
+                height=90,
+                placeholder="e.g. CC1=CC=CC=C1",
+            )
+            hint("SMILES is a text code for a molecule. Copy it from ChemDraw, PubChem, or any chemistry database.")
+        else:
+            if _KETCHER_OK:
+                hint("Draw your molecule, then click **Apply** in the sketcher to capture it.")
+                drawn = st_ketcher(
+                    st.session_state.parent_smiles or "",
+                    key="ketcher_draw",
+                    height=400,
+                )
+                smiles = drawn or st.session_state.parent_smiles
+                if smiles:
+                    st.caption(f"Captured SMILES: `{smiles}`")
+            else:
+                st.warning(
+                    "The drawing tool isn't installed here. Add `streamlit-ketcher` to "
+                    "requirements.txt to enable it. For now, paste a SMILES instead."
+                )
+                smiles = st.text_area(
+                    "Paste your compound SMILES",
+                    value=st.session_state.parent_smiles,
+                    height=90,
+                    placeholder="e.g. CC1=CC=CC=C1",
+                )
 
         name = st.text_input("Give it a short name", value=st.session_state.parent_name, placeholder="e.g. compound_1")
         hint("Used to label your output files.")
@@ -659,10 +696,10 @@ elif step == 3 and mode == "ligand":
     with col_a:
         st.markdown("### How many analogs?")
         st.session_state.n_analogs = st.slider(
-            "Number of analogs to generate", 10, 200,
-            st.session_state.n_analogs, step=10,
+            "Number of analogs to generate", 5, 20,
+            min(st.session_state.n_analogs, 20), step=1,
         )
-        hint("More analogs = more diversity, but slower to review. 50 is a good starting point.")
+        hint("Up to 20 analogs are generated. Fewer is faster to review.")
 
         st.markdown("### How adventurous?")
         risk_map = {
@@ -824,7 +861,7 @@ elif step == 3 and mode == "structure":
     st.markdown("### Generation settings")
     c1, c2 = st.columns(2)
     with c1:
-        st.session_state.n_analogs = st.slider("Number of analogs", 10, 200, st.session_state.n_analogs, step=10)
+        st.session_state.n_analogs = st.slider("Number of analogs", 5, 20, min(st.session_state.n_analogs, 20), step=1)
     with c2:
         risk_map = {
             "Conservative": "Conservative",
@@ -919,7 +956,7 @@ elif step == 4:
                 weights=weights,
                 avoid_opts=avoid_opts,
                 max_MW=st.session_state.max_MW,
-                max_analogs=st.session_state.n_analogs,
+                max_analogs=min(st.session_state.n_analogs, 20),
                 rank_by=st.session_state.get("rank_code", "Balanced (100-pt weights)"),
             )
         st.session_state.analogs_df = df
