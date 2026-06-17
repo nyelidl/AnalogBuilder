@@ -5,7 +5,10 @@
 This notebook is intended as a lightweight research workflow, not a full drug-discovery platform. It helps generate and organize candidate derivatives/analogs for follow-up docking, visualization, and downstream analysis.
 
 ---
-kowith@ccs.tsukuba.ac.jp
+
+*17 Jun 2026*
+**by kowith@ccs.tsukuba.ac.jp**
+
 ---
 
 ## Key Features
