@@ -1,8 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Analog Builder — Python dependencies
+#
+# CORE: these four run the full design workflow (Steps 1–4 + export).
+# rdkit pinned <2026 because anyonecandock/pkanet pull in dimorphite-dl,
+# which caps rdkit at <2026. 2025.9.6 is the newest compatible release.
+# ─────────────────────────────────────────────────────────────────────────────
 streamlit==1.58.0
-rdkit==2026.3.3
+rdkit==2025.9.6
 pandas==3.0.3
 numpy==2.4.6
-anyonecandock==1.1.3
-gemmi==0.7.5                       # convert uploaded .cif receptors to .pdb
-plip==3.0.0                        # PLIP interaction fingerprints (else distance fallback)
-pkanet-cloud[recommended]==0.9.0   # smarter protonation states for docking
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL — uncomment only if you need them. The app degrades gracefully:
+# missing tools show an "install X" hint instead of crashing.
+#
+# Docking (Step 5) — heavy; pulls in prody + meeko + openbabel. Best run
+# locally, not on Streamlit Cloud. Requires Vina + obabel on PATH.
+#   anyonecandock==1.1.3
+#
+# Upload .cif receptors (auto-converts to .pdb):
+#   gemmi==0.7.5
+#
+# PLIP interaction fingerprints (else distance-contact fallback is used):
+#   plip==3.0.0
+#
+# Smarter protonation states for docking:
+#   pkanet-cloud[recommended]==0.9.0
+# ─────────────────────────────────────────────────────────────────────────────
