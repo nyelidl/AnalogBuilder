@@ -216,7 +216,8 @@ DEFAULTS = {
     # Step 3 – quick (always visible)
     "risk": "Moderate",
     "n_analogs": 50,
-    "rank_by": "Balanced",
+    "rank_by": "Overall drug-likeness (recommended)",
+    "rank_code": "Balanced (100-pt weights)",
     # Step 3 – advanced (collapsed)
     "weights": {"potency": 30, "selectivity": 10, "solubility": 25,
                 "metabolic": 15, "synthesis": 10, "novelty": 10},
@@ -614,20 +615,20 @@ elif step == 3 and mode == "ligand":
     with col_b:
         st.markdown("### Rank results by")
         rank_map = {
-            "Overall drug-likeness (recommended)": "Balanced",
+            "Overall drug-likeness (recommended)": "Balanced (100-pt weights)",
             "Most similar to parent": "Similarity to parent",
             "Best predicted solubility": "Solubility (ESOL)",
             "Easiest to synthesise": "Synthetic feasibility",
         }
+        rank_labels = list(rank_map.keys())
+        current_label = st.session_state.rank_by if st.session_state.rank_by in rank_labels else rank_labels[0]
         rank_label = st.radio(
             "Sort analogs by",
-            list(rank_map.keys()),
-            index=list(rank_map.values()).index(
-                next((k for k, v in rank_map.items() if v == st.session_state.rank_by),
-                     "Overall drug-likeness (recommended)")
-            ),
+            rank_labels,
+            index=rank_labels.index(current_label),
         )
-        st.session_state.rank_by = rank_map[rank_label]
+        st.session_state.rank_by = rank_label
+        st.session_state.rank_code = rank_map[rank_label]
 
         st.markdown("### Fragment categories")
         hint("Uncheck any group types you want to exclude from the library.")
@@ -853,10 +854,7 @@ elif step == 4:
                 avoid_opts=avoid_opts,
                 max_MW=st.session_state.max_MW,
                 max_analogs=st.session_state.n_analogs,
-                rank_by=st.session_state.rank_by if st.session_state.rank_by in [
-                    "Balanced (100-pt weights)", "Similarity to parent", "Solubility (ESOL)",
-                    "ADMET (QED)", "Synthetic feasibility", "Binding proxy (heuristic)"
-                ] else "Balanced (100-pt weights)",
+                rank_by=st.session_state.get("rank_code", "Balanced (100-pt weights)"),
             )
         st.session_state.analogs_df = df
 
