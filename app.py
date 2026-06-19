@@ -315,15 +315,19 @@ def svg_img(mol, highlight=None, size=(500, 380)):
 
 
 def show_mol(mol, highlight=None, size=(400, 300), use_container_width=True):
-    """Render a molecule using st.image (PNG) — works reliably on Streamlit Cloud."""
+    """Render a molecule using st.image (PNG) — works reliably on Streamlit Cloud.
+    Uses MolsToGridImage with returnPNG=True which is confirmed working."""
     if mol is None:
         return
     try:
         AllChem.Compute2DCoords(mol)
-        img = Draw.MolToImage(mol, size=size, highlightAtoms=list(highlight or []))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        st.image(buf.getvalue(), use_container_width=use_container_width)
+        png = Draw.MolsToGridImage(
+            [mol], molsPerRow=1,
+            subImgSize=size,
+            highlightAtomLists=[list(highlight or [])],
+            returnPNG=True,
+        )
+        st.image(png, use_container_width=use_container_width)
     except Exception:
         st.caption("(Could not render structure)")
 
@@ -667,7 +671,6 @@ if step == 1:
         if pc_results:
             st.markdown(f"**{len(pc_results)} result{'s' if len(pc_results)>1 else ''}**")
             for r in pc_results:
-                is_picked = (st.session_state.get("_pc_picked_cid") == r["cid"])
                 with st.container():
                     rc1, rc2, rc3 = st.columns([5, 2, 1])
                     with rc1:
@@ -677,46 +680,32 @@ if step == 1:
                     with rc2:
                         mol_tmp = Chem.MolFromSmiles(r["smiles"])
                         if mol_tmp:
-                            AllChem.Compute2DCoords(mol_tmp)
-                            img_buf = io.BytesIO()
-                            Draw.MolToImage(mol_tmp, size=(200, 150)).save(img_buf, format="PNG")
-                            st.image(img_buf.getvalue(), width=160)
+                            try:
+                                AllChem.Compute2DCoords(mol_tmp)
+                                png = Draw.MolsToGridImage(
+                                    [mol_tmp], molsPerRow=1,
+                                    subImgSize=(200, 150), returnPNG=True,
+                                )
+                                st.image(png, width=160)
+                            except Exception:
+                                st.caption("(structure)")
                     with rc3:
-                        if st.button(
-                            "✓ Use" if is_picked else "Use",
-                            key=f"pc_use_{r['cid']}",
-                            type="primary" if is_picked else "secondary",
-                        ):
-                            st.session_state["_pc_picked_cid"] = r["cid"]
-                            st.session_state.parent_smiles = r["smiles"]
-                            st.session_state.parent_name = r["name"][:30].lower().replace(" ", "_")
-                            smiles = r["smiles"]
-                            st.rerun()
+                        if st.button("Use →", key=f"pc_use_{r['cid']}", type="primary"):
+                            mol_use = Chem.MolFromSmiles(r["smiles"])
+                            if mol_use:
+                                AllChem.Compute2DCoords(mol_use)
+                                st.session_state.parent_smiles = r["smiles"]
+                                st.session_state.parent_name = r["name"][:30].lower().replace(" ", "_")
+                                st.session_state.parent_mol = mol_use
+                                st.session_state.selected_atoms = set()
+                                st.session_state.analogs_df = None
+                                go(2)
                     st.divider()
 
-        # Preview + name + continue (after selecting a compound)
-        if smiles and smiles.strip():
-            st.divider()
-            picked_name = st.session_state.get("parent_name", "compound")
-            picked_cid = st.session_state.get("_pc_picked_cid", "")
-            if picked_cid:
-                st.success(f"✅ Selected: **{picked_name}** (CID {picked_cid})")
-
-            prev_c, form_c = st.columns([1, 1], gap="large")
-            with prev_c:
-                mol_preview = Chem.MolFromSmiles(smiles.strip())
-                if mol_preview:
-                    AllChem.Compute2DCoords(mol_preview)
-                    c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
-                    st.markdown("**Preview** — highlighted atoms can be modified")
-                    img_buf = io.BytesIO()
-                    Draw.MolToImage(mol_preview, size=(400, 300)).save(img_buf, format="PNG")
-                    st.image(img_buf.getvalue(), use_container_width=True)
-                    st.caption(f"{mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
-            with form_c:
-                name = st.text_input("Compound name", value=st.session_state.parent_name, key="pc_name")
-                hint("Used to label your output files.")
-                _render_step1_receptor_and_continue(smiles, name)
+        # If no results yet but smiles already set, show continue option
+        if not pc_results and smiles and smiles.strip():
+            name = st.text_input("Compound name", value=st.session_state.parent_name, key="pc_name")
+            _render_step1_receptor_and_continue(smiles, name)
 
     # ── DRAW MODE: full-width sketcher, preview + form below ─────────────────
     elif draw_mode:
