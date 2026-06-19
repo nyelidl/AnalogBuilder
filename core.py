@@ -701,53 +701,69 @@ def _pdb_reskey(line: str) -> Tuple:
 # PubChem PUG REST API
 # ---------------------------------------------------------------------------
 
-def search_pubchem(query: str, max_results: int = 10) -> List[Dict]:
+def search_pubchem(query: str, max_results: int = 10) -> Dict:
     """Search PubChem by compound name / synonym / CAS number.
-    Returns a list of dicts: {name, cid, smiles, mw, formula}."""
+    Returns a dict: {found, cid, smiles, iupac, formula, mw, img_url, url, error}."""
     query = query.strip()
     if not query:
-        return []
+        return {"found": False, "error": "empty query"}
 
-    # Step 1: name → CID list
-    url = (
-        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
-        f"{urllib.request.quote(query)}/cids/JSON"
-    )
     try:
+        # Step 1: name → first CID
+        url = (
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+            f"{urllib.request.quote(query)}/cids/JSON"
+        )
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
-        cids = data.get("IdentifierList", {}).get("CID", [])[:max_results]
-    except Exception:
-        cids = []
+        cids = data.get("IdentifierList", {}).get("CID", [])
+        if not cids:
+            return {"found": False, "error": f"'{query}' not found in PubChem"}
+        cid = cids[0]
 
-    if not cids:
-        return []
+        # Step 2: CID → properties (try multiple property combos for robustness)
+        p = {}
+        smiles = ""
+        for prop_block in [
+            "IUPACName,MolecularFormula,MolecularWeight,IsomericSMILES,CanonicalSMILES",
+            "IUPACName,MolecularFormula,MolecularWeight,CanonicalSMILES",
+        ]:
+            prop_url = (
+                f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/"
+                f"property/{prop_block}/JSON"
+            )
+            try:
+                req2 = urllib.request.Request(prop_url, headers={"Accept": "application/json"})
+                with urllib.request.urlopen(req2, timeout=10) as resp2:
+                    prop_data = json.loads(resp2.read())
+                props = prop_data.get("PropertyTable", {}).get("Properties", [])
+                if props:
+                    p = props[0]
+                    smiles = (
+                        p.get("IsomericSMILES", "")
+                        or p.get("CanonicalSMILES", "")
+                    )
+                    if smiles:
+                        break
+            except Exception:
+                continue
 
-    # Step 2: CID list → properties
-    cid_str = ",".join(str(c) for c in cids)
-    prop_url = (
-        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid_str}/"
-        f"property/MolecularFormula,MolecularWeight,CanonicalSMILES,IUPACName/JSON"
-    )
-    try:
-        req = urllib.request.Request(prop_url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            prop_data = json.loads(resp.read())
-        props = prop_data.get("PropertyTable", {}).get("Properties", [])
-    except Exception:
-        props = []
-
-    results = []
-    for p in props:
-        results.append({
-            "cid": p.get("CID"),
-            "name": p.get("IUPACName", query),
-            "smiles": p.get("CanonicalSMILES", ""),
-            "mw": p.get("MolecularWeight", ""),
+        return {
+            "found": True,
+            "cid": cid,
+            "smiles": smiles,
+            "iupac": p.get("IUPACName", query),
             "formula": p.get("MolecularFormula", ""),
-        })
-    return results
+            "mw": float(p.get("MolecularWeight", 0) or 0),
+            "img_url": (
+                f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/"
+                f"{cid}/PNG?record_type=2d&image_size=300x300"
+            ),
+            "url": f"https://pubchem.ncbi.nlm.nih.gov/compound/{cid}",
+        }
+    except Exception as e:
+        return {"found": False, "error": str(e)}
 
 
 def pubchem_cid_to_smiles(cid: int) -> Optional[str]:
