@@ -306,11 +306,26 @@ def info_card(text: str):
 
 
 def svg_img(mol, highlight=None, size=(500, 380)):
+    """Generate SVG as base64 img tag (works locally, may be stripped on Cloud)."""
     if mol is None:
         return ""
     svg = core.draw_mol_svg(mol, highlight=list(highlight or []), size=size)
     b64 = base64.b64encode(svg.encode()).decode()
     return f'<img src="data:image/svg+xml;base64,{b64}" style="max-width:100%;border-radius:10px;border:1px solid #E0D6C8;">'
+
+
+def show_mol(mol, highlight=None, size=(400, 300), use_container_width=True):
+    """Render a molecule using st.image (PNG) — works reliably on Streamlit Cloud."""
+    if mol is None:
+        return
+    try:
+        AllChem.Compute2DCoords(mol)
+        img = Draw.MolToImage(mol, size=size, highlightAtoms=list(highlight or []))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        st.image(buf.getvalue(), use_container_width=use_container_width)
+    except Exception:
+        st.caption("(Could not render structure)")
 
 
 def _render_step1_receptor_and_continue(smiles: str, name: str):
@@ -679,8 +694,14 @@ if step == 1:
                             st.rerun()
                     st.divider()
 
-        # Preview + name + continue
+        # Preview + name + continue (after selecting a compound)
         if smiles and smiles.strip():
+            st.divider()
+            picked_name = st.session_state.get("parent_name", "compound")
+            picked_cid = st.session_state.get("_pc_picked_cid", "")
+            if picked_cid:
+                st.success(f"✅ Selected: **{picked_name}** (CID {picked_cid})")
+
             prev_c, form_c = st.columns([1, 1], gap="large")
             with prev_c:
                 mol_preview = Chem.MolFromSmiles(smiles.strip())
@@ -688,7 +709,9 @@ if step == 1:
                     AllChem.Compute2DCoords(mol_preview)
                     c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
                     st.markdown("**Preview** — highlighted atoms can be modified")
-                    st.markdown(svg_img(mol_preview, highlight=c_sites), unsafe_allow_html=True)
+                    img_buf = io.BytesIO()
+                    Draw.MolToImage(mol_preview, size=(400, 300)).save(img_buf, format="PNG")
+                    st.image(img_buf.getvalue(), use_container_width=True)
                     st.caption(f"{mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
             with form_c:
                 name = st.text_input("Compound name", value=st.session_state.parent_name, key="pc_name")
@@ -709,10 +732,9 @@ if step == 1:
         with prev_col:
             mol_preview = Chem.MolFromSmiles(smiles.strip()) if smiles and smiles.strip() else None
             if mol_preview:
-                AllChem.Compute2DCoords(mol_preview)
                 c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
                 st.markdown("**Preview** — highlighted atoms can be modified")
-                st.markdown(svg_img(mol_preview, highlight=c_sites), unsafe_allow_html=True)
+                show_mol(mol_preview, highlight=c_sites)
                 st.caption(f"Captured SMILES: `{smiles}`  ·  {mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
             else:
                 st.markdown(
@@ -751,10 +773,9 @@ if step == 1:
         with col_mol:
             mol_preview = Chem.MolFromSmiles(smiles.strip()) if smiles.strip() else None
             if mol_preview:
-                AllChem.Compute2DCoords(mol_preview)
                 c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
                 st.markdown("**Preview** — highlighted atoms can be modified")
-                st.markdown(svg_img(mol_preview, highlight=c_sites), unsafe_allow_html=True)
+                show_mol(mol_preview, highlight=c_sites)
                 st.caption(f"{mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
             else:
                 st.markdown(
@@ -820,8 +841,7 @@ elif step == 2:
 
     with col_view:
         st.markdown("### Structure")
-        svg = svg_img(mol, highlight=sorted(new_sel), size=(480, 380))
-        st.markdown(svg, unsafe_allow_html=True)
+        show_mol(mol, highlight=sorted(new_sel))
         if new_sel:
             st.caption(f"Selected: atoms {sorted(new_sel)}")
         else:
