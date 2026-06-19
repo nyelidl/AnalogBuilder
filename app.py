@@ -432,9 +432,13 @@ LIGAND_STEPS  = ["Parent compound", "Choose atoms", "Design options", "View resu
 STRUCT_STEPS  = ["Parent + receptor", "Choose atoms", "Pocket guidance", "View results", "Docking & cIFP", "Export"]
 
 def render_sidebar():
+    st.sidebar.markdown(
+        '<style>[data-testid="stSidebar"] [data-testid="stImage"] {text-align: center;}</style>',
+        unsafe_allow_html=True,
+    )
     st.sidebar.image(LOGO_URL, width=160)
     st.sidebar.markdown(
-        '<p style="font-size:0.78rem;color:#8B7355;margin-top:-8px;">Ligand design for everyone</p>',
+        '<p style="text-align:center;font-size:0.78rem;color:#8B7355;margin-top:-8px;">Ligand design for everyone</p>',
         unsafe_allow_html=True,
     )
     st.sidebar.divider()
