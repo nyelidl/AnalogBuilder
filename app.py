@@ -478,7 +478,7 @@ def render_sidebar():
     st.sidebar.markdown(
         f'<p style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.08em;'
         f'color:#8B7355;margin-bottom:8px;">'
-        f'<img src="{_mode_icon}" hight="140" style="vertical-align:middle;margin-right:4px;"/>'
+        f'<img src="{_mode_icon}" hight="100" style="vertical-align:middle;margin-right:4px;"/>'
         f'{_mode_name} track</p>',
         unsafe_allow_html=True
     )
@@ -547,7 +547,7 @@ if st.session_state.mode is None:
     with col_l:
         st.markdown(f"""
         <div class="mode-card">
-            <div class="icon"><img src="{LB_URL}" hight="140" style="display:inline-block;"/></div>
+            <div class="icon"><img src="{LB_URL}" hight="100" style="display:inline-block;"/></div>
             <h2>Ligand-based</h2>
             <p>Start with just a SMILES string.<br>
             Great for exploring substitutions quickly — no protein structure needed.</p>
@@ -562,7 +562,7 @@ if st.session_state.mode is None:
     with col_r:
         st.markdown(f"""
         <div class="mode-card">
-            <div class="icon"><img src="{SB_URL}" hight="140" style="display:inline-block;"/></div>
+            <div class="icon"><img src="{SB_URL}" hight="100" style="display:inline-block;"/></div>
             <h2>Structure-based</h2>
             <p>Upload or fetch a protein structure.<br>
             Analogs are guided by the actual binding pocket environment.</p>
@@ -599,7 +599,7 @@ tab_l, tab_r = st.columns(2)
 with tab_l:
     st.markdown(
         f'<div style="text-align:center;margin-bottom:-8px;">'
-        f'<img src="{LB_URL}" hight="140" style="opacity:{1.0 if mode=="ligand" else 0.4};"/></div>',
+        f'<img src="{LB_URL}" hight="100" style="opacity:{1.0 if mode=="ligand" else 0.4};"/></div>',
         unsafe_allow_html=True,
     )
     if st.button(
@@ -693,7 +693,7 @@ if step == 1:
                     f"[PubChem CID {_sr['cid']}]({_sr['url']})"
                 )
             with _imgc:
-                st.image(_sr["img_url"], width=140)
+                st.image(_sr["img_url"], width=100)
             if not (_sr.get("smiles") or "").strip():
                 st.warning("This PubChem result did not return a usable SMILES string.")
         elif _sr and not _sr.get("found"):
