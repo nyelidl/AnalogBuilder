@@ -547,7 +547,7 @@ if st.session_state.mode is None:
     with col_l:
         st.markdown(f"""
         <div class="mode-card">
-            <div class="icon"><img src="{LB_URL}" width="70" style="display:inline-block;"/></div>
+            <div class="icon"><img src="{LB_URL}" width="140" style="display:inline-block;"/></div>
             <h2>Ligand-based</h2>
             <p>Start with just a SMILES string.<br>
             Great for exploring substitutions quickly — no protein structure needed.</p>
