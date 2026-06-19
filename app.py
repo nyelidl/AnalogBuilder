@@ -478,7 +478,7 @@ def render_sidebar():
     st.sidebar.markdown(
         f'<p style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.08em;'
         f'color:#8B7355;margin-bottom:8px;">'
-        f'<img src="{_mode_icon}" width="70" style="vertical-align:middle;margin-right:4px;"/>'
+        f'<img src="{_mode_icon}" width="140" style="vertical-align:middle;margin-right:4px;"/>'
         f'{_mode_name} track</p>',
         unsafe_allow_html=True
     )
