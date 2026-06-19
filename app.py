@@ -691,10 +691,14 @@ if step == 1:
                 _sr = core.search_pubchem(pc_query.strip())
                 st.session_state["_pc_result"] = _sr
                 if _sr.get("found") and (_sr.get("smiles") or "").strip():
+                    # Set WIDGET keys directly (not just parent_smiles)
+                    # — Streamlit keyed widgets ignore value= after first render
+                    st.session_state["smiles_in_pc"] = _sr["smiles"]
+                    _auto_name = (_sr["iupac"] or pc_query)[:20].lower().replace(" ", "_")
+                    st.session_state["pc_compound_name"] = _auto_name
                     st.session_state.parent_smiles = _sr["smiles"]
-                    st.session_state.parent_name = (
-                        (_sr["iupac"] or pc_query)[:20].lower().replace(" ", "_")
-                    )
+                    st.session_state.parent_name = _auto_name
+                    st.rerun()
 
         # Show result
         _sr = st.session_state.get("_pc_result")
