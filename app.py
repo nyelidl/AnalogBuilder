@@ -32,7 +32,9 @@ except Exception:
     _KETCHER_OK = False
 
 # Logo
-LOGO_URL = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/b69e5c4fbe467806394bb5b83b0bc714ad7a54a9/AB.svg"
+LOGO_URL = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/AB.svg"
+LB_URL   = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/LB.svg"
+SB_URL   = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/SB.svg"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config + global CSS
@@ -471,9 +473,13 @@ def render_sidebar():
     steps = LIGAND_STEPS if mode == "ligand" else STRUCT_STEPS
     current = st.session_state.step
 
+    _mode_icon = LB_URL if mode == "ligand" else SB_URL
+    _mode_name = "Ligand-based" if mode == "ligand" else "Structure-based"
     st.sidebar.markdown(
         f'<p style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.08em;'
-        f'color:#8B7355;margin-bottom:8px;">{"Ligand-based" if mode=="ligand" else "Structure-based"} track</p>',
+        f'color:#8B7355;margin-bottom:8px;">'
+        f'<img src="{_mode_icon}" width="16" style="vertical-align:middle;margin-right:4px;"/>'
+        f'{_mode_name} track</p>',
         unsafe_allow_html=True
     )
 
@@ -539,9 +545,9 @@ if st.session_state.mode is None:
     col_l, col_r = st.columns(2, gap="large")
 
     with col_l:
-        st.markdown("""
+        st.markdown(f"""
         <div class="mode-card">
-            <div class="icon">💊</div>
+            <div class="icon"><img src="{LB_URL}" width="64" style="display:inline-block;"/></div>
             <h2>Ligand-based</h2>
             <p>Start with just a SMILES string.<br>
             Great for exploring substitutions quickly — no protein structure needed.</p>
@@ -554,9 +560,9 @@ if st.session_state.mode is None:
             st.rerun()
 
     with col_r:
-        st.markdown("""
+        st.markdown(f"""
         <div class="mode-card">
-            <div class="icon">🔬</div>
+            <div class="icon"><img src="{SB_URL}" width="64" style="display:inline-block;"/></div>
             <h2>Structure-based</h2>
             <p>Upload or fetch a protein structure.<br>
             Analogs are guided by the actual binding pocket environment.</p>
@@ -591,16 +597,26 @@ def switch_mode(new_mode: str):
 
 tab_l, tab_r = st.columns(2)
 with tab_l:
+    st.markdown(
+        f'<div style="text-align:center;margin-bottom:-8px;">'
+        f'<img src="{LB_URL}" width="28" style="opacity:{1.0 if mode=="ligand" else 0.4};"/></div>',
+        unsafe_allow_html=True,
+    )
     if st.button(
-        "💊 Ligand-based",
+        "Ligand-based",
         key="tab_ligand",
         use_container_width=True,
         type="primary" if mode == "ligand" else "secondary",
     ):
         switch_mode("ligand")
 with tab_r:
+    st.markdown(
+        f'<div style="text-align:center;margin-bottom:-8px;">'
+        f'<img src="{SB_URL}" width="28" style="opacity:{1.0 if mode=="structure" else 0.4};"/></div>',
+        unsafe_allow_html=True,
+    )
     if st.button(
-        "🔬 Structure-based",
+        "Structure-based",
         key="tab_structure",
         use_container_width=True,
         type="primary" if mode == "structure" else "secondary",
