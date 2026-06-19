@@ -504,12 +504,12 @@ render_sidebar()
 # ─────────────────────────────────────────────────────────────────────────────
 
 if st.session_state.mode is None:
-    lc1, lc2, lc3 = st.columns([1, 2, 1])
-    with lc2:
-        st.image(LOGO_URL, width=260)
     st.markdown(
-        '<p style="text-align:center;color:#8B7355;margin-top:-8px;margin-bottom:24px;">'
-        'Design new drug candidates by modifying a parent compound. Choose how you want to work:</p>',
+        f'<div style="text-align:center;margin:40px 0 8px;">'
+        f'<img src="{LOGO_URL}" width="260" style="display:inline-block;"/>'
+        f'</div>'
+        f'<p style="text-align:center;color:#8B7355;margin-bottom:28px;">'
+        f'Design new drug candidates by modifying a parent compound. Choose how you want to work:</p>',
         unsafe_allow_html=True,
     )
 
