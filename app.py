@@ -31,13 +31,16 @@ try:
 except Exception:
     _KETCHER_OK = False
 
+# Logo
+LOGO_URL = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/b69e5c4fbe467806394bb5b83b0bc714ad7a54a9/AB.svg"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config + global CSS
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="⌬+⌬ Analog Builder",
-    page_icon="⌬",
+    page_icon=LOGO_URL,
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -429,8 +432,11 @@ LIGAND_STEPS  = ["Parent compound", "Choose atoms", "Design options", "View resu
 STRUCT_STEPS  = ["Parent + receptor", "Choose atoms", "Pocket guidance", "View results", "Docking & cIFP", "Export"]
 
 def render_sidebar():
-    st.sidebar.markdown("## ⌬+⌬ Analog Builder")
-    st.sidebar.caption("Ligand design for everyone")
+    st.sidebar.image(LOGO_URL, width=160)
+    st.sidebar.markdown(
+        '<p style="font-size:0.78rem;color:#8B7355;margin-top:-8px;">Ligand design for everyone</p>',
+        unsafe_allow_html=True,
+    )
     st.sidebar.divider()
 
     mode = st.session_state.mode
@@ -498,12 +504,14 @@ render_sidebar()
 # ─────────────────────────────────────────────────────────────────────────────
 
 if st.session_state.mode is None:
-    st.markdown("## ⌬+⌬ Analog Builder")
+    lc1, lc2, lc3 = st.columns([1, 2, 1])
+    with lc2:
+        st.image(LOGO_URL, width=260)
     st.markdown(
-        "Design new drug candidates by modifying a parent compound. "
-        "Choose how you want to work:"
+        '<p style="text-align:center;color:#8B7355;margin-top:-8px;margin-bottom:24px;">'
+        'Design new drug candidates by modifying a parent compound. Choose how you want to work:</p>',
+        unsafe_allow_html=True,
     )
-    st.write("")
 
     col_l, col_r = st.columns(2, gap="large")
 
