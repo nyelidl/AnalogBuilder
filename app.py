@@ -562,7 +562,7 @@ if st.session_state.mode is None:
     with col_r:
         st.markdown(f"""
         <div class="mode-card">
-            <div class="icon"><img src="{SB_URL}" width="70" style="display:inline-block;"/></div>
+            <div class="icon"><img src="{SB_URL}" width="140" style="display:inline-block;"/></div>
             <h2>Structure-based</h2>
             <p>Upload or fetch a protein structure.<br>
             Analogs are guided by the actual binding pocket environment.</p>
@@ -599,7 +599,7 @@ tab_l, tab_r = st.columns(2)
 with tab_l:
     st.markdown(
         f'<div style="text-align:center;margin-bottom:-8px;">'
-        f'<img src="{LB_URL}" width="70" style="opacity:{1.0 if mode=="ligand" else 0.4};"/></div>',
+        f'<img src="{LB_URL}" width="140" style="opacity:{1.0 if mode=="ligand" else 0.4};"/></div>',
         unsafe_allow_html=True,
     )
     if st.button(
