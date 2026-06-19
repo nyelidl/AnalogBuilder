@@ -701,53 +701,78 @@ def _pdb_reskey(line: str) -> Tuple:
 # PubChem PUG REST API
 # ---------------------------------------------------------------------------
 
-def search_pubchem(query: str, max_results: int = 10) -> Dict:
+def search_pubchem(query: str) -> Dict:
     """Search PubChem by compound name / synonym / CAS number.
-    Returns a dict: {found, cid, smiles, iupac, formula, mw, img_url, url, error}."""
+    Uses multiple fallback strategies to find SMILES (matching ACD's robust logic).
+    Returns: {found, cid, smiles, iupac, formula, mw, img_url, url, error}."""
     query = query.strip()
     if not query:
         return {"found": False, "error": "empty query"}
 
     try:
-        # Step 1: name → first CID
-        url = (
+        def _get_json(url):
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read())
+
+        def _pick_smiles(prop_dict):
+            for k in ("IsomericSMILES", "CanonicalSMILES", "ConnectivitySMILES", "SMILES"):
+                v = prop_dict.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return ""
+
+        # Step 1: name -> first CID
+        data = _get_json(
             f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
             f"{urllib.request.quote(query)}/cids/JSON"
         )
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
         cids = data.get("IdentifierList", {}).get("CID", [])
         if not cids:
             return {"found": False, "error": f"'{query}' not found in PubChem"}
         cid = cids[0]
 
-        # Step 2: CID → properties (try multiple property combos for robustness)
+        # Step 2: CID -> properties (try multiple property combos)
         p = {}
         smiles = ""
         for prop_block in [
-            "IUPACName,MolecularFormula,MolecularWeight,IsomericSMILES,CanonicalSMILES",
-            "IUPACName,MolecularFormula,MolecularWeight,CanonicalSMILES",
+            "IUPACName,MolecularFormula,MolecularWeight,IsomericSMILES,CanonicalSMILES,ConnectivitySMILES",
+            "IUPACName,MolecularFormula,MolecularWeight,CanonicalSMILES,ConnectivitySMILES",
+            "IUPACName,MolecularFormula,MolecularWeight,ConnectivitySMILES",
         ]:
-            prop_url = (
-                f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/"
-                f"property/{prop_block}/JSON"
-            )
             try:
-                req2 = urllib.request.Request(prop_url, headers={"Accept": "application/json"})
-                with urllib.request.urlopen(req2, timeout=10) as resp2:
-                    prop_data = json.loads(resp2.read())
+                prop_data = _get_json(
+                    f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/"
+                    f"property/{prop_block}/JSON"
+                )
                 props = prop_data.get("PropertyTable", {}).get("Properties", [])
                 if props:
                     p = props[0]
-                    smiles = (
-                        p.get("IsomericSMILES", "")
-                        or p.get("CanonicalSMILES", "")
-                    )
+                    smiles = _pick_smiles(p)
                     if smiles:
                         break
             except Exception:
                 continue
+
+        # Step 3: ultimate fallback - full compound JSON to find any SMILES
+        if not smiles:
+            try:
+                pc_data = _get_json(
+                    f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/JSON"
+                )
+                pc = pc_data.get("PC_Compounds", [{}])[0]
+                for prop in pc.get("props", []):
+                    urn = prop.get("urn", {})
+                    label = str(urn.get("label", "")).lower()
+                    name2 = str(urn.get("name", "")).lower()
+                    if "smiles" in label or "smiles" in name2:
+                        value = prop.get("value", {})
+                        cand = value.get("sval") or value.get("string") or ""
+                        if cand.strip():
+                            smiles = cand.strip()
+                            break
+            except Exception:
+                pass
 
         return {
             "found": True,
