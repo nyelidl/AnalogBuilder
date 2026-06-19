@@ -659,7 +659,9 @@ if step == 1:
                         mol_tmp = Chem.MolFromSmiles(r["smiles"])
                         if mol_tmp:
                             AllChem.Compute2DCoords(mol_tmp)
-                            st.markdown(svg_img(mol_tmp, size=(140, 100)), unsafe_allow_html=True)
+                            img_buf = io.BytesIO()
+                            Draw.MolToImage(mol_tmp, size=(200, 150)).save(img_buf, format="PNG")
+                            st.image(img_buf.getvalue(), width=160)
                     with rc3:
                         if st.button(
                             "✓ Use" if is_picked else "Use",
