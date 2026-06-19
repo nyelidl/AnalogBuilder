@@ -316,19 +316,33 @@ def svg_img(mol, highlight=None, size=(500, 380)):
     return f'<img src="data:image/svg+xml;base64,{b64}" style="max-width:100%;border-radius:10px;border:1px solid #E0D6C8;">'
 
 
-def show_mol(mol, highlight=None, size=(400, 300), use_container_width=True):
+def show_mol(mol, highlight=None, size=(400, 300), use_container_width=True, atom_indices=False):
     """Render a molecule using st.image (PNG) — works reliably on Streamlit Cloud.
-    Uses MolsToGridImage with returnPNG=True which is confirmed working."""
+    When atom_indices=True, shows atom numbers on the structure."""
     if mol is None:
         return
     try:
         AllChem.Compute2DCoords(mol)
-        png = Draw.MolsToGridImage(
-            [mol], molsPerRow=1,
-            subImgSize=size,
-            highlightAtomLists=[list(highlight or [])],
-            returnPNG=True,
-        )
+        if atom_indices:
+            from rdkit.Chem.Draw import rdMolDraw2D as _d2d
+            d = _d2d.MolDraw2DCairo(*size)
+            o = d.drawOptions()
+            o.addAtomIndices = True
+            o.annotationFontScale = 0.7
+            _d2d.PrepareAndDrawMolecule(
+                d, mol,
+                highlightAtoms=list(highlight or []),
+                highlightAtomColors={i: (1.0, 0.6, 0.6) for i in (highlight or [])},
+            )
+            d.FinishDrawing()
+            png = d.GetDrawingText()
+        else:
+            png = Draw.MolsToGridImage(
+                [mol], molsPerRow=1,
+                subImgSize=size,
+                highlightAtomLists=[list(highlight or [])],
+                returnPNG=True,
+            )
         st.image(png, use_container_width=use_container_width)
     except Exception:
         st.caption("(Could not render structure)")
@@ -478,7 +492,7 @@ def render_sidebar():
     st.sidebar.markdown(
         f'<p style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.08em;'
         f'color:#8B7355;margin-bottom:8px;">'
-        f'<img src="{_mode_icon}" hight="100" style="vertical-align:middle;margin-right:4px;"/>'
+        f'<img src="{_mode_icon}" width="16" style="vertical-align:middle;margin-right:4px;"/>'
         f'{_mode_name} track</p>',
         unsafe_allow_html=True
     )
@@ -547,7 +561,7 @@ if st.session_state.mode is None:
     with col_l:
         st.markdown(f"""
         <div class="mode-card">
-            <div class="icon"><img src="{LB_URL}" hight="100" style="display:inline-block;"/></div>
+            <div class="icon"><img src="{LB_URL}" width="64" style="display:inline-block;"/></div>
             <h2>Ligand-based</h2>
             <p>Start with just a SMILES string.<br>
             Great for exploring substitutions quickly — no protein structure needed.</p>
@@ -562,7 +576,7 @@ if st.session_state.mode is None:
     with col_r:
         st.markdown(f"""
         <div class="mode-card">
-            <div class="icon"><img src="{SB_URL}" hight="100" style="display:inline-block;"/></div>
+            <div class="icon"><img src="{SB_URL}" width="64" style="display:inline-block;"/></div>
             <h2>Structure-based</h2>
             <p>Upload or fetch a protein structure.<br>
             Analogs are guided by the actual binding pocket environment.</p>
@@ -599,7 +613,7 @@ tab_l, tab_r = st.columns(2)
 with tab_l:
     st.markdown(
         f'<div style="text-align:center;margin-bottom:-8px;">'
-        f'<img src="{LB_URL}" hight="100" style="opacity:{1.0 if mode=="ligand" else 0.4};"/></div>',
+        f'<img src="{LB_URL}" width="28" style="opacity:{1.0 if mode=="ligand" else 0.4};"/></div>',
         unsafe_allow_html=True,
     )
     if st.button(
@@ -612,7 +626,7 @@ with tab_l:
 with tab_r:
     st.markdown(
         f'<div style="text-align:center;margin-bottom:-8px;">'
-        f'<img src="{SB_URL}" width="70" style="opacity:{1.0 if mode=="structure" else 0.4};"/></div>',
+        f'<img src="{SB_URL}" width="28" style="opacity:{1.0 if mode=="structure" else 0.4};"/></div>',
         unsafe_allow_html=True,
     )
     if st.button(
@@ -693,7 +707,7 @@ if step == 1:
                     f"[PubChem CID {_sr['cid']}]({_sr['url']})"
                 )
             with _imgc:
-                st.image(_sr["img_url"], width=100)
+                st.image(_sr["img_url"], width=140)
             if not (_sr.get("smiles") or "").strip():
                 st.warning("This PubChem result did not return a usable SMILES string.")
         elif _sr and not _sr.get("found"):
@@ -733,7 +747,7 @@ if step == 1:
             if mol_preview:
                 c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
                 st.markdown("**Preview** — highlighted atoms can be modified")
-                show_mol(mol_preview, highlight=c_sites)
+                show_mol(mol_preview, highlight=c_sites, atom_indices=True)
                 st.caption(f"Captured SMILES: `{smiles}`  ·  {mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
             else:
                 st.markdown(
@@ -774,7 +788,7 @@ if step == 1:
             if mol_preview:
                 c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
                 st.markdown("**Preview** — highlighted atoms can be modified")
-                show_mol(mol_preview, highlight=c_sites)
+                show_mol(mol_preview, highlight=c_sites, atom_indices=True)
                 st.caption(f"{mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
             else:
                 st.markdown(
@@ -840,7 +854,7 @@ elif step == 2:
 
     with col_view:
         st.markdown("### Structure")
-        show_mol(mol, highlight=sorted(new_sel))
+        show_mol(mol, highlight=sorted(new_sel), atom_indices=True)
         if new_sel:
             st.caption(f"Selected: atoms {sorted(new_sel)}")
         else:
