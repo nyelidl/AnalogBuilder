@@ -644,68 +644,62 @@ if step == 1:
 
     # ── PUBCHEM SEARCH ───────────────────────────────────────────────────────
     if pubchem_mode:
-        info_card("Search PubChem by compound name, synonym, or CAS number. The SMILES and structure are fetched automatically.")
-        pc_col1, pc_col2 = st.columns([2, 1])
+        st.markdown("#### 🔍 Search compound from PubChem")
+        pc_col1, pc_col2 = st.columns([5, 1])
         with pc_col1:
             pc_query = st.text_input(
                 "Compound name",
-                value="",
-                placeholder="e.g. imatinib, aspirin, caffeine, 50-78-2",
+                placeholder="e.g. imatinib, apigenin, caffeine, aspirin…",
                 key="pubchem_query",
             )
         with pc_col2:
-            st.write("")  # vertical spacer
-            pc_search = st.button("Search PubChem", type="primary", key="pc_search_btn")
-
-        hint("Powered by PubChem PUG REST API. Results include name, CID, molecular weight, and SMILES.")
+            st.markdown("<div style='height:1.75rem;'></div>", unsafe_allow_html=True)
+            pc_search = st.button("Search", key="pc_search_btn", type="secondary")
 
         if pc_search and pc_query.strip():
-            with st.spinner(f'Searching PubChem for "{pc_query.strip()}"…'):
-                st.session_state["_pc_results"] = core.search_pubchem(pc_query.strip(), max_results=8)
-            if not st.session_state.get("_pc_results"):
-                st.warning(f'No results found for "{pc_query.strip()}". Try a different name or spelling.')
+            with st.spinner(f"Searching PubChem for '{pc_query.strip()}'…"):
+                _sr = core.search_pubchem(pc_query.strip())
+                st.session_state["_pc_result"] = _sr
+                if _sr.get("found") and (_sr.get("smiles") or "").strip():
+                    st.session_state.parent_smiles = _sr["smiles"]
+                    st.session_state.parent_name = (
+                        (_sr["iupac"] or pc_query)[:20].lower().replace(" ", "_")
+                    )
 
-        pc_results = st.session_state.get("_pc_results", [])
-        smiles = st.session_state.parent_smiles
+        # Show result
+        _sr = st.session_state.get("_pc_result")
+        if _sr and _sr.get("found"):
+            _ic, _imgc = st.columns([3, 1])
+            with _ic:
+                st.markdown(
+                    f"**{_sr['iupac']}**  \n"
+                    f"`{_sr['formula']}` · {_sr['mw']:.2f} g/mol · "
+                    f"[PubChem CID {_sr['cid']}]({_sr['url']})"
+                )
+            with _imgc:
+                st.image(_sr["img_url"], width=140)
+            if not (_sr.get("smiles") or "").strip():
+                st.warning("This PubChem result did not return a usable SMILES string.")
+        elif _sr and not _sr.get("found"):
+            st.error(f"Not found: {_sr.get('error', 'Unknown error')}")
 
-        if pc_results:
-            st.markdown(f"**{len(pc_results)} result{'s' if len(pc_results)>1 else ''}**")
-            for r in pc_results:
-                with st.container():
-                    rc1, rc2, rc3 = st.columns([5, 2, 1])
-                    with rc1:
-                        st.markdown(f"**{r['name'][:60]}**")
-                        st.caption(f"CID: {r['cid']} · MW: {r['mw']} Da · {r['formula']}")
-                        st.caption(f"`{r['smiles'][:80]}{'…' if len(r['smiles'])>80 else ''}`")
-                    with rc2:
-                        mol_tmp = Chem.MolFromSmiles(r["smiles"])
-                        if mol_tmp:
-                            try:
-                                AllChem.Compute2DCoords(mol_tmp)
-                                png = Draw.MolsToGridImage(
-                                    [mol_tmp], molsPerRow=1,
-                                    subImgSize=(200, 150), returnPNG=True,
-                                )
-                                st.image(png, width=160)
-                            except Exception:
-                                st.caption("(structure)")
-                    with rc3:
-                        if st.button("Use →", key=f"pc_use_{r['cid']}", type="primary"):
-                            mol_use = Chem.MolFromSmiles(r["smiles"])
-                            if mol_use:
-                                AllChem.Compute2DCoords(mol_use)
-                                st.session_state.parent_smiles = r["smiles"]
-                                st.session_state.parent_name = r["name"][:30].lower().replace(" ", "_")
-                                st.session_state.parent_mol = mol_use
-                                st.session_state.selected_atoms = set()
-                                st.session_state.analogs_df = None
-                                go(2)
-                    st.divider()
+        # SMILES text input — auto-filled from PubChem search
+        smiles = st.text_input(
+            "SMILES string",
+            value=st.session_state.parent_smiles,
+            key="smiles_in_pc",
+            help="Auto-filled from PubChem search, or paste your own SMILES here.",
+        )
+        st.session_state.parent_smiles = smiles
 
-        # If no results yet but smiles already set, show continue option
-        if not pc_results and smiles and smiles.strip():
-            name = st.text_input("Compound name", value=st.session_state.parent_name, key="pc_name")
-            _render_step1_receptor_and_continue(smiles, name)
+        name = st.text_input(
+            "Compound name",
+            value=st.session_state.parent_name,
+            key="pc_compound_name",
+        )
+        hint("Used to label your output files.")
+
+        _render_step1_receptor_and_continue(smiles, name)
 
     # ── DRAW MODE: full-width sketcher, preview + form below ─────────────────
     elif draw_mode:
