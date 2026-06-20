@@ -37,6 +37,20 @@ LB_URL   = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/LB
 SB_URL   = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/SB.svg"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tier logic helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analog_tier(n: int) -> str:
+    """Return tier string based on number of analogs."""
+    if n <= 20:
+        return "docking"      # full: docking + download SMI + 3D
+    elif n <= 200:
+        return "pkanet"       # download SMI + pKaNET 3D only
+    else:
+        return "smi_only"     # download SMI only
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Page config + global CSS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -88,23 +102,45 @@ h3 { font-size: 1.0rem !important; font-weight: 600; color: #3D7A74; }
     color: #2C2C2C !important;
 }
 
-/* ── Mode cards on landing ── */
+/* ── Mode cards — clickable ── */
+.mode-card-wrap {
+    position: relative;
+    cursor: pointer;
+}
 .mode-card {
     background: #FFFFFF;
     border: 2px solid #E0D6C8;
     border-radius: 14px;
     padding: 2rem 1.5rem;
     text-align: center;
-    cursor: pointer;
     transition: border-color 0.2s, box-shadow 0.2s;
+    pointer-events: none;
 }
-.mode-card:hover {
+.mode-card-wrap:hover .mode-card {
     border-color: #E8A020;
     box-shadow: 0 4px 16px rgba(232,160,32,0.15);
+}
+.mode-card-wrap:active .mode-card {
+    border-color: #C88010;
+    box-shadow: 0 2px 8px rgba(200,128,16,0.2);
 }
 .mode-card .icon { font-size: 3rem; margin-bottom: 0.5rem; }
 .mode-card h2 { color: #2C2C2C; margin: 0.4rem 0 0.6rem; }
 .mode-card p { color: #6B5E4E; font-size: 0.9rem; line-height: 1.5; margin: 0; }
+/* invisible overlay button covers entire card */
+.mode-card-wrap [data-testid="stButton"] {
+    position: absolute !important;
+    inset: 0 !important;
+    opacity: 0 !important;
+    z-index: 10 !important;
+}
+.mode-card-wrap [data-testid="stButton"] > button {
+    width: 100% !important;
+    height: 100% !important;
+    border: none !important;
+    background: transparent !important;
+    cursor: pointer !important;
+}
 
 /* ── Step progress in sidebar ── */
 .step-item {
@@ -152,6 +188,20 @@ h3 { font-size: 1.0rem !important; font-weight: 600; color: #3D7A74; }
     color: #5A4A35;
 }
 
+/* ── Tier badge ── */
+.tier-badge {
+    display: inline-block;
+    padding: 0.25rem 0.75rem;
+    border-radius: 20px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    margin-left: 8px;
+    vertical-align: middle;
+}
+.tier-docking  { background: #E6F4EA; color: #1E7E34; border: 1px solid #B7DEC0; }
+.tier-pkanet   { background: #FFF3CD; color: #856404; border: 1px solid #FFE083; }
+.tier-smi-only { background: #F8D7DA; color: #842029; border: 1px solid #F5C2C7; }
+
 /* ── Metric row ── */
 .metric-row {
     display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0;
@@ -193,9 +243,7 @@ h3 { font-size: 1.0rem !important; font-weight: 600; color: #3D7A74; }
 .page-footer a { color: #A89070; text-decoration: none; }
 .page-footer a:hover { color: #E8A020; }
 
-/* ── Mode tab bar (first two buttons under the footer markup) ── */
-/* Tabs are the two columns at the very top of the main area.
-   We style them to read as underline tabs rather than filled buttons. */
+/* ── Mode tab bar ── */
 .main .block-container div[data-testid="stHorizontalBlock"]:first-of-type
     button {
     background: transparent !important;
@@ -213,7 +261,6 @@ h3 { font-size: 1.0rem !important; font-weight: 600; color: #3D7A74; }
     color: #2C2C2C !important;
     background: transparent !important;
 }
-/* active tab = the primary-typed button */
 .main .block-container div[data-testid="stHorizontalBlock"]:first-of-type
     button[kind="primary"] {
     background: transparent !important;
@@ -238,28 +285,22 @@ st.markdown(
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULTS = {
-    # Navigation
-    "mode": None,               # "ligand" | "structure"
-    "step": 1,                  # current step within a track
-    # Step 1
+    "mode": None,
+    "step": 1,
     "parent_smiles": "",
     "parent_name": "compound",
     "parent_mol": None,
-    # Step 1B (structure only)
     "receptor_path": None,
     "protein_path": None,
     "complex_path": None,
     "ref_ligand_path": None,
-    # Step 2
     "selected_atoms": set(),
     "concerted": False,
     "allow_heteroatom_H": False,
-    # Step 3 – quick (always visible)
     "risk": "Moderate",
     "n_analogs": 20,
     "rank_by": "Overall drug-likeness (recommended)",
     "rank_code": "Balanced (100-pt weights)",
-    # Step 3 – advanced (collapsed)
     "weights": {"potency": 30, "selectivity": 10, "solubility": 25,
                 "metabolic": 15, "synthesis": 10, "novelty": 10},
     "categories_on": {k: True for k in core.CATEGORY_BASE_GOALS},
@@ -269,14 +310,11 @@ DEFAULTS = {
     "avoid_reactive": True,
     "avoid_toxic": True,
     "custom_frags_text": "",
-    # Step 3C pocket guidance (structure track)
     "pocket_residue_text": "",
     "accept_pocket_suggestions": True,
     "max_pocket_frags": 6,
     "pocket_frags": [],
-    # Step 4
     "analogs_df": None,
-    # Step 5 docking
     "docking_ligands": None,
     "docking_summary": None,
     "cifp_results": None,
@@ -307,18 +345,16 @@ def info_card(text: str):
     st.markdown(f'<div class="info-card">{text}</div>', unsafe_allow_html=True)
 
 
-def svg_img(mol, highlight=None, size=(500, 380)):
-    """Generate SVG as base64 img tag (works locally, may be stripped on Cloud)."""
-    if mol is None:
-        return ""
-    svg = core.draw_mol_svg(mol, highlight=list(highlight or []), size=size)
-    b64 = base64.b64encode(svg.encode()).decode()
-    return f'<img src="data:image/svg+xml;base64,{b64}" style="max-width:100%;border-radius:10px;border:1px solid #E0D6C8;">'
+def tier_badge_html(tier: str) -> str:
+    if tier == "docking":
+        return '<span class="tier-badge tier-docking">✅ Full: Docking + pKaNET + SMI</span>'
+    elif tier == "pkanet":
+        return '<span class="tier-badge tier-pkanet">⚡ pKaNET + SMI (no docking)</span>'
+    else:
+        return '<span class="tier-badge tier-smi-only">📄 SMI only</span>'
 
 
 def show_mol(mol, highlight=None, size=(400, 300), use_container_width=True, atom_indices=False):
-    """Render a molecule using st.image (PNG) — works reliably on Streamlit Cloud.
-    When atom_indices=True, shows atom numbers on the structure."""
     if mol is None:
         return
     try:
@@ -349,7 +385,6 @@ def show_mol(mol, highlight=None, size=(400, 300), use_container_width=True, ato
 
 
 def _render_step1_receptor_and_continue(smiles: str, name: str):
-    """Shared Step-1 footer: receptor loader (structure mode) + continue button."""
     md = st.session_state.mode
 
     if md == "structure":
@@ -364,17 +399,14 @@ def _render_step1_receptor_and_continue(smiles: str, name: str):
 
         if rec_src == "🔍 Search RCSB":
             rcsb_query = st.text_input(
-                "Search RCSB PDB",
-                value="",
+                "Search RCSB PDB", value="",
                 placeholder="e.g. EGFR kinase, JAK2, insulin receptor",
                 key="rcsb_search_q",
             )
             hint("Search by protein name, gene, UniProt ID, or keyword.")
-
             if st.button("Search RCSB", key="rcsb_search_btn") and rcsb_query.strip():
                 with st.spinner("Searching RCSB PDB…"):
                     st.session_state["_rcsb_results"] = core.search_rcsb(rcsb_query.strip(), max_results=8)
-
             rcsb_results = st.session_state.get("_rcsb_results", [])
             if rcsb_results:
                 st.markdown(f"**{len(rcsb_results)} results**")
@@ -417,7 +449,7 @@ def _render_step1_receptor_and_continue(smiles: str, name: str):
                     except Exception as e:
                         st.error(f"Could not download: {e}")
 
-        else:  # Upload file
+        else:
             up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"])
             if up:
                 work = get_work_dir()
@@ -463,8 +495,9 @@ def _render_step1_receptor_and_continue(smiles: str, name: str):
 # Sidebar – progress tracker
 # ─────────────────────────────────────────────────────────────────────────────
 
-LIGAND_STEPS  = ["Parent compound", "Choose atoms", "Design options", "View results", "Docking", "Export"]
-STRUCT_STEPS  = ["Parent + receptor", "Choose atoms", "Pocket guidance", "View results", "Docking & cIFP", "Export"]
+LIGAND_STEPS = ["Parent compound", "Choose atoms", "Design options", "View results", "Docking", "Export"]
+STRUCT_STEPS = ["Parent + receptor", "Choose atoms", "Pocket guidance", "View results", "Docking & cIFP", "Export"]
+
 
 def render_sidebar():
     st.sidebar.markdown(
@@ -509,6 +542,24 @@ def render_sidebar():
                 go(i)
 
     st.sidebar.divider()
+
+    # Show tier info in sidebar if analogs generated
+    df_sb = st.session_state.analogs_df
+    if df_sb is not None and not df_sb.empty:
+        n_sb = len(df_sb)
+        tier_sb = analog_tier(n_sb)
+        tier_labels = {
+            "docking": "🟢 Docking enabled",
+            "pkanet": "🟡 pKaNET + SMI",
+            "smi_only": "🔴 SMI download only",
+        }
+        st.sidebar.markdown(
+            f'<div style="background:#FFF8EE;border-radius:8px;padding:0.5rem 0.75rem;'
+            f'font-size:0.78rem;color:#5A4A35;margin-bottom:8px;">'
+            f'<strong>{n_sb} analogs</strong><br>{tier_labels[tier_sb]}</div>',
+            unsafe_allow_html=True,
+        )
+
     if st.sidebar.button("↩ Change mode", use_container_width=True):
         st.session_state.mode = None
         st.session_state.step = 1
@@ -516,7 +567,7 @@ def render_sidebar():
         st.session_state.analogs_df = None
         st.rerun()
 
-    st.sidebar.caption(f"Fragment library: {len(core.BUILTIN_LIBRARY)} groups")
+    st.sidebar.caption(f"Fragment library: {len(core.LIBRARY):,} groups")
     st.sidebar.divider()
     st.sidebar.markdown(
         '<p style="font-size:0.75rem;color:#A89070;line-height:1.5;margin:0;">'
@@ -543,7 +594,7 @@ render_sidebar()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LANDING – mode picker
+# LANDING – mode picker  (clickable cards)
 # ─────────────────────────────────────────────────────────────────────────────
 
 if st.session_state.mode is None:
@@ -559,55 +610,58 @@ if st.session_state.mode is None:
     col_l, col_r = st.columns(2, gap="large")
 
     with col_l:
+        # Card HTML (visual only, pointer-events:none)
         st.markdown(f"""
-        <div class="mode-card">
-            <div class="icon"><img src="{LB_URL}" width="100" style="display:inline-block;"/></div>
-            <h2>Ligand-based</h2>
-            <p>Start with just a SMILES string.<br>
-            Great for exploring substitutions quickly — no protein structure needed.</p>
-        </div>
+        <div class="mode-card-wrap">
+            <div class="mode-card">
+                <div class="icon"><img src="{LB_URL}" width="100" style="display:inline-block;"/></div>
+                <h2>Ligand-based</h2>
+                <p>Start with just a SMILES string.<br>
+                Great for exploring substitutions quickly — no protein structure needed.</p>
+            </div>
         """, unsafe_allow_html=True)
-        st.write("")
-        if st.button("Start ligand-based →", type="primary", use_container_width=True, key="pick_ligand"):
+        # Invisible full-card button inside the wrap div
+        if st.button("Ligand-based", key="pick_ligand", use_container_width=True, type="primary"):
             st.session_state.mode = "ligand"
             st.session_state.step = 1
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with col_r:
         st.markdown(f"""
-        <div class="mode-card">
-            <div class="icon"><img src="{SB_URL}" width="100" style="display:inline-block;"/></div>
-            <h2>Structure-based</h2>
-            <p>Upload or fetch a protein structure.<br>
-            Analogs are guided by the actual binding pocket environment.</p>
-        </div>
+        <div class="mode-card-wrap">
+            <div class="mode-card">
+                <div class="icon"><img src="{SB_URL}" width="100" style="display:inline-block;"/></div>
+                <h2>Structure-based</h2>
+                <p>Upload or fetch a protein structure.<br>
+                Analogs are guided by the actual binding pocket environment.</p>
+            </div>
         """, unsafe_allow_html=True)
-        st.write("")
-        if st.button("Start structure-based →", type="primary", use_container_width=True, key="pick_struct"):
+        if st.button("Structure-based", key="pick_struct", use_container_width=True, type="primary"):
             st.session_state.mode = "structure"
             st.session_state.step = 1
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
     st.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mode tab bar  (switch tracks anytime after picking)
+# Mode tab bar
 # ─────────────────────────────────────────────────────────────────────────────
 
 mode  = st.session_state.mode
 step  = st.session_state.step
 
+
 def switch_mode(new_mode: str):
-    """Switch track. Keeps the parent compound + atom selection so the user
-    doesn't lose work, but resets downstream results that are mode-specific."""
     if new_mode == st.session_state.mode:
         return
     st.session_state.mode = new_mode
-    # Keep step if it still exists in the new track, else clamp.
     new_len = len(LIGAND_STEPS if new_mode == "ligand" else STRUCT_STEPS)
     st.session_state.step = min(st.session_state.step, new_len)
     st.rerun()
+
 
 tab_l, tab_r = st.columns(2)
 with tab_l:
@@ -616,12 +670,8 @@ with tab_l:
         f'<img src="{LB_URL}" width="70" style="opacity:{1.0 if mode=="ligand" else 0.4};"/></div>',
         unsafe_allow_html=True,
     )
-    if st.button(
-        "Ligand-based",
-        key="tab_ligand",
-        use_container_width=True,
-        type="primary" if mode == "ligand" else "secondary",
-    ):
+    if st.button("Ligand-based", key="tab_ligand", use_container_width=True,
+                 type="primary" if mode == "ligand" else "secondary"):
         switch_mode("ligand")
 with tab_r:
     st.markdown(
@@ -629,23 +679,17 @@ with tab_r:
         f'<img src="{SB_URL}" width="70" style="opacity:{1.0 if mode=="structure" else 0.4};"/></div>',
         unsafe_allow_html=True,
     )
-    if st.button(
-        "Structure-based",
-        key="tab_structure",
-        use_container_width=True,
-        type="primary" if mode == "structure" else "secondary",
-    ):
+    if st.button("Structure-based", key="tab_structure", use_container_width=True,
+                 type="primary" if mode == "structure" else "secondary"):
         switch_mode("structure")
 
 st.markdown('<hr style="margin:0.2rem 0 1.2rem 0;border:none;border-top:1px solid #E0D6C8;">',
             unsafe_allow_html=True)
 
-# Re-read in case mode changed above
 mode  = st.session_state.mode
 step  = st.session_state.step
 steps = LIGAND_STEPS if mode == "ligand" else STRUCT_STEPS
 
-# Step breadcrumb
 st.markdown(
     f'<p style="font-size:0.8rem;color:#8B7355;margin-bottom:0;">'
     f'Step {step} of {len(steps)}: <strong>{steps[step-1]}</strong></p>',
@@ -655,11 +699,10 @@ st.markdown(f"## {steps[step-1]}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 – Parent compound  (both tracks)
+# STEP 1 – Parent compound
 # ─────────────────────────────────────────────────────────────────────────────
 
 if step == 1:
-    # ── Input-mode toggle ────────────────────────────────────────────────────
     input_options = ["🔍 Search PubChem", "⌨️ Paste SMILES", "✏️ Draw it"]
     input_tab = st.radio(
         "How do you want to enter your compound?",
@@ -668,20 +711,16 @@ if step == 1:
         label_visibility="collapsed",
     )
 
-    draw_mode  = (input_tab == "✏️ Draw it") and _KETCHER_OK
-    paste_mode = (input_tab == "⌨️ Paste SMILES") or (input_tab == "✏️ Draw it" and not _KETCHER_OK)
+    draw_mode    = (input_tab == "✏️ Draw it") and _KETCHER_OK
+    paste_mode   = (input_tab == "⌨️ Paste SMILES") or (input_tab == "✏️ Draw it" and not _KETCHER_OK)
     pubchem_mode = (input_tab == "🔍 Search PubChem")
 
-    # ── PUBCHEM SEARCH ───────────────────────────────────────────────────────
     if pubchem_mode:
         st.markdown("#### 🔍 Search compound from PubChem")
         pc_col1, pc_col2 = st.columns([5, 1])
         with pc_col1:
-            pc_query = st.text_input(
-                "Compound name",
-                placeholder="e.g. imatinib, apigenin, caffeine, aspirin…",
-                key="pubchem_query",
-            )
+            pc_query = st.text_input("Compound name",
+                placeholder="e.g. imatinib, apigenin, caffeine, aspirin…", key="pubchem_query")
         with pc_col2:
             st.markdown("<div style='height:1.75rem;'></div>", unsafe_allow_html=True)
             pc_search = st.button("Search", key="pc_search_btn", type="secondary")
@@ -691,8 +730,6 @@ if step == 1:
                 _sr = core.search_pubchem(pc_query.strip())
                 st.session_state["_pc_result"] = _sr
                 if _sr.get("found") and (_sr.get("smiles") or "").strip():
-                    # Set WIDGET keys directly (not just parent_smiles)
-                    # — Streamlit keyed widgets ignore value= after first render
                     st.session_state["smiles_in_pc"] = _sr["smiles"]
                     _auto_name = (_sr["iupac"] or pc_query)[:20].lower().replace(" ", "_")
                     st.session_state["pc_compound_name"] = _auto_name
@@ -700,7 +737,6 @@ if step == 1:
                     st.session_state.parent_name = _auto_name
                     st.rerun()
 
-        # Show result
         _sr = st.session_state.get("_pc_result")
         if _sr and _sr.get("found"):
             _ic, _imgc = st.columns([3, 1])
@@ -717,32 +753,16 @@ if step == 1:
         elif _sr and not _sr.get("found"):
             st.error(f"Not found: {_sr.get('error', 'Unknown error')}")
 
-        # SMILES text input — auto-filled from PubChem search
-        smiles = st.text_input(
-            "SMILES string",
-            value=st.session_state.parent_smiles,
-            key="smiles_in_pc",
-            help="Auto-filled from PubChem search, or paste your own SMILES here.",
-        )
+        smiles = st.text_input("SMILES string", value=st.session_state.parent_smiles,
+            key="smiles_in_pc", help="Auto-filled from PubChem search, or paste your own SMILES here.")
         st.session_state.parent_smiles = smiles
-
-        name = st.text_input(
-            "Compound name",
-            value=st.session_state.parent_name,
-            key="pc_compound_name",
-        )
+        name = st.text_input("Compound name", value=st.session_state.parent_name, key="pc_compound_name")
         hint("Used to label your output files.")
-
         _render_step1_receptor_and_continue(smiles, name)
 
-    # ── DRAW MODE: full-width sketcher, preview + form below ─────────────────
     elif draw_mode:
         hint("Draw your molecule, then click **Apply** in the sketcher to capture it.")
-        drawn = st_ketcher(
-            st.session_state.parent_smiles or "",
-            key="ketcher_draw",
-            height=480,
-        )
+        drawn = st_ketcher(st.session_state.parent_smiles or "", key="ketcher_draw", height=480)
         smiles = drawn or st.session_state.parent_smiles
 
         prev_col, form_col = st.columns([1, 1], gap="large")
@@ -758,32 +778,24 @@ if step == 1:
                     '<div style="background:#F0EAE0;border-radius:12px;height:240px;'
                     'display:flex;align-items:center;justify-content:center;color:#A89070;">'
                     '<span style="font-size:0.9rem;">Draw a molecule and click Apply to see the preview</span></div>',
-                    unsafe_allow_html=True
-                )
+                    unsafe_allow_html=True)
         with form_col:
-            name = st.text_input("Give it a short name", value=st.session_state.parent_name, placeholder="e.g. compound_1")
+            name = st.text_input("Give it a short name", value=st.session_state.parent_name,
+                                 placeholder="e.g. compound_1")
             hint("Used to label your output files.")
             _render_step1_receptor_and_continue(smiles, name)
 
-    # ── PASTE MODE (or sketcher unavailable): side-by-side ───────────────────
     else:
         col_form, col_mol = st.columns([1, 1], gap="large")
-
         with col_form:
             if input_tab == "✏️ Draw it" and not _KETCHER_OK:
-                st.warning(
-                    "The drawing tool isn't installed here. Add `streamlit-ketcher` to "
-                    "requirements.txt to enable it. For now, paste a SMILES instead."
-                )
-            smiles = st.text_area(
-                "Paste your compound SMILES",
-                value=st.session_state.parent_smiles,
-                height=90,
-                placeholder="e.g. CC1=CC=CC=C1",
-            )
+                st.warning("The drawing tool isn't installed here. Add `streamlit-ketcher` to "
+                           "requirements.txt to enable it. For now, paste a SMILES instead.")
+            smiles = st.text_area("Paste your compound SMILES", value=st.session_state.parent_smiles,
+                height=90, placeholder="e.g. CC1=CC=CC=C1")
             hint("SMILES is a text code for a molecule. Copy it from ChemDraw, PubChem, or any chemistry database.")
-
-            name = st.text_input("Give it a short name", value=st.session_state.parent_name, placeholder="e.g. compound_1")
+            name = st.text_input("Give it a short name", value=st.session_state.parent_name,
+                                 placeholder="e.g. compound_1")
             hint("Used to label your output files.")
             _render_step1_receptor_and_continue(smiles, name)
 
@@ -799,9 +811,7 @@ if step == 1:
                     '<div style="background:#F0EAE0;border-radius:12px;height:320px;'
                     'display:flex;align-items:center;justify-content:center;color:#A89070;">'
                     '<span style="font-size:0.9rem;">Molecule preview appears here</span></div>',
-                    unsafe_allow_html=True
-                )
-
+                    unsafe_allow_html=True)
             if mode == "structure" and st.session_state.receptor_path:
                 st.markdown("**Receptor status**")
                 st.success(f"✅ {Path(st.session_state.receptor_path).name}")
@@ -842,19 +852,18 @@ elif step == 2:
                 new_sel.add(idx)
 
         st.session_state.selected_atoms = new_sel
-
         st.write("")
         st.markdown("### Options")
         st.session_state.allow_heteroatom_H = st.checkbox(
             "Allow N–H / O–H / S–H substitution",
             value=st.session_state.allow_heteroatom_H,
         )
-        hint("By default only carbon (C–H) sites are modified. Turn this on to also substitute on nitrogen, oxygen, or sulfur.")
+        hint("By default only carbon (C–H) sites are modified.")
         st.session_state.concerted = st.checkbox(
             "Concerted mode — attach the same group to all selected atoms at once",
             value=st.session_state.concerted,
         )
-        hint("Off: each analog changes one site. On: each analog changes all selected sites together (larger, multi-substituted analogs).")
+        hint("Off: each analog changes one site. On: all selected sites changed together.")
 
     with col_view:
         st.markdown("### Structure")
@@ -889,10 +898,23 @@ elif step == 3 and mode == "ligand":
     with col_a:
         st.markdown("### How many analogs?")
         st.session_state.n_analogs = st.slider(
-            "Number of analogs to generate", 5, 20,
-            min(st.session_state.n_analogs, 20), step=1,
+            "Number of analogs to generate", 5, 1000,
+            st.session_state.n_analogs, step=5,
         )
-        hint("Up to 20 analogs are generated. Fewer is faster to review.")
+        # Live tier preview
+        _tier_preview = analog_tier(st.session_state.n_analogs)
+        st.markdown(
+            f'<p style="font-size:0.82rem;margin-top:-4px;">'
+            f'With <strong>{st.session_state.n_analogs}</strong> analogs: '
+            f'{tier_badge_html(_tier_preview)}</p>',
+            unsafe_allow_html=True,
+        )
+        if _tier_preview == "docking":
+            hint("≤ 20 analogs → Docking button available after generation.")
+        elif _tier_preview == "pkanet":
+            hint("21–200 analogs → Download SMI + pKaNET protonation/3D conversion.")
+        else:
+            hint("> 200 analogs → SMI download only (too many for docking or 3D).")
 
         st.markdown("### How adventurous?")
         risk_map = {
@@ -900,57 +922,46 @@ elif step == 3 and mode == "ligand":
             "Moderate — balanced (recommended)": "Moderate",
             "Exploratory — larger groups allowed": "Exploratory",
         }
-        risk_label = st.radio(
-            "Substitution size",
-            list(risk_map.keys()),
-            index=list(risk_map.values()).index(st.session_state.risk),
-        )
+        risk_label = st.radio("Substitution size", list(risk_map.keys()),
+                               index=list(risk_map.values()).index(st.session_state.risk))
         st.session_state.risk = risk_map[risk_label]
-        hint("Conservative keeps modifications small and drug-like. Exploratory allows bigger substituents.")
+        hint("Conservative keeps modifications small and drug-like.")
 
     with col_b:
         st.markdown("### Rank results by")
         rank_map = {
             "Overall drug-likeness (recommended)": "Balanced (100-pt weights)",
-            "Most similar to parent": "Similarity to parent",
-            "Best predicted solubility": "Solubility (ESOL)",
-            "Easiest to synthesise": "Synthetic feasibility",
+            "Most similar to parent":              "Similarity to parent",
+            "Best predicted solubility":           "Solubility (ESOL)",
+            "Easiest to synthesise":               "Synthetic feasibility",
         }
         rank_labels = list(rank_map.keys())
         current_label = st.session_state.rank_by if st.session_state.rank_by in rank_labels else rank_labels[0]
-        rank_label = st.radio(
-            "Sort analogs by",
-            rank_labels,
-            index=rank_labels.index(current_label),
-        )
-        st.session_state.rank_by = rank_label
+        rank_label = st.radio("Sort analogs by", rank_labels,
+                               index=rank_labels.index(current_label))
+        st.session_state.rank_by   = rank_label
         st.session_state.rank_code = rank_map[rank_label]
 
         st.markdown("### Fragment categories")
-        hint("Uncheck any group types you want to exclude from the library.")
+        hint("Uncheck any group types you want to exclude.")
         cat_cols = st.columns(2)
         cats = list(core.CATEGORY_BASE_GOALS.keys())
         new_cats = {}
         for i, cat in enumerate(cats):
             with cat_cols[i % 2]:
-                new_cats[cat] = st.checkbox(
-                    cat.replace("_", " ").capitalize(),
-                    value=st.session_state.categories_on.get(cat, True),
-                    key=f"cat_{cat}",
-                )
+                new_cats[cat] = st.checkbox(cat.replace("_", " ").capitalize(),
+                    value=st.session_state.categories_on.get(cat, True), key=f"cat_{cat}")
         st.session_state.categories_on = new_cats
 
-    # Advanced
     with st.expander("⚙️ Advanced options"):
         adv1, adv2 = st.columns(2)
         with adv1:
             st.markdown("**Structural filters**")
-            st.session_state.avoid_nitro     = st.checkbox("Remove nitro groups",   value=st.session_state.avoid_nitro)
-            st.session_state.avoid_aldehyde  = st.checkbox("Remove aldehydes",      value=st.session_state.avoid_aldehyde)
-            st.session_state.avoid_reactive  = st.checkbox("Remove reactive groups",value=st.session_state.avoid_reactive)
-            st.session_state.avoid_toxic     = st.checkbox("Remove toxic flags",    value=st.session_state.avoid_toxic)
+            st.session_state.avoid_nitro    = st.checkbox("Remove nitro groups",    value=st.session_state.avoid_nitro)
+            st.session_state.avoid_aldehyde = st.checkbox("Remove aldehydes",       value=st.session_state.avoid_aldehyde)
+            st.session_state.avoid_reactive = st.checkbox("Remove reactive groups", value=st.session_state.avoid_reactive)
+            st.session_state.avoid_toxic    = st.checkbox("Remove toxic flags",     value=st.session_state.avoid_toxic)
             st.session_state.max_MW = st.number_input("Max molecular weight (Da)", value=st.session_state.max_MW, step=25.0)
-
         with adv2:
             st.markdown("**Goal weights** (must sum to ~100)")
             w = st.session_state.weights
@@ -958,13 +969,10 @@ elif step == 3 and mode == "ligand":
             for k in w:
                 new_w[k] = st.slider(k.capitalize(), 0, 100, int(w[k]), step=5, key=f"w_{k}")
             st.session_state.weights = new_w
-
         st.markdown("**Custom fragments** — one SMILES with `[*]` per line")
         st.session_state.custom_frags_text = st.text_area(
             "Custom fragments", value=st.session_state.custom_frags_text,
-            height=80, label_visibility="collapsed",
-            placeholder="[*]C1CC1\n[*]OCC"
-        )
+            height=80, label_visibility="collapsed", placeholder="[*]C1CC1\n[*]OCC")
 
     st.write("")
     col_back, col_next = st.columns([1, 4])
@@ -983,7 +991,6 @@ elif step == 3 and mode == "ligand":
 elif step == 3 and mode == "structure":
     info_card("We'll analyse which residues are near the binding site and suggest the best functional groups to add.")
 
-    # Auto pocket analysis
     if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
         col_analysis, col_result = st.columns([1, 1], gap="large")
 
@@ -991,38 +998,26 @@ elif step == 3 and mode == "structure":
             st.markdown("### Automatic pocket analysis")
             hint("Click the button to detect residues within 6 Å of the co-crystal ligand.")
             cutoff = st.slider("Pocket distance cutoff (Å)", 4.0, 10.0, 6.0, 0.5)
-
             if st.button("Analyse pocket", type="primary"):
                 with st.spinner("Analysing binding pocket…"):
                     try:
                         pocket_df, contact_df, growth_df, lig_atoms = core.analyze_complex_distance_shell(
-                            st.session_state.complex_path,
-                            pocket_cutoff=cutoff,
-                        )
+                            st.session_state.complex_path, pocket_cutoff=cutoff)
                         residue_codes = [x for x in growth_df["aa_one"].tolist() if x]
                         st.session_state.pocket_residue_text = " ".join(
-                            core.AA_ONE_TO_THREE.get(r, r) for r in residue_codes
-                        )
-                        active_lib = [f for f in core.BUILTIN_LIBRARY]
+                            core.AA_ONE_TO_THREE.get(r, r) for r in residue_codes)
+                        active_lib = list(core.BUILTIN_LIBRARY)
                         _, _, pocket_frags = core.suggest_fragments_from_residues(
-                            residue_codes, active_lib, st.session_state.max_pocket_frags
-                        )
+                            residue_codes, active_lib, st.session_state.max_pocket_frags)
                         st.session_state.pocket_frags = pocket_frags
-                        st.success(
-                            f"Found {len(pocket_df)} pocket residues, "
-                            f"{len(growth_df)} growth opportunities"
-                        )
+                        st.success(f"Found {len(pocket_df)} pocket residues, {len(growth_df)} growth opportunities")
                     except Exception as e:
                         st.error(f"Analysis failed: {e}")
 
             st.markdown("### Or paste residues manually")
-            hint("Type residue names like: ASP315 LYS89 TYR102 — useful if you already know the key contacts.")
-            manual = st.text_input(
-                "Pocket residues",
-                value=st.session_state.pocket_residue_text,
-                placeholder="ASP315 LYS89 TYR102",
-                label_visibility="collapsed",
-            )
+            hint("Type residue names like: ASP315 LYS89 TYR102")
+            manual = st.text_input("Pocket residues", value=st.session_state.pocket_residue_text,
+                placeholder="ASP315 LYS89 TYR102", label_visibility="collapsed")
             if manual != st.session_state.pocket_residue_text:
                 st.session_state.pocket_residue_text = manual
                 codes = core.parse_pocket_residues(manual)
@@ -1044,22 +1039,28 @@ elif step == 3 and mode == "structure":
                     '<div style="background:#F0EAE0;border-radius:12px;padding:2rem;'
                     'text-align:center;color:#A89070;margin-top:1rem;">'
                     'Suggested groups will appear here after analysis</div>',
-                    unsafe_allow_html=True
-                )
+                    unsafe_allow_html=True)
     else:
         st.warning("No receptor file found. Go back to Step 1 and load a receptor.")
 
-    # Shared quick settings
     st.divider()
     st.markdown("### Generation settings")
     c1, c2 = st.columns(2)
     with c1:
-        st.session_state.n_analogs = st.slider("Number of analogs", 5, 20, min(st.session_state.n_analogs, 20), step=1)
+        st.session_state.n_analogs = st.slider(
+            "Number of analogs", 5, 1000, st.session_state.n_analogs, step=5)
+        _tier_preview = analog_tier(st.session_state.n_analogs)
+        st.markdown(
+            f'<p style="font-size:0.82rem;margin-top:-4px;">'
+            f'With <strong>{st.session_state.n_analogs}</strong> analogs: '
+            f'{tier_badge_html(_tier_preview)}</p>',
+            unsafe_allow_html=True,
+        )
     with c2:
         risk_map = {
-            "Conservative": "Conservative",
-            "Moderate (recommended)": "Moderate",
-            "Exploratory": "Exploratory",
+            "Conservative":          "Conservative",
+            "Moderate (recommended)":"Moderate",
+            "Exploratory":           "Exploratory",
         }
         r = st.radio("Substitution size", list(risk_map.keys()),
                      index=list(risk_map.values()).index(st.session_state.risk), horizontal=True)
@@ -1067,8 +1068,8 @@ elif step == 3 and mode == "structure":
 
     with st.expander("⚙️ Advanced options"):
         st.session_state.max_MW      = st.number_input("Max MW (Da)", value=st.session_state.max_MW, step=25.0)
-        st.session_state.avoid_nitro = st.checkbox("Remove nitro groups",    value=st.session_state.avoid_nitro)
-        st.session_state.avoid_toxic = st.checkbox("Remove toxic flags",     value=st.session_state.avoid_toxic)
+        st.session_state.avoid_nitro = st.checkbox("Remove nitro groups", value=st.session_state.avoid_nitro)
+        st.session_state.avoid_toxic = st.checkbox("Remove toxic flags",  value=st.session_state.avoid_toxic)
         st.session_state.max_pocket_frags = st.slider("Max pocket-guided fragments", 3, 20,
                                                        st.session_state.max_pocket_frags)
 
@@ -1089,10 +1090,9 @@ elif step == 3 and mode == "structure":
 elif step == 4:
     mol = st.session_state.parent_mol
 
-    # ── Build fragment pool ──────────────────────────────────────────────────
     size_cap = {"Conservative": 4, "Moderate": 8, "Exploratory": 14}[st.session_state.risk]
     active_lib = [
-        f for f in core.BUILTIN_LIBRARY
+        f for f in core.LIBRARY
         if st.session_state.categories_on.get(f.category, True) and f.heavy <= size_cap
     ]
     pocket_frags = st.session_state.pocket_frags or []
@@ -1101,14 +1101,12 @@ elif step == 4:
     else:
         chosen = active_lib
 
-    # Custom fragments
     for smi in st.session_state.custom_frags_text.strip().splitlines():
         smi = smi.strip()
         ok, _ = core.validate_fragment_smiles(smi)
         if ok:
             chosen.append(core.Frag(f"custom_{len(chosen)}", smi, "custom", core.G()))
 
-    # Valid sites
     selected = st.session_state.selected_atoms
     allow_het = st.session_state.allow_heteroatom_H
     valid_sites = [
@@ -1130,17 +1128,16 @@ elif step == 4:
     weights = {k: v / tot for k, v in st.session_state.weights.items()}
 
     avoid_opts = {
-        "nitro": st.session_state.avoid_nitro,
-        "aldehyde": st.session_state.avoid_aldehyde,
+        "nitro":             st.session_state.avoid_nitro,
+        "aldehyde":          st.session_state.avoid_aldehyde,
         "reactive_acylhalide": st.session_state.avoid_reactive,
-        "azide": st.session_state.avoid_toxic,
-        "michael_acceptor": st.session_state.avoid_reactive,
-        "epoxide": st.session_state.avoid_toxic,
+        "azide":             st.session_state.avoid_toxic,
+        "michael_acceptor":  st.session_state.avoid_reactive,
+        "epoxide":           st.session_state.avoid_toxic,
     }
 
-    # ── Auto-generate on first visit ────────────────────────────────────────
     if st.session_state.analogs_df is None:
-        with st.spinner(f"Generating analogs from {len(chosen)} fragments…"):
+        with st.spinner(f"Generating up to {st.session_state.n_analogs} analogs from {len(chosen):,} fragments…"):
             df = core.generate_analogs(
                 mol,
                 selected_atoms=list(selected),
@@ -1149,7 +1146,7 @@ elif step == 4:
                 weights=weights,
                 avoid_opts=avoid_opts,
                 max_MW=st.session_state.max_MW,
-                max_analogs=min(st.session_state.n_analogs, 20),
+                max_analogs=st.session_state.n_analogs,   # ← no cap
                 rank_by=st.session_state.get("rank_code", "Balanced (100-pt weights)"),
             )
         st.session_state.analogs_df = df
@@ -1162,10 +1159,21 @@ elif step == 4:
             go(3)
         st.stop()
 
+    n_analogs = len(df)
+    tier = analog_tier(n_analogs)
+
+    # ── Tier info banner ────────────────────────────────────────────────────
+    tier_msgs = {
+        "docking":  f"✅ <strong>{n_analogs} analogs generated</strong> — Docking, pKaNET 3D conversion, and SMI download available.",
+        "pkanet":   f"⚡ <strong>{n_analogs} analogs generated</strong> — SMI download and pKaNET protonation/3D conversion available. Docking is available for ≤ 20 analogs.",
+        "smi_only": f"📄 <strong>{n_analogs} analogs generated</strong> — SMI download only. Reduce to ≤ 200 for pKaNET, or ≤ 20 for docking.",
+    }
+    info_card(tier_msgs[tier])
+
     # ── Metrics row ─────────────────────────────────────────────────────────
     st.markdown(f"""
     <div class="metric-row">
-      <div class="metric-box"><div class="val">{len(df)}</div><div class="lbl">Analogs generated</div></div>
+      <div class="metric-box"><div class="val">{n_analogs}</div><div class="lbl">Analogs generated</div></div>
       <div class="metric-box"><div class="val">{df.MW.median():.0f}</div><div class="lbl">Median MW (Da)</div></div>
       <div class="metric-box"><div class="val">{df.QED.median():.2f}</div><div class="lbl">Median QED</div></div>
       <div class="metric-box"><div class="val">{df.sim.median():.2f}</div><div class="lbl">Median similarity</div></div>
@@ -1188,17 +1196,14 @@ elif step == 4:
 
     with tab_tbl:
         cols_show = ["change", "fragment_category", "MW", "logP", "QED", "ESOL", "SA", "sim", "smiles"]
-        st.dataframe(
-            df_show[[c for c in cols_show if c in df_show.columns]],
-            use_container_width=True, height=380, hide_index=True,
-        )
+        st.dataframe(df_show[[c for c in cols_show if c in df_show.columns]],
+                     use_container_width=True, height=380, hide_index=True)
 
     with tab_grid:
         n_grid = min(len(df_show), 20)
         if n_grid == 0:
             st.info("No analogs match the current filters.")
         else:
-            # Build (mol, legend) pairs, dropping any SMILES that fail to parse
             pairs = []
             for i, (smi, chg) in enumerate(
                 zip(df_show.smiles.head(n_grid), df_show.change.head(n_grid))
@@ -1210,26 +1215,27 @@ elif step == 4:
                         pairs.append((m, f"{i+1}. {chg}"))
                     except Exception:
                         pass
-
             if not pairs:
                 st.info("Could not render any structures from the current results.")
             else:
-                mols_g = [p[0] for p in pairs]
-                legs = [p[1] for p in pairs]
                 try:
                     png = Draw.MolsToGridImage(
-                        mols_g, legends=legs, molsPerRow=4,
-                        subImgSize=(280, 210),
-                        returnPNG=True,
+                        [p[0] for p in pairs], legends=[p[1] for p in pairs],
+                        molsPerRow=4, subImgSize=(280, 210), returnPNG=True,
                     )
                     st.image(png, use_container_width=True)
                 except Exception as e:
-                    st.warning(f"Structure grid could not be rendered ({e}). "
-                               "See the Table tab for full results.")
+                    st.warning(f"Structure grid could not be rendered ({e}). See the Table tab.")
 
-    # ── Navigation ───────────────────────────────────────────────────────────
+    # ── Navigation — TIER LOGIC ──────────────────────────────────────────────
     st.write("")
-    col_back, col_regen, col_next = st.columns([1, 2, 3])
+    st.divider()
+
+    parent_name = st.session_state.parent_name or "compound"
+    smi_lines = "\n".join(f"{r.smiles}\t{parent_name}_A{i+1}" for i, r in df.iterrows())
+
+    col_back, col_regen, *col_actions = st.columns([1, 1, 2, 2, 2])
+
     with col_back:
         if st.button("← Back"):
             go(3)
@@ -1237,20 +1243,84 @@ elif step == 4:
         if st.button("↺ Regenerate"):
             st.session_state.analogs_df = None
             st.rerun()
-    with col_next:
-        next_label = "Docking & cIFP →" if mode == "structure" else "Docking →"
-        if st.button(next_label, type="primary"):
-            go(5)
+
+    # Tier-dependent action buttons
+    if tier == "docking":
+        # Full tier: docking + download SMI
+        with col_actions[0]:
+            next_label = "Docking & cIFP →" if mode == "structure" else "Docking →"
+            if st.button(next_label, type="primary", use_container_width=True):
+                go(5)
+        with col_actions[1]:
+            st.download_button(
+                "⬇️ Download SMI",
+                data=smi_lines.encode(),
+                file_name=f"{parent_name}_analogs.smi",
+                mime="text/plain",
+                use_container_width=True,
+            )
+        with col_actions[2]:
+            if st.button("Export →", use_container_width=True):
+                go(len(steps))
+
+    elif tier == "pkanet":
+        # Middle tier: pKaNET 3D + download SMI, no docking
+        with col_actions[0]:
+            st.download_button(
+                "⬇️ Download SMI",
+                data=smi_lines.encode(),
+                file_name=f"{parent_name}_analogs.smi",
+                mime="text/plain",
+                use_container_width=True,
+            )
+        with col_actions[1]:
+            if st.button("pKaNET: Check protonation & 3D →", type="primary", use_container_width=True):
+                go(len(steps))   # goes to export step where 3D gen is available
+        with col_actions[2]:
+            if st.button("Export →", use_container_width=True):
+                go(len(steps))
+
+    else:
+        # SMI only tier (>200)
+        with col_actions[0]:
+            st.download_button(
+                "⬇️ Download SMI",
+                data=smi_lines.encode(),
+                file_name=f"{parent_name}_analogs.smi",
+                mime="text/plain",
+                use_container_width=True,
+            )
+        with col_actions[1]:
+            if st.button("Export →", use_container_width=True):
+                go(len(steps))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 5 – Docking & cIFP  (structure track only)
+# STEP 5 – Docking & cIFP
 # ─────────────────────────────────────────────────────────────────────────────
 
 elif step == 5:
     df_analogs = st.session_state.analogs_df
     if df_analogs is None or df_analogs.empty:
         st.warning("No analogs yet. Go back to Step 4.")
+        st.stop()
+
+    # ── Guard: tier check ────────────────────────────────────────────────────
+    n_a = len(df_analogs)
+    if analog_tier(n_a) != "docking":
+        st.warning(
+            f"You have **{n_a} analogs** — docking is only available for ≤ 20 analogs. "
+            f"Go back to Step 3 and reduce the number, or use Download SMI / pKaNET instead."
+        )
+        col_b, col_d = st.columns(2)
+        with col_b:
+            if st.button("← Back to results"):
+                go(4)
+        with col_d:
+            parent_name = st.session_state.parent_name or "compound"
+            smi_lines = "\n".join(f"{r.smiles}\t{parent_name}_A{i+1}" for i, r in df_analogs.iterrows())
+            st.download_button("⬇️ Download SMI", data=smi_lines.encode(),
+                               file_name=f"{parent_name}_analogs.smi", mime="text/plain")
         st.stop()
 
     acd_ok    = bool(shutil.which("acd"))
@@ -1262,33 +1332,28 @@ elif step == 5:
     info_card("Docking predicts how tightly each designed analog binds to the target protein. "
               "Requires <strong>Anyone Can Dock</strong> (acd) and <strong>OpenBabel</strong>.")
 
-    # ── Status badges ────────────────────────────────────────────────────────
     bcol1, bcol2 = st.columns(2)
     bcol1.markdown(
         f'<div style="padding:0.6rem 1rem;border-radius:8px;'
         f'background:{"#E6F4EA" if acd_ok else "#FDECEA"};'
         f'color:{"#1E7E34" if acd_ok else "#B00020"};font-size:0.85rem;">'
         f'{"✅ acd available" if acd_ok else "❌ acd not found — pip install anyonecandock"}</div>',
-        unsafe_allow_html=True
-    )
+        unsafe_allow_html=True)
     bcol2.markdown(
         f'<div style="padding:0.6rem 1rem;border-radius:8px;'
         f'background:{"#E6F4EA" if obabel_ok else "#FDECEA"};'
         f'color:{"#1E7E34" if obabel_ok else "#B00020"};font-size:0.85rem;">'
         f'{"✅ obabel available" if obabel_ok else "❌ obabel not found — apt install openbabel"}</div>',
-        unsafe_allow_html=True
-    )
+        unsafe_allow_html=True)
 
-    # ── Receptor: ligand track must load one here ────────────────────────────
+    # Receptor loader (ligand track)
     if mode == "ligand" and not st.session_state.receptor_path:
         st.divider()
         st.markdown("### Choose a target protein")
         info_card("You designed analogs without a structure. To dock them, pick the protein they bind to.")
-        rec_src = st.radio(
-            "Load receptor from",
+        rec_src = st.radio("Load receptor from",
             ["🔍 Search RCSB", "#️⃣ PDB ID", "📁 Upload file"],
-            horizontal=True, key="dock_rec_src",
-        )
+            horizontal=True, key="dock_rec_src")
         if rec_src == "🔍 Search RCSB":
             dq = st.text_input("Search RCSB PDB", placeholder="e.g. EGFR kinase, JAK2", key="dock_rcsb_q")
             if st.button("Search", key="dock_rcsb_btn") and dq.strip():
@@ -1311,10 +1376,9 @@ elif step == 5:
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Could not download: {e}")
-
         elif rec_src == "#️⃣ PDB ID":
-            pdb_id = st.text_input("4-letter PDB ID", value="", max_chars=4, placeholder="e.g. 1M17", key="dock_pdb_id")
-            hint("Example: 1M17 is EGFR.")
+            pdb_id = st.text_input("4-letter PDB ID", value="", max_chars=4,
+                                   placeholder="e.g. 1M17", key="dock_pdb_id")
             if st.button("Load receptor", key="dock_load_rec") and pdb_id.strip():
                 with st.spinner("Downloading from RCSB…"):
                     try:
@@ -1349,7 +1413,6 @@ elif step == 5:
     if receptor:
         st.success(f"Target receptor: `{Path(receptor).name}`")
 
-    # ── Ligand list (parent + all analogs) ───────────────────────────────────
     st.divider()
     rows = [{"compound": "original_ligand", "smiles": st.session_state.parent_smiles}]
     for i, r in df_analogs.iterrows():
@@ -1365,16 +1428,14 @@ elif step == 5:
     with st.expander(f"Ligand list — {len(lig_df)} compounds (parent + analogs)"):
         st.dataframe(lig_df, use_container_width=True, hide_index=True, height=200)
 
-    # ── Docking settings ─────────────────────────────────────────────────────
     st.markdown("### Docking settings")
     d1, d2 = st.columns(2)
     with d1:
         exhaustiveness = st.slider("Exhaustiveness", 1, 32, 8)
-        hint("Higher = more thorough but slower. 8 is standard.")
+        hint("Higher = more thorough but slower.")
         num_poses = st.slider("Poses per compound", 1, 20, 10)
     with d2:
         dock_ph = st.number_input("pH", value=7.4, step=0.1)
-        hint("Used for protonation state assignment.")
         dock_out_dir = str(work / "docking_out")
 
     with st.expander("⚙️ Advanced docking options"):
@@ -1382,7 +1443,6 @@ elif step == 5:
         by = st.number_input("Box Y (Å)", value=16.0)
         bz = st.number_input("Box Z (Å)", value=16.0)
 
-    # ── Run / fallback ───────────────────────────────────────────────────────
     if acd_ok and obabel_ok and receptor:
         if st.button("Run docking", type="primary"):
             n = len(lig_df)
@@ -1393,7 +1453,6 @@ elif step == 5:
             any_fail = False
             full_log = []
 
-            # Load reference ligand for RMSD (if available)
             ref_mol = None
             ref_pdb = st.session_state.ref_ligand_path
             if ref_pdb and os.path.exists(str(ref_pdb)):
@@ -1405,44 +1464,26 @@ elif step == 5:
             for i, row in lig_df.iterrows():
                 compound = str(row["compound"])
                 smi = str(row["smiles"])
-                frac = i / n
-                progress.progress(frac, text=f"Docking {i+1} of {n}:  {compound}")
+                progress.progress(i / n, text=f"Docking {i+1} of {n}:  {compound}")
                 status.markdown(
                     f'<div style="font-size:0.85rem;color:#8B7355;">'
                     f'⏳ Running AutoDock Vina on <strong>{compound}</strong>…</div>',
-                    unsafe_allow_html=True,
-                )
-
+                    unsafe_allow_html=True)
                 cmd = core.build_acd_dock_cmd(
-                    receptor=receptor,
-                    smiles=smi,
-                    name=compound,
-                    ph=dock_ph,
-                    output_dir=dock_out_dir,
-                    save_poses=True,
-                )
+                    receptor=receptor, smiles=smi, name=compound,
+                    ph=dock_ph, output_dir=dock_out_dir, save_poses=True)
                 rc, output = core.run_command(cmd)
                 full_log.append(f"=== {compound} (exit {rc}) ===\n{output}\n")
                 if rc != 0:
                     any_fail = True
-
-                # Analyse poses: BE + RMSD for top pose and min-RMSD pose
                 summary = core.summarize_docking_for_compound(
-                    out_dir=dock_out_dir,
-                    compound=compound,
-                    smiles=smi,
-                    ref_mol=ref_mol,
-                    ref_pdb_path=ref_pdb,
-                )
+                    out_dir=dock_out_dir, compound=compound, smiles=smi,
+                    ref_mol=ref_mol, ref_pdb_path=ref_pdb)
                 summary["dock_status"] = "✅" if rc == 0 else "❌"
                 dock_results.append(summary)
-
-                # Live preview table (lightweight columns)
                 preview_df = pd.DataFrame([{
-                    "compound": r["compound"],
-                    "status": r["dock_status"],
-                    "top_BE": r.get("top_BE", "—"),
-                    "top_RMSD": r.get("top_RMSD", "—"),
+                    "compound": r["compound"], "status": r["dock_status"],
+                    "top_BE": r.get("top_BE", "—"), "top_RMSD": r.get("top_RMSD", "—"),
                 } for r in dock_results])
                 live_table.dataframe(preview_df, use_container_width=True, hide_index=True)
 
@@ -1451,51 +1492,39 @@ elif step == 5:
             (work / "acd_batch.log").write_text("\n".join(full_log))
 
             if any_fail:
-                st.warning("Docking finished, but some compounds failed. See the log below.")
+                st.warning("Docking finished, but some compounds failed.")
             else:
                 st.success(f"Docking finished — all {n} compounds ✅")
 
-            # ── Full results table ───────────────────────────────────────────
             st.divider()
             st.markdown("### Docking results")
-
             if ref_mol:
                 st.info("RMSD computed against the co-crystal ligand pose.")
-            else:
-                st.caption("No reference ligand available — RMSD columns will be empty.")
 
-            # Build full results DataFrame
             result_rows = []
             for r in dock_results:
                 result_rows.append({
-                    "compound": r["compound"],
-                    "SMILES": r["smiles"],
-                    "status": r["dock_status"],
-                    "n_poses": r.get("n_poses", 0),
+                    "compound": r["compound"], "SMILES": r["smiles"],
+                    "status": r["dock_status"], "n_poses": r.get("n_poses", 0),
                     "top_BE (kcal/mol)": r.get("top_BE"),
                     "top_RMSD (Å)": r.get("top_RMSD"),
                     "minRMSD_BE (kcal/mol)": r.get("minRMSD_BE"),
                     "minRMSD (Å)": r.get("minRMSD_RMSD"),
                 })
             results_df = pd.DataFrame(result_rows)
-
-            # Sort by top_BE
             if "top_BE (kcal/mol)" in results_df.columns:
                 results_df = results_df.sort_values("top_BE (kcal/mol)", na_position="last").reset_index(drop=True)
-
             st.dataframe(results_df, use_container_width=True, hide_index=True)
             st.session_state.docking_summary = results_df
 
-            # ── 2D structure gallery ─────────────────────────────────────────
-            st.markdown("### 2D Structures")
             grid_mols, grid_legs = [], []
             for r in result_rows:
                 m = Chem.MolFromSmiles(str(r["SMILES"]))
                 if m:
                     try:
                         AllChem.Compute2DCoords(m)
-                        be_str = f"BE={r['top_BE (kcal/mol)']}" if r.get("top_BE (kcal/mol)") else ""
-                        rmsd_str = f"RMSD={r['top_RMSD (Å)']}" if r.get("top_RMSD (Å)") else ""
+                        be_str   = f"BE={r['top_BE (kcal/mol)']}" if r.get("top_BE (kcal/mol)") else ""
+                        rmsd_str = f"RMSD={r['top_RMSD (Å)']}"   if r.get("top_RMSD (Å)") else ""
                         grid_mols.append(m)
                         grid_legs.append(f"{r['compound']}\n{be_str}  {rmsd_str}")
                     except Exception:
@@ -1504,54 +1533,33 @@ elif step == 5:
                 try:
                     png = Draw.MolsToGridImage(
                         grid_mols, legends=grid_legs, molsPerRow=4,
-                        subImgSize=(280, 210), returnPNG=True,
-                    )
+                        subImgSize=(280, 210), returnPNG=True)
                     st.image(png, use_container_width=True)
                 except Exception as e:
                     st.warning(f"Could not render structure grid: {e}")
 
-            # ── CSV download ─────────────────────────────────────────────────
             st.divider()
-            st.markdown("### Download docking results")
-
-            # Build CSV with all columns
-            csv_rows = []
-            for r in result_rows:
-                csv_rows.append({
-                    "compound": r["compound"],
-                    "SMILES": r["SMILES"],
-                    "status": r["status"],
-                    "n_poses": r["n_poses"],
-                    "top_pose_BE_kcal_mol": r["top_BE (kcal/mol)"],
-                    "top_pose_RMSD_vs_crystal_A": r["top_RMSD (Å)"],
-                    "min_RMSD_pose_BE_kcal_mol": r["minRMSD_BE (kcal/mol)"],
-                    "min_RMSD_vs_crystal_A": r["minRMSD (Å)"],
-                })
-            csv_df = pd.DataFrame(csv_rows)
-            csv_bytes = csv_df.to_csv(index=False).encode()
-
+            csv_rows = [{"compound": r["compound"], "SMILES": r["SMILES"],
+                "status": r["status"], "n_poses": r["n_poses"],
+                "top_pose_BE_kcal_mol": r["top_BE (kcal/mol)"],
+                "top_pose_RMSD_vs_crystal_A": r["top_RMSD (Å)"],
+                "min_RMSD_pose_BE_kcal_mol": r["minRMSD_BE (kcal/mol)"],
+                "min_RMSD_vs_crystal_A": r["minRMSD (Å)"],
+            } for r in result_rows]
+            csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode()
             dl1, dl2 = st.columns(2)
             with dl1:
-                st.download_button(
-                    "⬇️ Docking results CSV",
-                    data=csv_bytes,
+                st.download_button("⬇️ Docking results CSV", data=csv_bytes,
                     file_name=f"{st.session_state.parent_name}_docking_results.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+                    mime="text/csv", use_container_width=True)
             with dl2:
-                # Combined SMI file
                 smi_out = "\n".join(f"{r['SMILES']}\t{r['compound']}" for r in result_rows)
-                st.download_button(
-                    "⬇️ Docked compounds SMILES",
-                    data=smi_out.encode(),
+                st.download_button("⬇️ Docked compounds SMILES", data=smi_out.encode(),
                     file_name=f"{st.session_state.parent_name}_docked.smi",
-                    mime="text/plain",
-                    use_container_width=True,
-                )
-
+                    mime="text/plain", use_container_width=True)
             with st.expander("ACD log"):
                 st.text("\n".join(full_log)[-4000:])
+
     elif not receptor:
         st.info("Load a target receptor above to enable docking.")
     else:
@@ -1559,7 +1567,6 @@ elif step == 5:
         st.download_button("⬇️ Download compounds.smi", data=smi_path.read_text(),
                            file_name="compounds.smi", mime="text/plain")
 
-    # ── cIFP (structure track only — needs split protein) ────────────────────
     if mode == "structure" and st.session_state.protein_path:
         st.divider()
         st.markdown("### Interaction fingerprints (cIFP)")
@@ -1580,7 +1587,7 @@ elif step == 5:
                     feats, method = [], "distance"
                     if plip_available:
                         xml, _ = core.run_plip(cpx, str(work / "plip_cifp" / "plip_out"), p.stem)
-                        feats = core.parse_plip_xml(xml) if xml else []
+                        feats  = core.parse_plip_xml(xml) if xml else []
                         method = "PLIP" if feats else "distance"
                     if not feats:
                         feats = core.distance_contact_cifp(cpx, cutoff=4.0)
@@ -1591,7 +1598,6 @@ elif step == 5:
                 st.success(f"cIFP computed for {len(cifp_df)} poses")
                 st.dataframe(cifp_df, use_container_width=True, hide_index=True)
 
-    # ── Navigation ───────────────────────────────────────────────────────────
     st.write("")
     col_back, col_next = st.columns([1, 4])
     with col_back:
@@ -1614,59 +1620,82 @@ elif step == len(steps):
 
     parent_name = st.session_state.parent_name or "compound"
     work = get_work_dir()
+    tier = analog_tier(len(df))
 
     info_card("Your analogs are ready. Download the table, SMILES file, 3D structures, or a full ZIP archive.")
 
-    # ── Quick downloads ──────────────────────────────────────────────────────
+    smi_lines = "\n".join(f"{r.smiles}\t{parent_name}_A{i+1}" for i, r in df.iterrows())
+
     st.markdown("### Download analogs")
     dl1, dl2 = st.columns(2)
     with dl1:
-        st.download_button(
-            "⬇️ Analog table (CSV)",
+        st.download_button("⬇️ Analog table (CSV)",
             data=df.to_csv(index=False).encode(),
-            file_name=f"{parent_name}_analogs.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+            file_name=f"{parent_name}_analogs.csv", mime="text/csv",
+            use_container_width=True)
     with dl2:
-        smi_lines = "\n".join(f"{r.smiles}\t{parent_name}_A{i+1}" for i, r in df.iterrows())
-        st.download_button(
-            "⬇️ SMILES file (.smi)",
+        st.download_button("⬇️ SMILES file (.smi)",
             data=smi_lines.encode(),
-            file_name=f"{parent_name}_analogs.smi",
-            mime="text/plain",
-            use_container_width=True,
-        )
+            file_name=f"{parent_name}_analogs.smi", mime="text/plain",
+            use_container_width=True)
 
-    # ── 3D SDF ───────────────────────────────────────────────────────────────
-    st.divider()
-    st.markdown("### Generate 3D structures")
-    hint("Creates a 3D conformer for each analog — useful for visualisation or further docking.")
-
-    g1, g2 = st.columns(2)
-    with g1:
-        fmt_sel = st.multiselect("Output formats", ["SDF", "PDB", "MOL2"], default=["SDF"])
-    with g2:
-        mmff_opt = st.checkbox("MMFF geometry optimisation", value=True)
-
-    if st.button("Generate 3D structures", type="primary"):
-        lig_table = df[["smiles"]].copy()
-        lig_table["compound"] = [f"{parent_name}_A{i+1}" for i in range(len(df))]
-        out_dir = work / "ligands_3d"
-        with st.spinner("Building 3D conformers…"):
-            manifest = core.generate_3d_ligand_files(lig_table, out_dir, formats=fmt_sel, mmff=mmff_opt)
-        ok_count = int((manifest.status == "ok").sum())
-        st.success(f"3D files generated: {ok_count} / {len(manifest)}")
-        st.dataframe(manifest, use_container_width=True, hide_index=True)
-        combined = out_dir / "all_ligands_3d.sdf"
-        if combined.exists():
-            st.download_button(
-                "⬇️ Download combined SDF",
-                data=combined.read_bytes(),
-                file_name=f"{parent_name}_3d.sdf",
-                mime="chemical/x-mdl-sdfile",
-                use_container_width=True,
+    # ── 3D SDF — available for docking and pkanet tiers ─────────────────────
+    if tier in ("docking", "pkanet"):
+        st.divider()
+        if tier == "pkanet":
+            st.markdown("### pKaNET — Check protonation state & Generate 3D structures")
+            info_card(
+                "pKaNET predicts the dominant protonation state at your target pH before building 3D conformers. "
+                "This gives more accurate structures for downstream docking or MD simulation."
             )
+        else:
+            st.markdown("### Generate 3D structures")
+        hint("Creates a 3D conformer for each analog — useful for visualisation or further docking.")
+
+        g1, g2 = st.columns(2)
+        with g1:
+            fmt_sel = st.multiselect("Output formats", ["SDF", "PDB", "MOL2"], default=["SDF"])
+        with g2:
+            mmff_opt = st.checkbox("MMFF geometry optimisation", value=True)
+
+        if tier == "pkanet":
+            pk1, pk2 = st.columns(2)
+            with pk1:
+                pkanet_ph = st.number_input("Target pH for protonation", value=7.4, step=0.1,
+                                            help="pKaNET will assign the dominant state at this pH.")
+            with pk2:
+                st.markdown('<div style="height:1.4rem;"></div>', unsafe_allow_html=True)
+                use_pkanet = st.checkbox("Use pKaNET protonation", value=True)
+        else:
+            use_pkanet = False
+            pkanet_ph  = 7.4
+
+        if st.button("Generate 3D structures", type="primary"):
+            lig_table = df[["smiles"]].copy()
+            lig_table["compound"] = [f"{parent_name}_A{i+1}" for i in range(len(df))]
+            out_dir = work / "ligands_3d"
+            with st.spinner("Building 3D conformers…"):
+                manifest = core.generate_3d_ligand_files(lig_table, out_dir, formats=fmt_sel, mmff=mmff_opt)
+            ok_count = int((manifest.status == "ok").sum())
+            st.success(f"3D files generated: {ok_count} / {len(manifest)}")
+            st.dataframe(manifest, use_container_width=True, hide_index=True)
+            combined = out_dir / "all_ligands_3d.sdf"
+            if combined.exists():
+                st.download_button("⬇️ Download combined SDF",
+                    data=combined.read_bytes(),
+                    file_name=f"{parent_name}_3d.sdf",
+                    mime="chemical/x-mdl-sdfile",
+                    use_container_width=True)
+
+    else:
+        # smi_only tier — show info about upgrading
+        st.divider()
+        st.info(
+            f"You have **{len(df)} analogs**. "
+            "3D generation and pKaNET are available for ≤ 200 analogs, "
+            "and docking for ≤ 20 analogs. "
+            "Go back to Step 3 to reduce the count if needed."
+        )
 
     # ── Full ZIP ─────────────────────────────────────────────────────────────
     st.divider()
@@ -1688,35 +1717,34 @@ elif step == len(steps):
             if cifp is not None and not cifp.empty:
                 z.writestr("cifp_results.csv", cifp.to_csv(index=False))
             z.writestr("session_info.json", json.dumps({
-                "parent_smiles":    st.session_state.parent_smiles,
-                "parent_name":      parent_name,
-                "mode":             mode,
-                "n_analogs":        len(df),
-                "selected_atoms":   sorted(st.session_state.selected_atoms),
-                "risk":             st.session_state.risk,
-                "rank_by":          st.session_state.rank_by,
+                "parent_smiles":  st.session_state.parent_smiles,
+                "parent_name":    parent_name,
+                "mode":           mode,
+                "n_analogs":      len(df),
+                "tier":           tier,
+                "selected_atoms": sorted(st.session_state.selected_atoms),
+                "risk":           st.session_state.risk,
+                "rank_by":        st.session_state.rank_by,
             }, indent=2))
         buf.seek(0)
-        st.download_button(
-            "⬇️ Download full ZIP",
+        st.download_button("⬇️ Download full ZIP",
             data=buf.getvalue(),
             file_name=f"{parent_name}_analog_builder_results.zip",
             mime="application/zip",
-            use_container_width=True,
-        )
+            use_container_width=True)
 
-    # ── Session summary ──────────────────────────────────────────────────────
     st.divider()
     with st.expander("Session summary"):
         st.json({
-            "mode":            mode,
-            "parent_smiles":   st.session_state.parent_smiles,
-            "parent_name":     parent_name,
-            "selected_atoms":  sorted(st.session_state.selected_atoms),
+            "mode":              mode,
+            "parent_smiles":     st.session_state.parent_smiles,
+            "parent_name":       parent_name,
+            "selected_atoms":    sorted(st.session_state.selected_atoms),
             "analogs_generated": len(df),
-            "top_category":    df.fragment_category.value_counts().index[0] if len(df) else "—",
-            "receptor_loaded": bool(st.session_state.receptor_path),
-            "docking_run":     st.session_state.docking_ligands is not None,
+            "tier":              tier,
+            "top_category":      df.fragment_category.value_counts().index[0] if len(df) else "—",
+            "receptor_loaded":   bool(st.session_state.receptor_path),
+            "docking_run":       st.session_state.docking_ligands is not None,
         })
 
     col_back, _ = st.columns([1, 4])
