@@ -24,6 +24,22 @@ from rdkit.Chem import AllChem, Draw
 
 import core
 
+# Module 2: ChemBERTa pocket-aware fragment ranker
+try:
+    import pocket_reference as _pr
+    _PR_OK = True
+except ImportError:
+    _pr = None
+    _PR_OK = False
+
+# Void / unoccupied space analyzer
+try:
+    import void_analyzer as _va
+    _VA_OK = True
+except ImportError:
+    _va = None
+    _VA_OK = False
+
 # Optional in-browser molecule sketcher
 try:
     from streamlit_ketcher import st_ketcher
@@ -348,6 +364,12 @@ DEFAULTS = {
     "pocket_frags": [],
     "analogs_df": None,
     "docking_ligands": None,
+    "_void_subpockets": [],
+    "_void_mode": "",
+    "_void_size_filter": None,
+    "struct_mode": "A",          # "A" = co-crystal complex | "B" = ligand+protein
+    "modeB_docked": False,       # True after Mode B docking completed
+    "modeB_complex_path": None,  # path to pseudo-complex (protein + docked pose)
     "docking_summary": None,
     "cifp_results": None,
     "work_dir": None,
@@ -416,103 +438,188 @@ def show_mol(mol, highlight=None, size=(400, 300), use_container_width=True, ato
         st.caption("(Could not render structure)")
 
 
-def _render_step1_receptor_and_continue(smiles: str, name: str):
-    md = st.session_state.mode
+def _load_receptor_widget(key_prefix: str = "") -> None:
+    """Reusable receptor loader widget (search / PDB ID / upload)."""
+    rec_src = st.radio(
+        "Load receptor from",
+        ["🔍 Search RCSB", "#️⃣ PDB ID", "📁 Upload file"],
+        horizontal=True,
+        key=f"rec_src_{key_prefix}",
+    )
 
-    if md == "structure":
-        st.markdown("### Protein receptor")
-        info_card("The receptor is the protein your compound binds to. "
-                  "Search by name, enter a PDB ID, or upload a file.")
-        rec_src = st.radio(
-            "Load receptor from",
-            ["🔍 Search RCSB", "#️⃣ PDB ID", "📁 Upload file"],
-            horizontal=True,
+    if rec_src == "🔍 Search RCSB":
+        rcsb_query = st.text_input(
+            "Search RCSB PDB", value="",
+            placeholder="e.g. EGFR kinase, JAK2, insulin receptor",
+            key=f"rcsb_search_q_{key_prefix}",
         )
+        hint("Search by protein name, gene, UniProt ID, or keyword.")
+        if st.button("Search RCSB", key=f"rcsb_search_btn_{key_prefix}") and rcsb_query.strip():
+            with st.spinner("Searching RCSB PDB…"):
+                st.session_state[f"_rcsb_results_{key_prefix}"] = core.search_rcsb(rcsb_query.strip(), max_results=8)
+        rcsb_results = st.session_state.get(f"_rcsb_results_{key_prefix}", [])
+        if rcsb_results:
+            st.markdown(f"**{len(rcsb_results)} results**")
+            for r in rcsb_results:
+                cols = st.columns([1, 6, 2])
+                with cols[0]:
+                    st.markdown(f"**{r['id']}**")
+                with cols[1]:
+                    st.caption(f"{r['title']}")
+                    st.caption(f"{r['resolution']} · {r['method']} · {r['organism']}")
+                with cols[2]:
+                    if st.button("Use", key=f"rcsb_use_{r['id']}_{key_prefix}"):
+                        with st.spinner(f"Downloading {r['id']}…"):
+                            try:
+                                work = get_work_dir()
+                                path = core.download_pdb(r["id"], work)
+                                prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                                st.session_state.receptor_path   = path
+                                st.session_state.protein_path    = prot
+                                st.session_state.ref_ligand_path = lig
+                                if lig:  # co-crystal complex
+                                    st.session_state.complex_path = path
+                                st.success(f"Receptor loaded ({r['id']}) ✅")
+                            except Exception as e:
+                                st.error(f"Could not download: {e}")
 
-        if rec_src == "🔍 Search RCSB":
-            rcsb_query = st.text_input(
-                "Search RCSB PDB", value="",
-                placeholder="e.g. EGFR kinase, JAK2, insulin receptor",
-                key="rcsb_search_q",
-            )
-            hint("Search by protein name, gene, UniProt ID, or keyword.")
-            if st.button("Search RCSB", key="rcsb_search_btn") and rcsb_query.strip():
-                with st.spinner("Searching RCSB PDB…"):
-                    st.session_state["_rcsb_results"] = core.search_rcsb(rcsb_query.strip(), max_results=8)
-            rcsb_results = st.session_state.get("_rcsb_results", [])
-            if rcsb_results:
-                st.markdown(f"**{len(rcsb_results)} results**")
-                for r in rcsb_results:
-                    cols = st.columns([1, 6, 2])
-                    with cols[0]:
-                        st.markdown(f"**{r['id']}**")
-                    with cols[1]:
-                        st.caption(f"{r['title']}")
-                        st.caption(f"{r['resolution']} · {r['method']} · {r['organism']}")
-                    with cols[2]:
-                        if st.button("Use", key=f"rcsb_use_{r['id']}"):
-                            with st.spinner(f"Downloading {r['id']}…"):
-                                try:
-                                    work = get_work_dir()
-                                    path = core.download_pdb(r["id"], work)
-                                    prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
-                                    st.session_state.receptor_path   = path
-                                    st.session_state.protein_path    = prot
-                                    st.session_state.complex_path    = path
-                                    st.session_state.ref_ligand_path = lig
-                                    st.success(f"Receptor loaded ({r['id']}) ✅")
-                                except Exception as e:
-                                    st.error(f"Could not download: {e}")
-
-        elif rec_src == "#️⃣ PDB ID":
-            pdb_id = st.text_input("4-letter PDB ID", value="", max_chars=4, placeholder="e.g. 1M17")
-            hint("Example: 1M17 is EGFR, 6VXX is SARS-CoV-2 spike.")
-            if st.button("Load receptor", key="load_rec") and pdb_id.strip():
-                with st.spinner("Downloading from RCSB…"):
-                    try:
-                        work = get_work_dir()
-                        path = core.download_pdb(pdb_id.strip().upper(), work)
-                        prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
-                        st.session_state.receptor_path   = path
-                        st.session_state.protein_path    = prot
-                        st.session_state.complex_path    = path
-                        st.session_state.ref_ligand_path = lig
-                        st.success(f"Receptor loaded ({pdb_id.upper()}) ✅")
-                    except Exception as e:
-                        st.error(f"Could not download: {e}")
-
-        else:
-            up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"])
-            if up:
-                work = get_work_dir()
-                raw = work / up.name
-                raw.write_bytes(up.read())
+    elif rec_src == "#️⃣ PDB ID":
+        pdb_id = st.text_input("4-letter PDB ID", value="", max_chars=4,
+                               placeholder="e.g. 1M17", key=f"pdb_id_{key_prefix}")
+        hint("Example: 1M17 is EGFR, 6VXX is SARS-CoV-2 spike.")
+        if st.button("Load receptor", key=f"load_rec_{key_prefix}") and pdb_id.strip():
+            with st.spinner("Downloading from RCSB…"):
                 try:
-                    path = core.cif_to_pdb_if_needed(str(raw))
+                    work = get_work_dir()
+                    path = core.download_pdb(pdb_id.strip().upper(), work)
                     prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
                     st.session_state.receptor_path   = path
                     st.session_state.protein_path    = prot
-                    st.session_state.complex_path    = path
                     st.session_state.ref_ligand_path = lig
-                    st.success("Receptor uploaded ✅")
+                    if lig:
+                        st.session_state.complex_path = path
+                    st.success(f"Receptor loaded ({pdb_id.upper()}) ✅")
                 except Exception as e:
-                    st.error(f"Could not process file: {e}")
+                    st.error(f"Could not download: {e}")
 
-        if st.session_state.receptor_path:
-            st.success(f"✅ Receptor ready: `{Path(st.session_state.receptor_path).name}`")
-            if st.session_state.ref_ligand_path:
-                st.info("Co-crystal ligand detected — will be used as reference pose")
+    else:  # Upload file
+        up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"],
+                               key=f"rec_upload_{key_prefix}")
+        if up:
+            work = get_work_dir()
+            raw = work / up.name
+            raw.write_bytes(up.read())
+            try:
+                path = core.cif_to_pdb_if_needed(str(raw))
+                prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                st.session_state.receptor_path   = path
+                st.session_state.protein_path    = prot
+                st.session_state.ref_ligand_path = lig
+                if lig:
+                    st.session_state.complex_path = path
+                st.success("Receptor uploaded ✅")
+            except Exception as e:
+                st.error(f"Could not process file: {e}")
+
+    if st.session_state.receptor_path:
+        st.success(f"✅ Receptor: `{Path(st.session_state.receptor_path).name}`")
+        if st.session_state.ref_ligand_path:
+            st.info("Co-crystal ligand detected (Mode A ready)")
+
+
+def _render_step1_receptor_and_continue(smiles: str, name: str):
+    """Step 1 footer: Mode A/B selector (structure) + continue button."""
+    md = st.session_state.mode
+
+    if md == "structure":
+        # ── Mode A / B selector ──────────────────────────────────────────────
+        st.markdown("### Structure-based mode")
+        modeAB = st.radio(
+            "How do you have the structure?",
+            [
+                "🅰️  Co-crystal complex — PDB already has my ligand inside",
+                "🅱️  Protein only — I will dock my ligand using ACD first",
+            ],
+            index=0 if st.session_state.struct_mode == "A" else 1,
+            key="struct_mode_radio",
+        )
+        st.session_state.struct_mode = "A" if modeAB.startswith("🅰️") else "B"
+        struct_mode = st.session_state.struct_mode
+        st.markdown("---")
+
+        if struct_mode == "A":
+            # ── Mode A ───────────────────────────────────────────────────────
+            info_card(
+                "<strong>Mode A — Co-crystal</strong>: Load a PDB that already "
+                "contains your ligand. The app extracts the ligand SMILES and "
+                "uses the 3D complex for pocket + void analysis."
+            )
+            col_rec, col_info = st.columns([3, 2])
+            with col_rec:
+                _load_receptor_widget(key_prefix="modeA")
+            with col_info:
+                if st.session_state.receptor_path and st.session_state.ref_ligand_path:
+                    st.markdown("**Co-crystal ligand detected ✅**")
+                    try:
+                        lig_mol = Chem.MolFromPDBFile(
+                            st.session_state.ref_ligand_path, removeHs=True)
+                        if lig_mol:
+                            extracted = Chem.MolToSmiles(lig_mol)
+                            st.code(extracted, language=None)
+                            st.session_state["_modeA_extracted_smiles"] = extracted
+                            if st.button("Use extracted SMILES ↑", key="use_extracted"):
+                                st.session_state.parent_smiles = extracted
+                                st.rerun()
+                    except Exception:
+                        st.caption("(Could not auto-extract SMILES)")
+                elif st.session_state.receptor_path:
+                    st.warning(
+                        "No co-crystal ligand found. Switch to **Mode B** or "
+                        "try a PDB that contains a bound ligand."
+                    )
+                else:
+                    st.markdown(
+                        '<div style="background:#F0EAE0;border-radius:10px;padding:1.2rem;'
+                        'text-align:center;color:#A89070;font-size:0.85rem;">'
+                        'Load a complex PDB to auto-extract SMILES</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        else:
+            # ── Mode B ───────────────────────────────────────────────────────
+            info_card(
+                "<strong>Mode B — Dock first</strong>: Load a protein-only PDB. "
+                "After you continue, the app will dock your ligand with "
+                "<strong>ACD (Anyone Can Dock)</strong> and use the docked pose "
+                "for pocket + void analysis — same pipeline as Mode A from there."
+            )
+            _load_receptor_widget(key_prefix="modeB")
+
+            if st.session_state.receptor_path:
+                if st.session_state.ref_ligand_path:
+                    st.info(
+                        "This PDB has a co-crystal ligand — consider switching "
+                        "to **Mode A** to use it directly."
+                    )
+                else:
+                    st.success(
+                        f"✅ Protein ready: `{Path(st.session_state.receptor_path).name}`  "
+                        "— ACD docking will run after Step 2."
+                    )
+
+        st.markdown("---")
 
     st.write("")
     if md == "structure" and not st.session_state.receptor_path:
         st.caption("⚠️ Load a receptor above before continuing.")
 
-    if st.button("Load compound & continue →", type="primary", disabled=not bool(smiles and smiles.strip())):
+    ready = bool(smiles and smiles.strip()) and (
+        md != "structure" or bool(st.session_state.receptor_path)
+    )
+    if st.button("Load compound & continue →", type="primary", disabled=not ready):
         mol = Chem.MolFromSmiles(smiles.strip())
         if mol is None:
-            st.error("That SMILES doesn't look right. Check for typos and try again.")
-        elif md == "structure" and not st.session_state.receptor_path:
-            st.error("Please load a receptor before continuing.")
+            st.error("That SMILES doesn\'t look right. Check for typos.")
         else:
             AllChem.Compute2DCoords(mol)
             st.session_state.parent_smiles  = smiles.strip()
@@ -520,6 +627,8 @@ def _render_step1_receptor_and_continue(smiles: str, name: str):
             st.session_state.parent_mol     = mol
             st.session_state.selected_atoms = set()
             st.session_state.analogs_df     = None
+            st.session_state.modeB_docked   = False
+            st.session_state.modeB_complex_path = None
             go(2)
 
 
@@ -985,6 +1094,93 @@ elif step == 3 and mode == "ligand":
                     value=st.session_state.categories_on.get(cat, True), key=f"cat_{cat}")
         st.session_state.categories_on = new_cats
 
+        # ── Module 2: pocket-aware ML ranking (ligand track) ──────────────
+        if _PR_OK:
+            st.markdown("### 🧬 Pocket-aware fragment ranking")
+            hint("Enter binding-site residues — ML will auto-rank and use the best fragments. Leave blank to use all fragment categories.")
+            lb_residues = st.text_input(
+                "Key binding-site residues *(optional)*",
+                value=st.session_state.get("lb_pocket_residues", ""),
+                placeholder="e.g. ASP315 LYS89 PHE82 LEU83  (one-letter or three-letter OK)",
+                key="lb_pocket_input",
+            )
+
+            if lb_residues.strip():
+                lb_codes = core.parse_pocket_residues(lb_residues)
+                if lb_codes:
+                    # ── Auto-compute ML scores immediately ──────────────────
+                    st.session_state["lb_pocket_residues"] = lb_residues
+                    _lb_tag_counts: dict = {}
+                    for _aa in lb_codes:
+                        for _tag in core.AA_TAGS.get(_aa, []):
+                            _lb_tag_counts[_tag] = _lb_tag_counts.get(_tag, 0) + 1
+                    st.session_state["_pocket_tag_counts"] = _lb_tag_counts
+
+                    all_frags = [f for f in core.LIBRARY
+                                 if st.session_state.categories_on.get(f.category, True)]
+                    lb_scored = _pr.score_fragments(all_frags, _lb_tag_counts, alpha=0.7)
+
+                    # Auto-use top-N as generation pool (no checkbox needed)
+                    n_ml = st.session_state.n_analogs
+                    top_n = lb_scored[:max(n_ml, 50)]  # always keep ≥50 for diversity
+                    st.session_state.pocket_frags = [f for f, _ in top_n]
+
+                    # ── Summary info card ───────────────────────────────────
+                    dominant = max(_lb_tag_counts, key=_lb_tag_counts.get)
+                    _mstatus = _pr.model_status()
+                    _badge = "🟢 ChemBERTa" if _mstatus["chemberta_loaded"] else "🟡 Rule-based fallback"
+                    info_card(
+                        f"<strong>{len(lb_codes)} residues detected</strong> · "
+                        f"dominant: <code>{dominant.replace('_', ' ')}</code> · "
+                        f"{_badge}<br>"
+                        f"Ranked {len(all_frags):,} fragments → using top <strong>{len(top_n)}</strong> "
+                        f"as generation pool for Step 4."
+                    )
+
+                    # ── Ranked table (top 20 preview) ──────────────────────
+                    st.markdown(f"**Top 20 ML-ranked fragments** *(used automatically in Step 4)*")
+                    preview_20 = lb_scored[:20]
+                    lb_df = pd.DataFrame([{
+                        "Rank":     i + 1,
+                        "Fragment": f.name,
+                        "Category": f.category,
+                        "ML score": f"{s:.3f}",
+                        "Reason":   _pr.explain_score(f, _lb_tag_counts)["reason"][:60] + "…",
+                    } for i, (f, s) in enumerate(preview_20)])
+
+                    def _lb_colour(val):
+                        try:
+                            v = float(val)
+                            if v >= 0.75:   return "background-color:#E6F4EA;color:#1E7E34"
+                            elif v >= 0.50: return "background-color:#FFF3CD;color:#856404"
+                            else:           return "background-color:#FDE8E8;color:#842029"
+                        except Exception:
+                            return ""
+
+                    st.dataframe(
+                        lb_df.style.map(_lb_colour, subset=["ML score"]),
+                        use_container_width=True, hide_index=True, height=340,
+                    )
+
+                    with st.expander("🔍 Score breakdown for top fragment"):
+                        top_f, top_s = preview_20[0]
+                        exp = _pr.explain_score(top_f, _lb_tag_counts)
+                        st.markdown(f"**{top_f.name}** — ML score: `{top_s:.3f}`")
+                        st.markdown(f"- Category: `{exp['category']}`")
+                        st.markdown(f"- Category score: `{exp['category_score']}`")
+                        st.markdown(f"- Fragment-level score: `{exp['fine_score']}`")
+                        st.markdown(f"- Dominant pocket tag: `{exp['dominant_pocket_tag']}`")
+                        st.markdown(f"- Reason: {exp['reason']}")
+
+                else:
+                    st.warning("Could not parse residue codes. Try formats like: ASP315 LYS89 PHE82  or  D K F L")
+            else:
+                # No residues provided → clear ML selection, use all categories
+                st.session_state["_pocket_tag_counts"] = {}
+                if st.session_state.get("pocket_frags"):
+                    st.session_state.pocket_frags = []
+                st.caption("💡 No residues entered — all fragment categories will be used in Step 4.")
+
     with st.expander("⚙️ Advanced options"):
         adv1, adv2 = st.columns(2)
         with adv1:
@@ -1023,6 +1219,107 @@ elif step == 3 and mode == "ligand":
 elif step == 3 and mode == "structure":
     info_card("We'll analyse which residues are near the binding site and suggest the best functional groups to add.")
 
+    # ── Mode B: dock ligand first if not yet done ────────────────────────────
+    if st.session_state.struct_mode == "B" and not st.session_state.modeB_docked:
+        st.markdown("### 🔬 Step 3A — Dock ligand with ACD")
+        info_card(
+            "<strong>Mode B</strong>: Your ligand needs to be docked into the "
+            "protein before pocket analysis. ACD (Anyone Can Dock) will run now."
+        )
+        acd_ok    = bool(shutil.which("acd"))
+        obabel_ok = bool(shutil.which("obabel"))
+        receptor  = st.session_state.receptor_path
+        protein   = st.session_state.protein_path
+
+        bcol1, bcol2 = st.columns(2)
+        bcol1.markdown(
+            f'<div style="padding:0.6rem 1rem;border-radius:8px;'
+            f'background:{"#E6F4EA" if acd_ok else "#FDECEA"};'
+            f'color:{"#1E7E34" if acd_ok else "#B00020"};font-size:0.85rem;">'
+            f'{"✅ acd available" if acd_ok else "❌ acd not found — pip install anyonecandock"}</div>',
+            unsafe_allow_html=True,
+        )
+        bcol2.markdown(
+            f'<div style="padding:0.6rem 1rem;border-radius:8px;'
+            f'background:{"#E6F4EA" if obabel_ok else "#FDECEA"};'
+            f'color:{"#1E7E34" if obabel_ok else "#B00020"};font-size:0.85rem;">'
+            f'{"✅ obabel available" if obabel_ok else "❌ obabel not found — apt install openbabel"}</div>',
+            unsafe_allow_html=True,
+        )
+
+        if acd_ok and obabel_ok and receptor:
+            dock_ph  = st.number_input("pH for protonation", value=7.4, step=0.1, key="modeB_ph")
+            use_pkanet = st.checkbox("Use pKaNET protonation", value=True, key="modeB_pkanet")
+
+            if st.button("🚀 Dock ligand now", type="primary", key="modeB_dock_btn"):
+                work     = get_work_dir()
+                dock_out = str(work / "modeB_docking")
+                compound = st.session_state.parent_name or "ligand"
+                smiles   = st.session_state.parent_smiles
+
+                with st.spinner(f"Docking {compound} into {Path(receptor).name}…"):
+                    cmd = core.build_acd_dock_cmd(
+                        receptor=receptor,
+                        smiles=smiles,
+                        name=compound,
+                        ph=float(dock_ph),
+                        output_dir=dock_out,
+                        use_pkanet=bool(use_pkanet),
+                        save_poses=True,
+                    )
+                    rc, log = core.run_command(cmd)
+                    (work / "modeB_acd.log").write_text(log)
+
+                    if rc != 0:
+                        st.error(f"ACD docking failed (exit {rc}). Check the log below.")
+                        with st.expander("ACD log"):
+                            st.text(log[-3000:])
+                    else:
+                        # Find best pose SDF → convert to PDB → build pseudo-complex
+                        sdf_path = core.find_pose_sdf(dock_out)
+                        if sdf_path:
+                            pose_pdb = str(work / "modeB_pose.pdb")
+                            core.sdf_first_mol_to_pdb(sdf_path, pose_pdb)
+                            # Build pseudo-complex: protein + docked pose
+                            complex_pdb = str(work / "modeB_complex.pdb")
+                            if protein and os.path.exists(protein):
+                                core.combine_protein_ligand_pdb(protein, pose_pdb, complex_pdb)
+                            else:
+                                core.combine_protein_ligand_pdb(receptor, pose_pdb, complex_pdb)
+
+                            st.session_state.complex_path       = complex_pdb
+                            st.session_state.ref_ligand_path    = pose_pdb
+                            st.session_state.modeB_docked       = True
+                            st.session_state.modeB_complex_path = complex_pdb
+
+                            # Parse best score
+                            best = core.parse_acd_score_csvs(dock_out)
+                            be_str = ""
+                            if best:
+                                sc_col = best.get("_score_col","")
+                                be_val = best.get(sc_col)
+                                if be_val is not None:
+                                    be_str = f"  ·  BE = {float(be_val):.2f} kcal/mol"
+
+                            st.success(f"✅ Docking complete{be_str} — proceeding to pocket analysis")
+                            st.rerun()
+                        else:
+                            st.error("Docking ran but no pose SDF found. Check ACD output.")
+                            with st.expander("ACD log"):
+                                st.text(log[-3000:])
+        elif not receptor:
+            st.warning("No receptor loaded. Go back to Step 1 and load a protein PDB.")
+        else:
+            st.info("ACD or OpenBabel not available. Cannot run docking in Mode B.")
+
+        # Stop here until docking is done
+        if not st.session_state.modeB_docked:
+            st.divider()
+            if st.button("← Back to Step 1", key="modeB_back"):
+                go(1)
+            st.stop()
+
+    # ── Pocket analysis (Mode A or Mode B after docking) ─────────────────────
     if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
         col_analysis, col_result = st.columns([1, 1], gap="large")
 
@@ -1042,6 +1339,12 @@ elif step == 3 and mode == "structure":
                         _, _, pocket_frags = core.suggest_fragments_from_residues(
                             residue_codes, active_lib, st.session_state.max_pocket_frags)
                         st.session_state.pocket_frags = pocket_frags
+                        # Store tag counts for Module 2 ML scoring
+                        _tag_counts: dict = {}
+                        for _aa in residue_codes:
+                            for _tag in core.AA_TAGS.get(_aa, []):
+                                _tag_counts[_tag] = _tag_counts.get(_tag, 0) + 1
+                        st.session_state["_pocket_tag_counts"] = _tag_counts
                         st.success(f"Found {len(pocket_df)} pocket residues, {len(growth_df)} growth opportunities")
                     except Exception as e:
                         st.error(f"Analysis failed: {e}")
@@ -1056,16 +1359,88 @@ elif step == 3 and mode == "structure":
                 if codes:
                     _, _, pf = core.suggest_fragments_from_residues(codes, core.BUILTIN_LIBRARY, 6)
                     st.session_state.pocket_frags = pf
+                    # Store tag counts for Module 2 ML scoring
+                    _tag_counts_m: dict = {}
+                    for _aa in codes:
+                        for _tag in core.AA_TAGS.get(_aa, []):
+                            _tag_counts_m[_tag] = _tag_counts_m.get(_tag, 0) + 1
+                    st.session_state["_pocket_tag_counts"] = _tag_counts_m
 
         with col_result:
             if st.session_state.pocket_frags:
                 st.markdown("### Suggested functional groups")
-                hint("These groups match the chemistry of your binding pocket residues.")
-                fdf = pd.DataFrame([
-                    {"Group": f.name, "Category": f.category, "Why": f.notes or f.category}
-                    for f in st.session_state.pocket_frags
-                ])
-                st.dataframe(fdf, use_container_width=True, hide_index=True)
+
+                # ── Module 2: ML pocket-aware ranking ──────────────────────
+                if _PR_OK and st.session_state.get("_pocket_tag_counts"):
+                    # Show model status badge
+                    _mstatus = _pr.model_status()
+                    _badge_col = "🟢" if _mstatus["chemberta_loaded"] else "🟡"
+                    st.markdown(
+                        f'<div style="font-size:0.78rem;color:#5A4A35;margin-bottom:6px;">'
+                        f'{_badge_col} <strong>{_mstatus["mode"]}</strong>'
+                        f'{" · cache: " + str(_mstatus["cache_size"]) + " SMILES" if _mstatus["chemberta_loaded"] else ""}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                    hint("Ranked by ChemBERTa semantic similarity + PDB co-occurrence (blended).")
+                    tag_counts = st.session_state["_pocket_tag_counts"]
+                    alpha = st.slider(
+                        "Category vs fragment-level weight",
+                        0.0, 1.0, 0.7, 0.05,
+                        help="Higher = more weight on fragment category fit; lower = more weight on specific fragment PDB frequency",
+                        key="pr_alpha",
+                    )
+                    scored = _pr.score_fragments(
+                        st.session_state.pocket_frags, tag_counts, alpha=alpha
+                    )
+                    fdf = pd.DataFrame([{
+                        "Rank":     i + 1,
+                        "Group":    f.name,
+                        "Category": f.category,
+                        "ML score": f"{score:.3f}",
+                        "Why":      _pr.explain_score(f, tag_counts)["reason"],
+                    } for i, (f, score) in enumerate(scored)])
+
+                    # Colour-code by score
+                    def _score_colour(val):
+                        try:
+                            v = float(val)
+                            if v >= 0.75:   return "background-color:#E6F4EA;color:#1E7E34"
+                            elif v >= 0.50: return "background-color:#FFF3CD;color:#856404"
+                            else:           return "background-color:#FDE8E8;color:#842029"
+                        except Exception:
+                            return ""
+
+                    styled = fdf.style.map(_score_colour, subset=["ML score"])
+                    st.dataframe(styled, use_container_width=True, hide_index=True, height=320)
+
+                    # Update pocket_frags order to ML-ranked order
+                    st.session_state.pocket_frags = [f for f, _ in scored]
+
+                    # Expandable explanation for top fragment
+                    with st.expander("🔍 Score breakdown for top fragment"):
+                        top_f, top_s = scored[0]
+                        exp = _pr.explain_score(top_f, tag_counts)
+                        st.markdown(f"**{top_f.name}** — ML score: `{top_s:.3f}`")
+                        st.markdown(f"- Category: `{exp['category']}`")
+                        st.markdown(f"- Category score: `{exp['category_score']}`")
+                        st.markdown(f"- Fragment-level score: `{exp['fine_score']}`")
+                        st.markdown(f"- Dominant pocket: `{exp['dominant_pocket_tag']}`")
+                        st.markdown(f"- Reason: {exp['reason']}")
+                        if exp['top_matching_tags']:
+                            tags_str = ", ".join(f"`{t}` ({s})" for t, s in exp['top_matching_tags'])
+                            st.markdown(f"- Top pocket tags: {tags_str}")
+
+                else:
+                    # Fallback: rule-based display
+                    hint("These groups match the chemistry of your binding pocket residues.")
+                    fdf = pd.DataFrame([
+                        {"Group": f.name, "Category": f.category, "Why": f.notes or f.category}
+                        for f in st.session_state.pocket_frags
+                    ])
+                    st.dataframe(fdf, use_container_width=True, hide_index=True)
+                    if not _PR_OK:
+                        st.caption("ℹ️ Install `pocket_reference.py` to enable ML scoring.")
             else:
                 st.markdown(
                     '<div style="background:#F0EAE0;border-radius:12px;padding:2rem;'
@@ -1074,6 +1449,79 @@ elif step == 3 and mode == "structure":
                     unsafe_allow_html=True)
     else:
         st.warning("No receptor file found. Go back to Step 1 and load a receptor.")
+
+    # ── Void / unoccupied space analysis ─────────────────────────────────
+    if _VA_OK and st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
+        st.divider()
+        st.markdown("### 📐 Unoccupied pocket space analysis")
+        info_card(
+            "Detects sub-pockets <strong>not filled by the current ligand</strong> "
+            "and recommends fragment sizes that fit the available space. "
+            "Use this to decide which attachment vector to grow into."
+        )
+
+        va_cutoff = st.slider("Pocket cutoff (Å)", 4.0, 10.0, 6.0, 0.5, key="va_cutoff")
+        va_cluster = st.slider("Sub-pocket cluster distance (Å)", 3.0, 10.0, 6.0, 0.5, key="va_cluster")
+
+        if st.button("Analyse unoccupied space", type="primary", key="va_btn"):
+            with st.spinner("Detecting void sub-pockets…"):
+                try:
+                    from core import read_complex_atoms_for_pocket, analyze_complex_distance_shell
+                    prot_atoms, lig_atoms = read_complex_atoms_for_pocket(
+                        st.session_state.complex_path)
+                    p_df, c_df, g_df, lig_raw = analyze_complex_distance_shell(
+                        st.session_state.complex_path,
+                        pocket_cutoff=va_cutoff,
+                        contact_cutoff=4.0,
+                    )
+                    subpockets, va_mode = _va.analyze_void(
+                        prot_atoms, lig_atoms if lig_atoms else None,
+                        p_df, g_df,
+                        pocket_cutoff=va_cutoff,
+                        cluster_dist=va_cluster,
+                    )
+                    st.session_state["_void_subpockets"] = subpockets
+                    st.session_state["_void_mode"] = va_mode
+                    st.success(
+                        f"Mode: **{va_mode}** — "
+                        f"found **{len(subpockets)}** unoccupied sub-pocket(s)"
+                    )
+                except Exception as e:
+                    st.error(f"Void analysis failed: {e}")
+
+        # Show results if available
+        subpockets = st.session_state.get("_void_subpockets", [])
+        va_mode    = st.session_state.get("_void_mode", "")
+        if subpockets:
+            # Summary text
+            st.markdown(_va.void_summary_text(subpockets, va_mode))
+
+            # Detailed table
+            sp_df = _va.subpockets_to_df(subpockets)
+            st.dataframe(sp_df, use_container_width=True, hide_index=True)
+
+            # Per sub-pocket fragment size filter
+            st.markdown("#### Apply size filter to fragment generation")
+            sp_options = ["All sizes (no filter)"] + [
+                f"Sub-pocket {sp['sub_pocket_id']}: {sp['size_class']} "
+                f"(r≤{sp['available_radius_A']:.1f}Å, {sp['void_volume_est_A3']:.0f}ų)"
+                for sp in subpockets
+            ]
+            chosen_sp = st.selectbox(
+                "Restrict fragments to fit selected sub-pocket",
+                sp_options, index=0, key="va_sp_select",
+            )
+            if chosen_sp != "All sizes (no filter)":
+                sp_idx = int(chosen_sp.split(":")[0].replace("Sub-pocket","").strip()) - 1
+                if 0 <= sp_idx < len(subpockets):
+                    sel_sp = subpockets[sp_idx]
+                    st.session_state["_void_size_filter"] = sel_sp["size_class"]
+                    hint(
+                        f"Fragments larger than **{sel_sp['size_class']}** will be excluded. "
+                        f"Examples that fit: {_va.SIZE_EXAMPLES.get(sel_sp['size_class'], '')}"
+                    )
+            else:
+                st.session_state["_void_size_filter"] = None
 
     st.divider()
     st.markdown("### Generation settings")
@@ -1127,6 +1575,15 @@ elif step == 4:
         f for f in core.LIBRARY
         if st.session_state.categories_on.get(f.category, True) and f.heavy <= size_cap
     ]
+    # Apply void size filter if user selected a sub-pocket
+    _void_size_filter = st.session_state.get("_void_size_filter")
+    if _void_size_filter and _VA_OK:
+        active_lib = _va.filter_frags_by_size(active_lib, _void_size_filter, allow_smaller=True)
+        st.info(
+            f"📐 Void filter active: showing fragments ≤ **{_void_size_filter}** size "
+            f"({len(active_lib):,} fragments match). "
+            f"Change in Step 3 → Unoccupied space analysis."
+        )
     pocket_frags = st.session_state.pocket_frags or []
     if mode == "structure" and pocket_frags and st.session_state.accept_pocket_suggestions:
         chosen = pocket_frags + [f for f in active_lib if f.name not in {g.name for g in pocket_frags}]
