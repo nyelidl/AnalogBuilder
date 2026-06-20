@@ -664,80 +664,69 @@ def _render_step1_receptor_and_continue(smiles: str, name: str):
     md = st.session_state.mode
 
     if md == "structure":
-        # ── Mode A / B selector ──────────────────────────────────────────────
-        st.markdown("### Structure-based mode")
-        modeAB = st.radio(
-            "How do you have the structure?",
-            [
-                "🅰️  Co-crystal complex — PDB already has my ligand inside",
-                "🅱️  Protein only — I will dock my ligand using ACD first",
-            ],
-            index=0 if st.session_state.struct_mode == "A" else 1,
-            key="struct_mode_radio",
+        # ── Unified PDB loader — auto-detect mode from PDB content ─────────
+        st.markdown("### Protein structure")
+        info_card(
+            "Load your protein from RCSB or upload a PDB file. "
+            "The app will <strong>auto-detect</strong> whether the PDB already contains "
+            "a bound ligand:<br>"
+            "• <strong>Complex detected</strong> → skip docking, use directly (fastest)<br>"
+            "• <strong>Protein only</strong> → dock your ligand with ACD first"
         )
-        st.session_state.struct_mode = "A" if modeAB.startswith("🅰️") else "B"
-        struct_mode = st.session_state.struct_mode
-        st.markdown("---")
 
-        if struct_mode == "A":
-            # ── Mode A ───────────────────────────────────────────────────────
-            info_card(
-                "<strong>Mode A — Co-crystal</strong>: Load a PDB that already "
-                "contains your ligand. The app extracts the ligand SMILES and "
-                "uses the 3D complex for pocket + void analysis."
-            )
-            col_rec, col_info = st.columns([3, 2])
-            with col_rec:
-                _load_receptor_widget(key_prefix="modeA")
-            with col_info:
-                if st.session_state.receptor_path and st.session_state.ref_ligand_path:
-                    st.markdown("**Co-crystal ligand detected ✅**")
+        col_rec, col_info = st.columns([3, 2])
+        with col_rec:
+            _load_receptor_widget(key_prefix="struct")
+
+        with col_info:
+            if st.session_state.receptor_path:
+                has_lig = bool(st.session_state.ref_ligand_path)
+
+                if has_lig:
+                    # ── Auto Mode A: complex detected ─────────────────────────
+                    st.session_state.struct_mode = "A"
+                    st.success("✅ **Complex detected** — ligand found in PDB")
+                    st.caption("Docking will be skipped. Using co-crystal pose directly.")
+
+                    # Auto-extract SMILES
                     try:
                         lig_mol = Chem.MolFromPDBFile(
                             st.session_state.ref_ligand_path, removeHs=True)
                         if lig_mol:
                             extracted = Chem.MolToSmiles(lig_mol)
-                            st.code(extracted, language=None)
                             st.session_state["_modeA_extracted_smiles"] = extracted
-                            if st.button("Use extracted SMILES ↑", key="use_extracted"):
+                            st.markdown("**Extracted ligand SMILES:**")
+                            st.code(extracted, language=None)
+                            if st.button("Use as parent compound ↑", key="use_extracted"):
                                 st.session_state.parent_smiles = extracted
                                 st.rerun()
                     except Exception:
-                        st.caption("(Could not auto-extract SMILES)")
-                elif st.session_state.receptor_path:
-                    st.warning(
-                        "No co-crystal ligand found. Switch to **Mode B** or "
-                        "try a PDB that contains a bound ligand."
-                    )
+                        st.caption("(Could not auto-extract SMILES from ligand)")
+
+                    # Override option — user can still choose to dock their own ligand
+                    if st.checkbox(
+                        "Ignore co-crystal ligand — dock my own ligand instead",
+                        value=False, key="force_modeB",
+                    ):
+                        st.session_state.struct_mode = "B"
+                        st.info("Mode switched to docking. Enter your SMILES in the field below.")
+
                 else:
-                    st.markdown(
-                        '<div style="background:#F0EAE0;border-radius:10px;padding:1.2rem;'
-                        'text-align:center;color:#A89070;font-size:0.85rem;">'
-                        'Load a complex PDB to auto-extract SMILES</div>',
-                        unsafe_allow_html=True,
-                    )
-
-        else:
-            # ── Mode B ───────────────────────────────────────────────────────
-            info_card(
-                "<strong>Mode B — Dock first</strong>: Load a protein-only PDB. "
-                "After you continue, the app will dock your ligand with "
-                "<strong>ACD (Anyone Can Dock)</strong> and use the docked pose "
-                "for pocket + void analysis — same pipeline as Mode A from there."
-            )
-            _load_receptor_widget(key_prefix="modeB")
-
-            if st.session_state.receptor_path:
-                if st.session_state.ref_ligand_path:
+                    # ── Auto Mode B: protein only ─────────────────────────────
+                    st.session_state.struct_mode = "B"
                     st.info(
-                        "This PDB has a co-crystal ligand — consider switching "
-                        "to **Mode A** to use it directly."
+                        f"**Protein only** — `{Path(st.session_state.receptor_path).name}`  \n"
+                        "No bound ligand detected. ACD docking will run after Step 2."
                     )
-                else:
-                    st.success(
-                        f"✅ Protein ready: `{Path(st.session_state.receptor_path).name}`  "
-                        "— ACD docking will run after Step 2."
-                    )
+            else:
+                st.markdown(
+                    '<div style="background:#F0EAE0;border-radius:10px;padding:1.2rem;'
+                    'text-align:center;color:#A89070;font-size:0.85rem;">"'
+                    'Load a PDB — the app will detect if it contains a ligand</div>',
+                    unsafe_allow_html=True,
+                )
+
+        struct_mode = st.session_state.struct_mode
 
         st.markdown("---")
 
@@ -1298,11 +1287,15 @@ elif step == 3 and mode == "ligand":
                         top_f, top_s = preview_20[0]
                         exp = _pr.explain_score(top_f, _lb_tag_counts)
                         st.markdown(f"**{top_f.name}** — ML score: `{top_s:.3f}`")
-                        st.markdown(f"- Category: `{exp['category']}`")
-                        st.markdown(f"- Category score: `{exp['category_score']}`")
-                        st.markdown(f"- Fragment-level score: `{exp['fine_score']}`")
-                        st.markdown(f"- Dominant pocket tag: `{exp['dominant_pocket_tag']}`")
-                        st.markdown(f"- Reason: {exp['reason']}")
+                        st.markdown(f"- Category: `{exp.get('category', '—')}`")
+                        st.markdown(f"- Category score: `{exp.get('category_score', '—')}`")
+                        st.markdown(f"- Model: `{exp.get('model_used', 'rule-based')}`")
+                        st.markdown(f"- Dominant pocket tag: `{exp.get('dominant_pocket_tag', '—')}`")
+                        st.markdown(f"- Reason: {exp.get('reason', '—')}")
+                        top_tags = exp.get('top_pocket_tags') or exp.get('top_matching_tags') or []
+                        if top_tags:
+                            tags_str = ", ".join(f"`{t}` ({c})" for t, c in top_tags[:3])
+                            st.markdown(f"- Top pocket tags: {tags_str}")
 
                 else:
                     st.warning("Could not parse residue codes. Try formats like: ASP315 LYS89 PHE82  or  D K F L")
@@ -1554,13 +1547,14 @@ elif step == 3 and mode == "structure":
                         top_f, top_s = scored[0]
                         exp = _pr.explain_score(top_f, tag_counts)
                         st.markdown(f"**{top_f.name}** — ML score: `{top_s:.3f}`")
-                        st.markdown(f"- Category: `{exp['category']}`")
-                        st.markdown(f"- Category score: `{exp['category_score']}`")
-                        st.markdown(f"- Fragment-level score: `{exp['fine_score']}`")
-                        st.markdown(f"- Dominant pocket: `{exp['dominant_pocket_tag']}`")
-                        st.markdown(f"- Reason: {exp['reason']}")
-                        if exp['top_matching_tags']:
-                            tags_str = ", ".join(f"`{t}` ({s})" for t, s in exp['top_matching_tags'])
+                        st.markdown(f"- Category: `{exp.get('category', '—')}`")
+                        st.markdown(f"- Category score: `{exp.get('category_score', '—')}`")
+                        st.markdown(f"- Model: `{exp.get('model_used', 'rule-based')}`")
+                        st.markdown(f"- Dominant pocket tag: `{exp.get('dominant_pocket_tag', '—')}`")
+                        st.markdown(f"- Reason: {exp.get('reason', '—')}")
+                        top_tags = exp.get('top_pocket_tags') or exp.get('top_matching_tags') or []
+                        if top_tags:
+                            tags_str = ", ".join(f"`{t}` ({c})" for t, c in top_tags[:3])
                             st.markdown(f"- Top pocket tags: {tags_str}")
 
                 else:
