@@ -103,43 +103,44 @@ h3 { font-size: 1.0rem !important; font-weight: 600; color: #3D7A74; }
 }
 
 /* ── Mode cards — clickable ── */
-.mode-card-wrap {
-    position: relative;
-    cursor: pointer;
+/* ── Mode cards — equal height columns, card border on div above button ── */
+/* Make both columns stretch to equal height */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col) {
+    align-items: stretch !important;
 }
-.mode-card {
+.mode-card-col {
     background: #FFFFFF;
     border: 2px solid #E0D6C8;
     border-radius: 14px;
-    padding: 2rem 1.5rem;
+    padding: 2rem 1.5rem 1.2rem;
     text-align: center;
+    height: 100%;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
     transition: border-color 0.2s, box-shadow 0.2s;
-    pointer-events: none;
+    cursor: pointer;
 }
-.mode-card-wrap:hover .mode-card {
+.mode-card-col:hover {
     border-color: #E8A020;
     box-shadow: 0 4px 16px rgba(232,160,32,0.15);
 }
-.mode-card-wrap:active .mode-card {
-    border-color: #C88010;
-    box-shadow: 0 2px 8px rgba(200,128,16,0.2);
-}
-.mode-card .icon { font-size: 3rem; margin-bottom: 0.5rem; }
-.mode-card h2 { color: #2C2C2C; margin: 0.4rem 0 0.6rem; }
-.mode-card p { color: #6B5E4E; font-size: 0.9rem; line-height: 1.5; margin: 0; }
-/* invisible overlay button covers entire card */
-.mode-card-wrap [data-testid="stButton"] {
-    position: absolute !important;
-    inset: 0 !important;
-    opacity: 0 !important;
-    z-index: 10 !important;
-}
-.mode-card-wrap [data-testid="stButton"] > button {
-    width: 100% !important;
-    height: 100% !important;
+/* Select button inside card — amber pill, no extra border */
+.mode-card-col [data-testid="stButton"] > button {
+    background: #E8A020 !important;
+    color: #fff !important;
     border: none !important;
-    background: transparent !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    padding: 0.45rem 1.2rem !important;
+    width: 100% !important;
+    margin-top: 1.2rem !important;
     cursor: pointer !important;
+}
+.mode-card-col [data-testid="stButton"] > button:hover {
+    background: #C88010 !important;
 }
 
 /* ── Step progress in sidebar ── */
@@ -610,38 +611,40 @@ if st.session_state.mode is None:
     col_l, col_r = st.columns(2, gap="large")
 
     with col_l:
-        # Card HTML (visual only, pointer-events:none)
-        st.markdown(f"""
-        <div class="mode-card-wrap">
-            <div class="mode-card">
-                <div class="icon"><img src="{LB_URL}" width="100" style="display:inline-block;"/></div>
-                <h2>Ligand-based</h2>
-                <p>Start with just a SMILES string.<br>
-                Great for exploring substitutions quickly — no protein structure needed.</p>
-            </div>
-        """, unsafe_allow_html=True)
-        # Invisible full-card button inside the wrap div
-        if st.button("Ligand-based", key="pick_ligand", use_container_width=True, type="primary"):
+        st.markdown('<div class="mode-card-col">', unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="text-align:center;pointer-events:none;margin-bottom:0.5rem;">'
+            f'<img src="{LB_URL}" width="90" style="display:inline-block;margin-bottom:0.75rem;"/>'
+            f'<div style="font-size:1.15rem;font-weight:700;color:#2C2C2C;margin-bottom:0.4rem;">Ligand-based</div>'
+            f'<div style="font-size:0.88rem;color:#6B5E4E;line-height:1.55;">'
+            f'Start with just a SMILES string.<br>'
+            f'Great for exploring substitutions quickly —<br>no protein structure needed.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Select Ligand-based →", key="pick_ligand", use_container_width=True, type="primary"):
             st.session_state.mode = "ligand"
             st.session_state.step = 1
             st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
     with col_r:
-        st.markdown(f"""
-        <div class="mode-card-wrap">
-            <div class="mode-card">
-                <div class="icon"><img src="{SB_URL}" width="100" style="display:inline-block;"/></div>
-                <h2>Structure-based</h2>
-                <p>Upload or fetch a protein structure.<br>
-                Analogs are guided by the actual binding pocket environment.</p>
-            </div>
-        """, unsafe_allow_html=True)
-        if st.button("Structure-based", key="pick_struct", use_container_width=True, type="primary"):
+        st.markdown('<div class="mode-card-col">', unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="text-align:center;pointer-events:none;margin-bottom:0.5rem;">'
+            f'<img src="{SB_URL}" width="90" style="display:inline-block;margin-bottom:0.75rem;"/>'
+            f'<div style="font-size:1.15rem;font-weight:700;color:#2C2C2C;margin-bottom:0.4rem;">Structure-based</div>'
+            f'<div style="font-size:0.88rem;color:#6B5E4E;line-height:1.55;">'
+            f'Upload or fetch a protein structure.<br>'
+            f'Analogs are guided by the actual<br>binding pocket environment.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Select Structure-based →", key="pick_struct", use_container_width=True, type="primary"):
             st.session_state.mode = "structure"
             st.session_state.step = 1
             st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
     st.stop()
 
