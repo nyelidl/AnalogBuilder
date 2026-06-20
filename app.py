@@ -664,66 +664,71 @@ def _render_step1_receptor_and_continue(smiles: str, name: str):
     md = st.session_state.mode
 
     if md == "structure":
-        # ── Unified PDB loader — auto-detect mode from PDB content ─────────
+        # ── Ask user: have complex or not? ──────────────────────────────────
         st.markdown("### Protein structure")
-        info_card(
-            "Load your protein from RCSB or upload a PDB file. "
-            "The app will <strong>auto-detect</strong> whether the PDB already contains "
-            "a bound ligand:<br>"
-            "• <strong>Complex detected</strong> → skip docking, use directly (fastest)<br>"
-            "• <strong>Protein only</strong> → dock your ligand with ACD first"
+
+        has_complex = st.radio(
+            "Do you have a protein–ligand complex?",
+            ["Yes — I have a co-crystal / docked complex (PDB with ligand inside)",
+             "No — I only have a protein structure (will dock my ligand)"],
+            index=0 if st.session_state.struct_mode != "B" else 1,
+            key="has_complex_radio",
         )
+        st.session_state.struct_mode = "A" if has_complex.startswith("Yes") else "B"
+        struct_mode = st.session_state.struct_mode
+        st.markdown("---")
 
-        col_rec, col_info = st.columns([3, 2])
-        with col_rec:
-            _load_receptor_widget(key_prefix="struct")
-
-        with col_info:
-            if st.session_state.receptor_path:
-                has_lig = bool(st.session_state.ref_ligand_path)
-
-                if has_lig:
-                    # ── Auto Mode A: complex detected ─────────────────────────
-                    st.session_state.struct_mode = "A"
-                    st.success("✅ **Complex detected** — ligand found in PDB")
-                    st.caption("Docking will be skipped. Using co-crystal pose directly.")
-
-                    # Auto-extract SMILES
+        if struct_mode == "A":
+            # ── Have complex → load PDB, skip docking ────────────────────────
+            info_card(
+                "<strong>Load your complex PDB</strong> — the app will extract "
+                "the ligand SMILES automatically and use the 3D complex for "
+                "pocket analysis. <strong>No docking needed.</strong>"
+            )
+            col_rec, col_info = st.columns([3, 2])
+            with col_rec:
+                _load_receptor_widget(key_prefix="struct")
+            with col_info:
+                if st.session_state.receptor_path and st.session_state.ref_ligand_path:
+                    st.success("✅ Ligand detected in PDB")
                     try:
                         lig_mol = Chem.MolFromPDBFile(
                             st.session_state.ref_ligand_path, removeHs=True)
                         if lig_mol:
                             extracted = Chem.MolToSmiles(lig_mol)
                             st.session_state["_modeA_extracted_smiles"] = extracted
-                            st.markdown("**Extracted ligand SMILES:**")
+                            st.markdown("**Extracted SMILES:**")
                             st.code(extracted, language=None)
                             if st.button("Use as parent compound ↑", key="use_extracted"):
                                 st.session_state.parent_smiles = extracted
                                 st.rerun()
                     except Exception:
-                        st.caption("(Could not auto-extract SMILES from ligand)")
-
-                    # Override option — user can still choose to dock their own ligand
-                    if st.checkbox(
-                        "Ignore co-crystal ligand — dock my own ligand instead",
-                        value=False, key="force_modeB",
-                    ):
-                        st.session_state.struct_mode = "B"
-                        st.info("Mode switched to docking. Enter your SMILES in the field below.")
-
-                else:
-                    # ── Auto Mode B: protein only ─────────────────────────────
-                    st.session_state.struct_mode = "B"
-                    st.info(
-                        f"**Protein only** — `{Path(st.session_state.receptor_path).name}`  \n"
-                        "No bound ligand detected. ACD docking will run after Step 2."
+                        st.caption("(Could not auto-extract SMILES)")
+                elif st.session_state.receptor_path:
+                    st.warning(
+                        "No ligand found in this PDB. "
+                        "Switch to **No** above, or try a different PDB file."
                     )
-            else:
-                st.markdown(
-                    '<div style="background:#F0EAE0;border-radius:10px;padding:1.2rem;'
-                    'text-align:center;color:#A89070;font-size:0.85rem;">"'
-                    'Load a PDB — the app will detect if it contains a ligand</div>',
-                    unsafe_allow_html=True,
+                else:
+                    st.markdown(
+                        '<div style="background:#F0EAE0;border-radius:10px;'
+                        'padding:1.2rem;text-align:center;color:#A89070;font-size:0.85rem;">'
+                        'Load a complex PDB to auto-extract SMILES</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        else:
+            # ── No complex → load protein, dock later ────────────────────────
+            info_card(
+                "<strong>Load your protein PDB</strong> — ACD (Anyone Can Dock) "
+                "will dock your ligand after Step 2. "
+                "The docked pose will then be used for pocket analysis."
+            )
+            _load_receptor_widget(key_prefix="struct")
+            if st.session_state.receptor_path:
+                st.success(
+                    f"✅ Protein ready: `{Path(st.session_state.receptor_path).name}`  "
+                    "— ACD docking will run in Step 3."
                 )
 
         struct_mode = st.session_state.struct_mode
