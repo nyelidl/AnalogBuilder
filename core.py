@@ -6120,3 +6120,68 @@ def get_interacting_residues(receptor_pdb: str, lig_mol, cutoff: float = 3.5) ->
     except Exception:
         return []
 
+# ---------------------------------------------------------------------------
+# RMSD calculation — heavy atoms via MCS (adapted from AnyonCanDock)
+# ---------------------------------------------------------------------------
+
+def calc_rmsd_heavy(pose_mol, crystal_pdb_path: str):
+    """RMSD of pose vs co-crystal ligand using maximum common substructure."""
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import rdFMCS
+        import numpy as _np
+        if not os.path.exists(crystal_pdb_path):
+            return None
+        cryst = None
+        for sanitize, removeHs, proxBonding in [
+            (True,  True, True), (False, True, True),
+            (True,  True, False), (False, True, False),
+        ]:
+            try:
+                cryst = Chem.MolFromPDBFile(
+                    crystal_pdb_path, sanitize=sanitize,
+                    removeHs=removeHs, proximityBonding=proxBonding)
+                if cryst is not None and cryst.GetNumConformers() > 0:
+                    if not sanitize:
+                        try: Chem.SanitizeMol(cryst)
+                        except Exception: pass
+                    break
+                cryst = None
+            except Exception:
+                cryst = None
+        if cryst is None or cryst.GetNumConformers() == 0:
+            return None
+        pose = Chem.RemoveHs(pose_mol, sanitize=False)
+        try: Chem.SanitizeMol(pose)
+        except Exception: pass
+        if pose.GetNumConformers() == 0:
+            return None
+        n_smaller = min(pose.GetNumAtoms(), cryst.GetNumAtoms())
+        mcs = rdFMCS.FindMCS(
+            [pose, cryst], timeout=10,
+            bondCompare=rdFMCS.BondCompare.CompareAny,
+            atomCompare=rdFMCS.AtomCompare.CompareElements,
+            completeRingsOnly=False, matchValences=False,
+        )
+        if mcs.numAtoms < 3 or mcs.numAtoms < 0.6 * n_smaller:
+            return None
+        mcs_mol = Chem.MolFromSmarts(mcs.smartsString)
+        if mcs_mol is None:
+            return None
+        pose_matches  = pose.GetSubstructMatches(mcs_mol,  uniquify=False)
+        cryst_matches = cryst.GetSubstructMatches(mcs_mol, uniquify=False)
+        if not pose_matches or not cryst_matches:
+            return None
+        pc = pose.GetConformer()
+        cc = cryst.GetConformer()
+        def _rmsd(pm, cm):
+            sq = sum(
+                (pc.GetAtomPosition(pi).x - cc.GetAtomPosition(ci).x) ** 2 +
+                (pc.GetAtomPosition(pi).y - cc.GetAtomPosition(ci).y) ** 2 +
+                (pc.GetAtomPosition(pi).z - cc.GetAtomPosition(ci).z) ** 2
+                for pi, ci in zip(pm, cm)
+            )
+            return float(_np.sqrt(sq / len(pm)))
+        return min(_rmsd(pm, cm) for pm in pose_matches for cm in cryst_matches)
+    except Exception:
+        return None
