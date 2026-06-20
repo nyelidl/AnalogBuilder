@@ -6119,3 +6119,4 @@ def get_interacting_residues(receptor_pdb: str, lig_mol, cutoff: float = 3.5) ->
         return [{"chain": k[0], "resi": k[1], "resn": v} for k, v in seen.items()]
     except Exception:
         return []
+
