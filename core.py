@@ -6092,3 +6092,30 @@ def generate_3d_ligand_files(
                      "sdf": sdf_p, "pdb": pdb_p, "mol2": mol2_p})
     writer.close()
     return pd.DataFrame(rows)
+
+# ---------------------------------------------------------------------------
+# 3D Viewer helper — interacting residues for py3Dmol
+# ---------------------------------------------------------------------------
+
+def get_interacting_residues(receptor_pdb: str, lig_mol, cutoff: float = 3.5) -> list:
+    """Return list of {chain, resi, resn} dicts for residues within cutoff of ligand."""
+    try:
+        from rdkit.Chem import AllChem as _AC
+        conf    = lig_mol.GetConformer()
+        lig_xyz = np.array([
+            [conf.GetAtomPosition(i).x,
+             conf.GetAtomPosition(i).y,
+             conf.GetAtomPosition(i).z]
+            for i in range(lig_mol.GetNumAtoms())
+        ])
+        protein, _ = read_complex_atoms_for_pocket(receptor_pdb)
+        seen = {}
+        for a in protein:
+            d = float(np.linalg.norm(lig_xyz - a["xyz"], axis=1).min())
+            if d <= cutoff:
+                key = (a["chain"], a["resnum"])
+                if key not in seen:
+                    seen[key] = a["resname"]
+        return [{"chain": k[0], "resi": k[1], "resn": v} for k, v in seen.items()]
+    except Exception:
+        return []
