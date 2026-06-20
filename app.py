@@ -2340,10 +2340,236 @@ elif step == 5:
                     "minRMSD_BE (kcal/mol)": r.get("minRMSD_BE"),
                     "minRMSD (Å)": r.get("minRMSD_RMSD"),
                 })
+            # ── Build per-compound per-pose RMSD vs co-crystal ─────────────
+            cryst_pdb = st.session_state.ref_ligand_path or ""
+            _has_crystal = bool(cryst_pdb and os.path.exists(cryst_pdb))
+            # Store co-crystal reference BE for plot (from Mode A redocking or manual entry)
+            if "_ref_be_for_plot" not in st.session_state:
+                st.session_state["_ref_be_for_plot"] = None
+
+            # Compute pose-level RMSD and best scores per compound
+            for r in dock_results:
+                cmpd_name = r["compound"]
+                dock_dir  = dock_out_dir
+                # Try to find all pose SDFs for this compound
+                pose_sdfs = core.find_pose_sdfs_for_compound(dock_dir, cmpd_name) if hasattr(core, "find_pose_sdfs_for_compound") else []
+                pose_rows = []
+                if pose_sdfs:
+                    try:
+                        from rdkit.Chem import SDMolSupplier
+                        suppl = SDMolSupplier(pose_sdfs[0], removeHs=False)
+                        scores_list = r.get("scores", [])
+                        for i, mol in enumerate(suppl):
+                            if mol is None:
+                                continue
+                            pose_num = i + 1
+                            be = None
+                            if scores_list and i < len(scores_list):
+                                be = scores_list[i].get("affinity") or scores_list[i].get("score")
+                            rmsd_val = None
+                            if _has_crystal:
+                                rmsd_val = core.calc_rmsd_heavy(mol, cryst_pdb)
+                            pose_rows.append({
+                                "Pose": pose_num,
+                                "Affinity (kcal/mol)": round(float(be), 2) if be is not None else None,
+                                "RMSD vs co-crystal (Å)": round(rmsd_val, 2) if rmsd_val is not None else "—",
+                            })
+                    except Exception:
+                        pass
+                r["_pose_rows"] = pose_rows
+
+            # ── Summary table (one row per compound) ────────────────────────
             results_df = pd.DataFrame(result_rows)
             if "top_BE (kcal/mol)" in results_df.columns:
                 results_df = results_df.sort_values("top_BE (kcal/mol)", na_position="last").reset_index(drop=True)
-            st.dataframe(results_df, use_container_width=True, hide_index=True)
+
+            st.markdown("#### Docking summary")
+            hint("Sorted by best binding energy (most negative = strongest predicted binding).")
+
+            # Colour coding: BE gradient + RMSD flag
+            def _colour_be(val):
+                try:
+                    v = float(val)
+                    if v < -10:   return "background-color:#E6F4EA;color:#1E7E34"
+                    elif v < -8:  return "background-color:#FFF3CD;color:#856404"
+                    elif v < -6:  return "background-color:#FDE8E8;color:#842029"
+                    else:         return "background-color:#F8D7DA;color:#721c24"
+                except Exception:
+                    return ""
+
+            def _colour_rmsd(val):
+                try:
+                    v = float(val)
+                    if v <= 2.0:  return "color:#1E7E34;font-weight:500"
+                    elif v <= 3.0:return "color:#856404"
+                    else:         return "color:#842029"
+                except Exception:
+                    return ""
+
+            be_col   = "top_BE (kcal/mol)"
+            rmsd_col = "top_RMSD (Å)"
+
+            styled = results_df.style
+            if be_col in results_df.columns:
+                styled = styled.map(_colour_be, subset=[be_col])
+            if rmsd_col in results_df.columns and _has_crystal:
+                styled = styled.map(_colour_rmsd, subset=[rmsd_col])
+            if be_col in results_df.columns:
+                fmt = {be_col: lambda x: f"{x:.2f}" if x is not None and str(x) != "nan" else "—"}
+                if rmsd_col in results_df.columns:
+                    fmt[rmsd_col] = lambda x: f"{x:.2f}" if isinstance(x, float) else str(x)
+                styled = styled.format(fmt, na_rep="—")
+
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            if not _has_crystal:
+                st.caption("ℹ️ RMSD vs co-crystal not shown — no reference ligand available (Mode B or no co-crystal PDB).")
+
+            # ── Batch score plot (ACD-style) ─────────────────────────────────
+            st.markdown("#### Score plot")
+            _plot_df = results_df.dropna(subset=["top_BE (kcal/mol)"]).copy()
+            _plot_df = _plot_df.sort_values("top_BE (kcal/mol)").reset_index(drop=True)
+
+            if not _plot_df.empty:
+                import matplotlib.pyplot as _plt
+                import io as _io
+
+                _n    = len(_plot_df)
+                _names  = _plot_df["compound"].tolist()
+                _scores = _plot_df["top_BE (kcal/mol)"].tolist()
+                _best   = min(_scores)
+
+                # Colour: green = best, blue = others
+                _dot_colors = ["#3fb950" if s == _best else "#58a6ff" for s in _scores]
+
+                # RMSD colour ring: green ≤2Å, amber 2-3Å, red >3Å, gray = no crystal
+                _rmsd_vals = []
+                if _has_crystal and "top_RMSD (Å)" in _plot_df.columns:
+                    for v in _plot_df["top_RMSD (Å)"]:
+                        try:
+                            _rmsd_vals.append(float(v))
+                        except Exception:
+                            _rmsd_vals.append(None)
+                else:
+                    _rmsd_vals = [None] * _n
+
+                _rmsd_ring = []
+                for rv in _rmsd_vals:
+                    if rv is None:     _rmsd_ring.append("#888888")
+                    elif rv <= 2.0:    _rmsd_ring.append("#3fb950")
+                    elif rv <= 3.0:    _rmsd_ring.append("#d29922")
+                    else:              _rmsd_ring.append("#f85149")
+
+                # Reference line = co-crystal BE if redocking was done
+                _ref_be = st.session_state.get("_ref_be_for_plot")
+
+                # Dark/light aware colours
+                _dark = False
+                try:
+                    _dark = st.get_option("theme.base") == "dark"
+                except Exception:
+                    pass
+
+                _bg      = "#0d1117" if _dark else "#ffffff"
+                _bg_sub  = "#161b22" if _dark else "#f6f8fa"
+                _txt     = "#e6edf3" if _dark else "#1f2328"
+                _muted   = "#8b949e" if _dark else "#6e7781"
+                _border  = "#30363d" if _dark else "#d0d7de"
+                _leg_bg  = "#21262d" if _dark else "#f6f8fa"
+
+                _fig_w = max(5, _n * 0.7 + 1.8)
+                _fig, _ax = _plt.subplots(figsize=(_fig_w, 3.8))
+                _fig.patch.set_facecolor(_bg)
+                _ax.set_facecolor(_bg_sub)
+
+                _xs = list(range(_n))
+
+                # Line connecting dots
+                _ax.plot(_xs, _scores, color=_border, linewidth=0.8, zorder=2)
+
+                # Dots with RMSD-coloured edge ring
+                _ax.scatter(_xs, _scores,
+                            color=_dot_colors,
+                            edgecolors=_rmsd_ring,
+                            linewidths=2.2,
+                            s=100, zorder=3)
+
+                # Reference dashed line
+                if _ref_be is not None:
+                    _ax.axhline(_ref_be, color="#f85149", linewidth=1.8,
+                                linestyle="--",
+                                label=f"Co-crystal ref: {_ref_be:.2f} kcal/mol")
+                    _ax.legend(facecolor=_leg_bg, edgecolor=_border,
+                               labelcolor=_txt, fontsize=8)
+
+                _ax.set_xticks(_xs)
+                _ax.set_xticklabels(_names, rotation=40, ha="right", fontsize=7)
+                _ax.set_xlim(-0.5, _n - 0.5)
+                _ax.set_ylabel("Vina score (kcal/mol)", color=_muted, fontsize=9)
+                _ax.set_xlabel("Analog", color=_muted, fontsize=9)
+                _ax.tick_params(colors=_muted, labelsize=7)
+                for _sp in _ax.spines.values():
+                    _sp.set_edgecolor(_border)
+
+                _fig.tight_layout()
+
+                # Render
+                _pbuf = _io.BytesIO()
+                _fig.savefig(_pbuf, format="png", dpi=150,
+                             bbox_inches="tight", facecolor=_fig.get_facecolor())
+                _pbuf.seek(0)
+                st.image(_pbuf.getvalue(), use_container_width=True)
+                _plt.close(_fig)
+
+                # Legend note
+                _legend_parts = [
+                    "🟢 Best binding energy",
+                    "🔵 Other analogs",
+                ]
+                if _has_crystal:
+                    _legend_parts += [
+                        "Ring colour: 🟢 RMSD ≤2 Å  🟡 2–3 Å  🔴 >3 Å  ⚫ no crystal"
+                    ]
+                st.caption("  ·  ".join(_legend_parts))
+
+            # ── Per-pose detail table (expandable per compound) ─────────────
+            st.markdown("#### Per-pose scores")
+            hint("Expand each compound to see all poses with binding energy and RMSD vs co-crystal.")
+            for r in dock_results:
+                pose_rows = r.get("_pose_rows", [])
+                if not pose_rows:
+                    continue
+                cmpd_name = r["compound"]
+                best_be   = r.get("top_BE")
+                be_str    = f"{best_be:.2f} kcal/mol" if best_be else "—"
+                with st.expander(f"{cmpd_name}  ·  best BE: {be_str}  ·  {len(pose_rows)} poses"):
+                    pose_df = pd.DataFrame(pose_rows)
+                    if "Affinity (kcal/mol)" in pose_df.columns:
+                        pose_df = pose_df.sort_values("Affinity (kcal/mol)", na_position="last")
+
+                    pstyled = pose_df.style.map(_colour_be, subset=["Affinity (kcal/mol)"])
+                    if _has_crystal and "RMSD vs co-crystal (Å)" in pose_df.columns:
+                        pstyled = pstyled.map(_colour_rmsd, subset=["RMSD vs co-crystal (Å)"])
+                    st.dataframe(pstyled, use_container_width=True, hide_index=True)
+
+                    # Best pose flag
+                    if _has_crystal and "RMSD vs co-crystal (Å)" in pose_df.columns:
+                        try:
+                            best_rmsd_row = pose_df[pose_df["RMSD vs co-crystal (Å)"] != "—"].copy()
+                            best_rmsd_row["_r"] = pd.to_numeric(best_rmsd_row["RMSD vs co-crystal (Å)"], errors="coerce")
+                            best_rmsd_row = best_rmsd_row.dropna(subset=["_r"])
+                            if not best_rmsd_row.empty:
+                                br = best_rmsd_row.loc[best_rmsd_row["_r"].idxmin()]
+                                rmsd_v = float(br["_r"])
+                                icon = "✅" if rmsd_v <= 2.0 else ("⚠️" if rmsd_v <= 3.0 else "❌")
+                                label = "good reproduction" if rmsd_v <= 2.0 else ("moderate" if rmsd_v <= 3.0 else "poor reproduction")
+                                st.caption(
+                                    f"{icon} Best RMSD: **{rmsd_v:.2f} Å** (Pose {int(br['Pose'])}) — {label}  "
+                                    f"{'(≤2 Å = binding mode reproduced)' if rmsd_v <= 2.0 else '(>2 Å = check docking protocol)'}"
+                                )
+                        except Exception:
+                            pass
+
             st.session_state.docking_summary = results_df
 
             grid_mols, grid_legs = [], []
