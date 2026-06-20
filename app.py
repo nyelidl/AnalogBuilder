@@ -428,18 +428,17 @@ def _viewer_bg() -> str:
 
 
 def show3d(view, height: int = 480):
-    """Render a py3Dmol view — uses stmol if available, else components.html."""
+    """Render a py3Dmol view via components.html (no stmol dependency)."""
+    import re as _re
     try:
-        from stmol import showmol
-        showmol(view, height=height)
-    except ImportError:
-        import re as _re
         raw  = view._make_html()
         resp = _re.sub(r'(width\s*[:=]\s*)["\'\']?\d+px?["\'\']?', r'\g<1>100%', raw)
         components.html(
             f'<div style="width:100%;overflow:hidden">{resp}</div>',
             height=height, scrolling=False,
         )
+    except Exception as _e:
+        st.warning(f"3D viewer render error: {_e}")
 
 
 def render_complex_3d(

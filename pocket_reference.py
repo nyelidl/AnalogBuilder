@@ -45,13 +45,20 @@ _EMBED_CACHE: Dict[str, np.ndarray] = {}   # SMILES → embedding cache
 MODEL_NAME = "seyonec/ChemBERTa-zinc-base-v1"
 
 def _load_model():
-    """Load ChemBERTa tokenizer + model (called once, cached globally)."""
+    """Load ChemBERTa tokenizer + model (called once, cached globally).
+    Returns False silently if transformers/torch not installed — rule-based
+    fallback will be used automatically.
+    """
     global _tokenizer, _model, _CHEMBERTA_OK
     if _CHEMBERTA_OK:
         return True
     try:
-        # Suppress transformers advisory warnings and torchvision noise
-        import os as _os
+        import importlib, os as _os
+        # Bail out early if transformers or torch not installed
+        if importlib.util.find_spec("transformers") is None:
+            return False
+        if importlib.util.find_spec("torch") is None:
+            return False
         _os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
         _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         from transformers import AutoTokenizer, AutoModel

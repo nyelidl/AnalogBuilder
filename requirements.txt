@@ -12,24 +12,25 @@ numpy==2.4.6
 anyonecandock==1.1.3
 gemmi==0.7.5
 # ─────────────────────────────────────────────────────────────────────────────
-# ML fragment ranker (pocket_reference.py — Module 2)
-# Pin transformers<4.45 to avoid torchvision dependency from vision model loaders.
-# torchvision added as explicit dep to silence ModuleNotFoundError warnings.
-# Falls back to rule-based scoring automatically if ChemBERTa unavailable.
-# ─────────────────────────────────────────────────────────────────────────────
-transformers>=4.35,<4.45
-torch>=2.0
-torchvision
-scipy>=1.10
-# ─────────────────────────────────────────────────────────────────────────────
-# PLIP interaction analysis (Step 3 + Step 5)
-# Falls back to distance-based cIFP if not installed.
-# ─────────────────────────────────────────────────────────────────────────────
-plip
-# ─────────────────────────────────────────────────────────────────────────────
 # 3D VIEWER (Step 3 + Step 5)
 # py3Dmol renders protein-ligand complexes in browser via WebGL.
-# stmol is the Streamlit wrapper — falls back to components.html if absent.
 # ─────────────────────────────────────────────────────────────────────────────
 py3Dmol>=2.0.1
-stmol>=0.0.9
+scipy>=1.10
+# ─────────────────────────────────────────────────────────────────────────────
+# PLIP — interaction analysis (Step 3 + Step 5)
+# plip==2.3.0 uses the system openbabel binary (not Python binding)
+# so it works with obabel from packages.txt without SWIG.
+# Do NOT use plain "plip" — latest 3.0.0 requires Python openbabel build.
+# ─────────────────────────────────────────────────────────────────────────────
+plip==2.3.0
+lxml>=4.2.1
+# ─────────────────────────────────────────────────────────────────────────────
+# ML fragment ranker (pocket_reference.py — Module 2)
+# transformers + torch removed — tokenizers 0.19 fails to build on Python 3.14
+# (PyO3 0.21 max supported: Python 3.12). Falls back to rule-based scoring.
+# Re-add when Python 3.14 wheels are available on PyPI.
+# ─────────────────────────────────────────────────────────────────────────────
+# transformers>=4.35,<4.45   # blocked: tokenizers build fails on Py3.14
+# torch>=2.0                 # blocked: depends on tokenizers
+# torchvision                # blocked
