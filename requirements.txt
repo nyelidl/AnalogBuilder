@@ -3,8 +3,33 @@ streamlit-ketcher==0.0.1
 rdkit==2025.9.6
 pandas==3.0.3
 numpy==2.4.6
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCKING (Step 5)
+# anyonecandock auto-downloads the AutoDock Vina 1.2.7 binary at runtime,
+# but needs the `obabel` system binary — provided via packages.txt (apt).
+# rdkit is pinned <2026 because anyonecandock -> dimorphite-dl needs rdkit<2026.
+# ─────────────────────────────────────────────────────────────────────────────
 anyonecandock==1.1.3
 gemmi==0.7.5
-transformers>=4.35
+# ─────────────────────────────────────────────────────────────────────────────
+# ML fragment ranker (pocket_reference.py — Module 2)
+# Pin transformers<4.45 to avoid torchvision dependency from vision model loaders.
+# torchvision added as explicit dep to silence ModuleNotFoundError warnings.
+# Falls back to rule-based scoring automatically if ChemBERTa unavailable.
+# ─────────────────────────────────────────────────────────────────────────────
+transformers>=4.35,<4.45
 torch>=2.0
+torchvision
 scipy>=1.10
+# ─────────────────────────────────────────────────────────────────────────────
+# PLIP interaction analysis (Step 3 + Step 5)
+# Falls back to distance-based cIFP if not installed.
+# ─────────────────────────────────────────────────────────────────────────────
+plip
+# ─────────────────────────────────────────────────────────────────────────────
+# 3D VIEWER (Step 3 + Step 5)
+# py3Dmol renders protein-ligand complexes in browser via WebGL.
+# stmol is the Streamlit wrapper — falls back to components.html if absent.
+# ─────────────────────────────────────────────────────────────────────────────
+py3Dmol>=2.0.1
+stmol>=0.0.9
