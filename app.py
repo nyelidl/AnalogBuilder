@@ -103,44 +103,75 @@ h3 { font-size: 1.0rem !important; font-weight: 600; color: #3D7A74; }
 }
 
 /* ── Mode cards — clickable ── */
-/* ── Mode cards — equal height columns, card border on div above button ── */
-/* Make both columns stretch to equal height */
+/* ── Mode cards — card = stMarkdown div + button fused visually ── */
+/* Equal height columns */
 div[data-testid="stHorizontalBlock"]:has(.mode-card-col) {
     align-items: stretch !important;
 }
+/* The stVerticalBlock inside each column: flex so card+button fill height */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"] {
+    display: flex !important;
+    flex-direction: column !important;
+    height: 100% !important;
+}
+/* Card content div */
 .mode-card-col {
     background: #FFFFFF;
     border: 2px solid #E0D6C8;
-    border-radius: 14px;
+    border-bottom: none;
+    border-radius: 14px 14px 0 0;
     padding: 2rem 1.5rem 1.2rem;
     text-align: center;
-    height: 100%;
+    flex: 1;
     box-sizing: border-box;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: space-between;
     transition: border-color 0.2s, box-shadow 0.2s;
-    cursor: pointer;
 }
-.mode-card-col:hover {
+/* Hover: target the stMarkdown wrapper so hovering card highlights border */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]:hover .mode-card-col {
     border-color: #E8A020;
-    box-shadow: 0 4px 16px rgba(232,160,32,0.15);
 }
-/* Select button inside card — amber pill, no extra border */
-.mode-card-col [data-testid="stButton"] > button {
+/* stMarkdown wrapper that contains mode-card-col: remove its own border/bg */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stMarkdownContainer"] {
+    flex: 1 !important;
+    display: flex !important;
+    flex-direction: column !important;
+}
+/* Button container: no gap between card div and button */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stButton"] {
+    margin-top: 0 !important;
+}
+/* Button styling: bottom half of card */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stButton"] > button {
     background: #E8A020 !important;
     color: #fff !important;
-    border: none !important;
-    border-radius: 8px !important;
+    border: 2px solid #E8A020 !important;
+    border-top: none !important;
+    border-radius: 0 0 14px 14px !important;
     font-weight: 600 !important;
-    padding: 0.45rem 1.2rem !important;
+    padding: 0.7rem 1.2rem !important;
     width: 100% !important;
-    margin-top: 1.2rem !important;
     cursor: pointer !important;
+    font-size: 0.95rem !important;
 }
-.mode-card-col [data-testid="stButton"] > button:hover {
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stButton"] > button:hover {
     background: #C88010 !important;
+    border-color: #C88010 !important;
 }
 
 /* ── Step progress in sidebar ── */
@@ -611,14 +642,15 @@ if st.session_state.mode is None:
     col_l, col_r = st.columns(2, gap="large")
 
     with col_l:
-        st.markdown('<div class="mode-card-col">', unsafe_allow_html=True)
+        # Card content + button in one visual unit
+        # CSS wraps both into a single card appearance
         st.markdown(
-            f'<div style="text-align:center;pointer-events:none;margin-bottom:0.5rem;">'
-            f'<img src="{LB_URL}" width="90" style="display:inline-block;margin-bottom:0.75rem;"/>'
+            f'<div class="mode-card-col" id="card-ligand">'
+            f'<img src="{LB_URL}" width="90" style="display:block;margin:0 auto 0.75rem;"/>'
             f'<div style="font-size:1.15rem;font-weight:700;color:#2C2C2C;margin-bottom:0.4rem;">Ligand-based</div>'
             f'<div style="font-size:0.88rem;color:#6B5E4E;line-height:1.55;">'
             f'Start with just a SMILES string.<br>'
-            f'Great for exploring substitutions quickly —<br>no protein structure needed.</div>'
+            f'Great for exploring substitutions quickly — no protein structure needed.</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -626,17 +658,15 @@ if st.session_state.mode is None:
             st.session_state.mode = "ligand"
             st.session_state.step = 1
             st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
 
     with col_r:
-        st.markdown('<div class="mode-card-col">', unsafe_allow_html=True)
         st.markdown(
-            f'<div style="text-align:center;pointer-events:none;margin-bottom:0.5rem;">'
-            f'<img src="{SB_URL}" width="90" style="display:inline-block;margin-bottom:0.75rem;"/>'
+            f'<div class="mode-card-col" id="card-structure">'
+            f'<img src="{SB_URL}" width="90" style="display:block;margin:0 auto 0.75rem;"/>'
             f'<div style="font-size:1.15rem;font-weight:700;color:#2C2C2C;margin-bottom:0.4rem;">Structure-based</div>'
             f'<div style="font-size:0.88rem;color:#6B5E4E;line-height:1.55;">'
             f'Upload or fetch a protein structure.<br>'
-            f'Analogs are guided by the actual<br>binding pocket environment.</div>'
+            f'Analogs are guided by the actual binding pocket environment.</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -644,7 +674,6 @@ if st.session_state.mode is None:
             st.session_state.mode = "structure"
             st.session_state.step = 1
             st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
 
     st.stop()
 
