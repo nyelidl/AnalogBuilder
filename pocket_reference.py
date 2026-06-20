@@ -50,6 +50,10 @@ def _load_model():
     if _CHEMBERTA_OK:
         return True
     try:
+        # Suppress transformers advisory warnings and torchvision noise
+        import os as _os
+        _os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+        _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         from transformers import AutoTokenizer, AutoModel
         import torch
         _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
