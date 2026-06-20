@@ -380,8 +380,11 @@ def explain_score(frag, tag_counts: Dict[str, int]) -> Dict:
         "category":           frag.category,
         "model_used":         model_used,
         "category_score":     round(cat_s, 3),
+        "fine_score":         round(cat_s, 3),          # alias for UI compat
         "dominant_pocket_tag": dominant,
         "top_pocket_tags":    [(t, c) for t, c in top_tags],
+        "top_matching_tags":  [(t, round(c/max(tag_counts.values(), default=1), 2))
+                               for t, c in top_tags],  # alias for UI compat
         "reason":             reason,
     }
 
