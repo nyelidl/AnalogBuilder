@@ -23,6 +23,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
 
 import core
+import streamlit.components.v1 as components
 
 # Module 2: ChemBERTa pocket-aware fragment ranker
 try:
@@ -39,6 +40,14 @@ try:
 except ImportError:
     _va = None
     _VA_OK = False
+
+# PLIP interaction analyzer
+try:
+    import plip_analyzer as _pa
+    _PA_OK = True
+except ImportError:
+    _pa = None
+    _PA_OK = False
 
 # Optional in-browser molecule sketcher
 try:
@@ -367,7 +376,13 @@ DEFAULTS = {
     "_void_subpockets": [],
     "_void_mode": "",
     "_void_size_filter": None,
-    "struct_mode": "A",          # "A" = co-crystal complex | "B" = ligand+protein
+    "struct_mode": "A",
+    "_plip_df": None,            # PLIP interaction table (parent ligand)
+    "_plip_tag_counts": {},      # residue tags from PLIP
+    "_plip_rec": None,           # unified recommendation dict
+    "_plip_parent_feats": [],    # cIFP features of parent
+    "_analog_plip": {},          # {compound: [features]} for analogs
+    "_cifp_comparison": None,    # compare_cifp DataFrame          # "A" = co-crystal complex | "B" = ligand+protein
     "modeB_docked": False,       # True after Mode B docking completed
     "modeB_complex_path": None,  # path to pseudo-complex (protein + docked pose)
     "docking_summary": None,
@@ -397,6 +412,124 @@ def hint(text: str):
 
 def info_card(text: str):
     st.markdown(f'<div class="info-card">{text}</div>', unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# 3D Viewer helpers (adapted from ACD / anyonecandock)
+# ---------------------------------------------------------------------------
+
+def _viewer_bg() -> str:
+    """Return background colour for py3Dmol canvas."""
+    try:
+        theme = st.get_option("theme.base")
+        return "#1a1a2e" if theme == "dark" else "#f8f6f2"
+    except Exception:
+        return "#f8f6f2"
+
+
+def show3d(view, height: int = 480):
+    """Render a py3Dmol view — uses stmol if available, else components.html."""
+    try:
+        from stmol import showmol
+        showmol(view, height=height)
+    except ImportError:
+        import re as _re
+        raw  = view._make_html()
+        resp = _re.sub(r'(width\s*[:=]\s*)["\'\']?\d+px?["\'\']?', r'\g<1>100%', raw)
+        components.html(
+            f'<div style="width:100%;overflow:hidden">{resp}</div>',
+            height=height, scrolling=False,
+        )
+
+
+def render_complex_3d(
+    receptor_pdb: str,
+    pose_mol,                   # RDKit Mol with 3D conformer
+    height: int = 500,
+    cutoff: float = 4.0,
+    show_labels: bool = True,
+    show_surface: bool = False,
+    ref_ligand_pdb: str = "",   # co-crystal / reference ligand (magenta)
+    key_prefix: str = "v3d",
+):
+    """
+    Render protein–ligand complex in 3D using py3Dmol.
+
+    Protein  → cartoon, spectrum colouring, 45% opacity
+    Ligand   → cyan sticks
+    Pocket residues (≤ cutoff Å) → orange sticks + optional labels
+    Reference ligand → magenta sticks (if provided)
+    """
+    try:
+        import py3Dmol
+        from rdkit import Chem
+
+        v  = py3Dmol.view(width="100%", height=height)
+        v.setBackgroundColor(_viewer_bg())
+        mi = 0
+
+        # ── Protein ─────────────────────────────────────────────────────
+        if receptor_pdb and os.path.exists(receptor_pdb):
+            v.addModel(open(receptor_pdb).read(), "pdb")
+            v.setStyle({"model": mi}, {
+                "cartoon": {"color": "spectrum", "opacity": 0.45}
+            })
+            if show_surface:
+                v.addSurface(py3Dmol.SAS,
+                             {"opacity": 0.40, "color": "white"},
+                             {"model": mi})
+            mi += 1
+
+        # ── Reference / co-crystal ligand (magenta) ──────────────────────
+        if ref_ligand_pdb and os.path.exists(ref_ligand_pdb):
+            v.addModel(open(ref_ligand_pdb).read(), "pdb")
+            v.setStyle({"model": mi}, {
+                "stick": {"colorscheme": "magentaCarbon", "radius": 0.18}
+            })
+            mi += 1
+
+        # ── Docked / query ligand (cyan) ──────────────────────────────────
+        if pose_mol is not None:
+            mol_block = Chem.MolToMolBlock(pose_mol)
+            v.addModel(mol_block, "mol")
+            lig_m = mi
+            v.setStyle({"model": lig_m}, {
+                "stick": {"colorscheme": "cyanCarbon", "radius": 0.30}
+            })
+            v.addSphere({"center": {"x": 0, "y": 0, "z": 0}, "radius": 0.01,
+                         "model": lig_m, "opacity": 0})  # anchor for zoomTo
+
+            # ── Pocket residues (orange sticks + labels) ─────────────────
+            if receptor_pdb and os.path.exists(receptor_pdb):
+                interacting = core.get_interacting_residues(
+                    receptor_pdb, pose_mol, cutoff=cutoff)
+                for rb in interacting:
+                    sel = {"model": 0, "resi": rb["resi"]}
+                    if rb["chain"] and rb["chain"].strip():
+                        sel["chain"] = rb["chain"]
+                    v.setStyle(sel, {
+                        "stick": {"colorscheme": "orangeCarbon", "radius": 0.20}
+                    })
+                    if show_labels:
+                        chain_str = rb["chain"] if rb["chain"].strip() else ""
+                        v.addLabel(
+                            f"{rb['resn']}{rb['resi']}{chain_str}",
+                            {"fontSize": 11, "fontColor": "yellow",
+                             "backgroundColor": "black",
+                             "backgroundOpacity": 0.65,
+                             "inFront": True, "showBackground": True},
+                            sel,
+                        )
+            v.zoomTo({"model": lig_m})
+        else:
+            v.zoomTo()
+
+        show3d(v, height=height)
+
+    except ImportError:
+        st.info("Install `py3Dmol` to enable 3D viewer: `pip install py3Dmol`")
+    except Exception as _e:
+        st.warning(f"3D viewer error: {_e}")
 
 
 def tier_badge_html(tier: str) -> str:
@@ -1450,6 +1583,177 @@ elif step == 3 and mode == "structure":
     else:
         st.warning("No receptor file found. Go back to Step 1 and load a receptor.")
 
+    # ── PLIP interaction analysis ───────────────────────────────────────────
+    if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
+        st.divider()
+        st.markdown("### 🔬 Protein–Ligand Interaction Analysis (PLIP)")
+        plip_ok = bool(shutil.which("plipcmd") or shutil.which("plip"))
+
+        if not plip_ok:
+            st.info(
+                "PLIP is not installed — using distance-based contact fingerprint as fallback. "
+                "Install with: `pip install plip`"
+            )
+
+        col_plip_btn, col_plip_status = st.columns([2, 3])
+        with col_plip_btn:
+            if st.button("Run PLIP analysis", type="primary", key="plip_btn"):
+                work = get_work_dir()
+                cpx  = st.session_state.complex_path
+                name = st.session_state.parent_name or "ligand"
+
+                with st.spinner("Running PLIP interaction analysis…"):
+                    if plip_ok:
+                        xml_path, err, log = _pa.run_plip_on_complex(
+                            cpx, str(work / "plip_out"), name)
+                        if xml_path:
+                            plip_df = _pa.parse_plip_to_table(xml_path)
+                        else:
+                            st.warning(f"PLIP failed: {err} — using distance fallback")
+                            plip_df = pd.DataFrame()
+                    else:
+                        plip_df = pd.DataFrame()
+
+                    # Fallback: distance-based cIFP
+                    if plip_df.empty:
+                        feats = _pa.distance_cifp_features(cpx, cutoff=4.0)
+                        st.session_state["_plip_parent_feats"] = feats
+                        st.session_state["_plip_df"] = pd.DataFrame(
+                            [{"type":"CONTACT","residue":f,"distance_A":None,"is_key":False}
+                             for f in feats])
+                        st.session_state["_plip_tag_counts"] = {}
+                        st.session_state["_plip_rec"] = None
+                        st.success(f"Distance cIFP: {len(feats)} contacts detected")
+                    else:
+                        # Build tag counts + recommendation
+                        tag_counts, res_codes = _pa.plip_to_residue_tags(
+                            plip_df, core.AA_TAGS)
+                        st.session_state["_plip_df"]         = plip_df
+                        st.session_state["_plip_tag_counts"] = tag_counts
+                        st.session_state["_plip_parent_feats"] = [
+                            f"{r['type']}:{r['chain']}:{r['resname']}:{r['resnum']}"
+                            for _, r in plip_df.iterrows()
+                        ]
+                        # Store for pocket_reference ML scoring
+                        st.session_state["_pocket_tag_counts"] = tag_counts
+                        st.success(
+                            f"PLIP: {len(plip_df)} interactions · "
+                            f"{plip_df['is_key'].sum()} key contacts"
+                        )
+                        st.rerun()
+
+        with col_plip_status:
+            plip_df = st.session_state.get("_plip_df")
+            if plip_df is not None and not plip_df.empty and "type" in plip_df.columns:
+                from collections import Counter
+                type_counts = Counter(plip_df["type"].tolist())
+                badges = " &nbsp; ".join(
+                    f'<span style="background:#E8A020;color:#fff;padding:2px 8px;'
+                    f'border-radius:10px;font-size:0.75rem;">{t}: {c}</span>'
+                    for t, c in sorted(type_counts.items())
+                )
+                st.markdown(badges, unsafe_allow_html=True)
+
+        # Show PLIP results
+        plip_df = st.session_state.get("_plip_df")
+        if plip_df is not None and not plip_df.empty:
+            tab_int, tab_rec = st.tabs(["📋 Interaction table", "💡 Design recommendation"])
+
+            with tab_int:
+                def _style_plip(val):
+                    colors = {
+                        "HBOND":"#E6F4EA","SALTBRIDGE":"#FDECEA","PISTACK":"#EDE7F6",
+                        "HYDROPHOBIC":"#FFF3CD","PICATION":"#E3F2FD",
+                        "HALOGEN":"#FBE9E7","METAL":"#FCE4EC","WATERBRIDGE":"#E0F7FA",
+                        "CONTACT":"#F3E5F5",
+                    }
+                    return f"background-color:{colors.get(val,'#FAFAFA')}"
+
+                show_cols = [c for c in ["type","residue","distance_A","is_key"] if c in plip_df.columns]
+                styled = plip_df[show_cols].style.map(
+                    _style_plip, subset=["type"] if "type" in show_cols else [])
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            with tab_rec:
+                rec = st.session_state.get("_plip_rec")
+                tag_counts = st.session_state.get("_plip_tag_counts", {})
+
+                if tag_counts and _VA_OK:
+                    # Build recommendation using void subpockets
+                    void_sps = st.session_state.get("_void_subpockets", [])
+                    rec = _pa.unified_recommendation(
+                        plip_df, void_sps, tag_counts, core.AA_TAGS)
+                    st.session_state["_plip_rec"] = rec
+
+                    st.markdown(f"**{rec['summary']}**")
+                    st.markdown("")
+
+                    if rec["preserve"]:
+                        st.markdown("#### 🔒 Interactions to preserve")
+                        for p in rec["preserve"]:
+                            st.markdown(
+                                f"- **{p['residue']}** `{p['type']}` — {p['strategy']}"
+                            )
+
+                    if rec["grow"]:
+                        st.markdown("#### 🌱 Growth vectors (unoccupied space)")
+                        for g in rec["grow"]:
+                            st.markdown(
+                                f"- **Sub-pocket {g['sub_pocket_id']}**"
+                                f" [{g['size_class']}, {g['void_volume_A3']:.0f} ų] — "
+                                f"{g['strategy']}\n\nExample fragments: *{g['example_frags']}*"
+                            )
+                    elif not void_sps:
+                        st.info(
+                            "Run **Unoccupied space analysis** below to see growth vectors."
+                        )
+                elif tag_counts:
+                    st.info("Run **Unoccupied space analysis** below to get full recommendations.")
+                else:
+                    st.info("Run PLIP analysis above to get design recommendations.")
+
+    # ── 3D Complex Viewer (parent ligand in pocket) ─────────────────────
+    if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
+        st.divider()
+        st.markdown("### 🧬 Binding Pocket 3D View")
+        hint("Parent ligand (cyan) in the protein pocket. Orange = interacting residues. Magenta = reference ligand (if available).")
+
+        v3d_s_col1, v3d_s_col2 = st.columns([1, 3])
+        with v3d_s_col1:
+            s3_labels  = st.checkbox("Residue labels",  value=True,  key="s3_labels")
+            s3_surface = st.checkbox("Protein surface", value=False, key="s3_surface")
+            s3_cutoff  = st.slider("Pocket cutoff (Å)", 3.0, 6.0, 4.0, 0.5, key="s3_cutoff")
+            s3_height  = st.slider("Height (px)", 300, 600, 460, 50, key="s3_height")
+            st.markdown("""
+<div style="font-size:0.75rem;line-height:1.8;margin-top:6px;">
+<span style="color:#00FFFF">■</span> Ligand &nbsp;
+<span style="color:#FF8C00">■</span> Pocket residues<br>
+<span style="color:#FF00FF">■</span> Reference &nbsp;
+<span style="color:#888">■</span> Protein
+</div>""", unsafe_allow_html=True)
+
+        with v3d_s_col2:
+            # Load ref ligand mol from PDB if available
+            ref_pdb = st.session_state.ref_ligand_path or ""
+            pose_mol_s3 = None
+            if ref_pdb and os.path.exists(ref_pdb):
+                try:
+                    from rdkit import Chem as _Chem_s3
+                    pose_mol_s3 = _Chem_s3.MolFromPDBFile(ref_pdb, removeHs=False)
+                except Exception:
+                    pass
+
+            render_complex_3d(
+                receptor_pdb   = st.session_state.protein_path or st.session_state.receptor_path or "",
+                pose_mol       = pose_mol_s3,
+                height         = s3_height,
+                cutoff         = s3_cutoff,
+                show_labels    = s3_labels,
+                show_surface   = s3_surface,
+                ref_ligand_pdb = "",
+                key_prefix     = "s3_viewer",
+            )
+
     # ── Void / unoccupied space analysis ─────────────────────────────────
     if _VA_OK and st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
         st.divider()
@@ -2065,6 +2369,60 @@ elif step == 5:
                 except Exception as e:
                     st.warning(f"Could not render structure grid: {e}")
 
+            # ── 3D Viewer ─────────────────────────────────────────────────────────
+            st.divider()
+            st.markdown("### 🧬 3D Complex Viewer")
+            hint("Select a compound to visualise its docked pose in the binding pocket.")
+
+            if result_rows:
+                v3d_compounds = [r["compound"] for r in result_rows if r.get("n_poses", 0) > 0]
+                if v3d_compounds:
+                    v3d_col1, v3d_col2 = st.columns([2, 3])
+                    with v3d_col1:
+                        sel_compound = st.selectbox(
+                            "Compound", v3d_compounds, key="v3d_compound_sel")
+                        show_labels  = st.checkbox("Residue labels", value=True, key="v3d_labels")
+                        show_surface = st.checkbox("Protein surface", value=False, key="v3d_surface")
+                        v3d_cutoff   = st.slider("Pocket cutoff (Å)", 3.0, 6.0, 4.0, 0.5, key="v3d_cutoff")
+                        v3d_height   = st.slider("Viewer height (px)", 300, 700, 480, 50, key="v3d_height")
+
+                        # Colour legend
+                        st.markdown("""
+<div style="font-size:0.78rem;line-height:1.8;margin-top:8px;">
+<span style="color:#00FFFF">■</span> Docked ligand &nbsp;
+<span style="color:#FF8C00">■</span> Pocket residues<br>
+<span style="color:#FF00FF">■</span> Reference ligand &nbsp;
+<span style="color:#AAAAAA">■</span> Protein
+</div>""", unsafe_allow_html=True)
+
+                    with v3d_col2:
+                        # Find best pose SDF for selected compound
+                        sdfs = core.find_pose_sdfs_for_compound(dock_out_dir, sel_compound)
+                        pose_mol = None
+                        if sdfs:
+                            from rdkit.Chem import SDMolSupplier
+                            suppl = SDMolSupplier(sdfs[0], removeHs=False)
+                            for _m in suppl:
+                                if _m is not None:
+                                    pose_mol = _m
+                                    break
+
+                        if pose_mol:
+                            render_complex_3d(
+                                receptor_pdb  = receptor or "",
+                                pose_mol      = pose_mol,
+                                height        = v3d_height,
+                                cutoff        = v3d_cutoff,
+                                show_labels   = show_labels,
+                                show_surface  = show_surface,
+                                ref_ligand_pdb= st.session_state.ref_ligand_path or "",
+                                key_prefix    = f"v3d_{sel_compound}",
+                            )
+                        else:
+                            st.info(f"No pose found for {sel_compound}")
+                else:
+                    st.info("No docked poses available yet.")
+
             st.divider()
             csv_rows = [{"compound": r["compound"], "SMILES": r["SMILES"],
                 "status": r["status"], "n_poses": r["n_poses"],
@@ -2096,34 +2454,115 @@ elif step == 5:
 
     if mode == "structure" and st.session_state.protein_path:
         st.divider()
-        st.markdown("### Interaction fingerprints (cIFP)")
-        hint("After docking, compute which residues each pose contacts.")
-        if st.button("Run cIFP analysis"):
-            plip_available = bool(shutil.which("plipcmd") or shutil.which("plip"))
+        st.markdown("### 🔬 Interaction fingerprints (PLIP / cIFP)")
+        hint("Compare binding interactions of parent vs each docked analog.")
+
+        plip_available = bool(shutil.which("plipcmd") or shutil.which("plip"))
+        if not plip_available:
+            st.caption("PLIP not installed — using distance-based cIFP as fallback.")
+
+        if st.button("Run PLIP / cIFP on all poses", type="primary", key="cifp_run_btn"):
             cifp_dir = work / "plip_cifp" / "complexes"
             cifp_dir.mkdir(parents=True, exist_ok=True)
             pose_dir = work / "docking_out" / "selected_pose_pdbs"
             pose_pdbs = list(pose_dir.glob("*.pdb")) if pose_dir.exists() else []
+
             if not pose_pdbs:
-                st.warning("No docked poses found yet. Run docking first.")
+                st.warning("No docked pose PDBs found. Run docking first.")
             else:
                 rows_c = []
-                for p in pose_pdbs[:30]:
+                analog_feats_map = {}
+                prog = st.progress(0.0, text="Running interaction analysis…")
+
+                for idx_p, p in enumerate(pose_pdbs[:30]):
+                    prog.progress((idx_p+1)/min(len(pose_pdbs),30),
+                                  text=f"Analysing {p.stem}…")
                     cpx = str(cifp_dir / f"{p.stem}_complex.pdb")
-                    core.combine_protein_ligand_pdb(st.session_state.protein_path, str(p), cpx)
-                    feats, method = [], "distance"
-                    if plip_available:
-                        xml, _ = core.run_plip(cpx, str(work / "plip_cifp" / "plip_out"), p.stem)
-                        feats  = core.parse_plip_xml(xml) if xml else []
-                        method = "PLIP" if feats else "distance"
-                    if not feats:
-                        feats = core.distance_contact_cifp(cpx, cutoff=4.0)
-                    rows_c.append({"compound": p.stem, "method": method,
-                                   "n_interactions": len(feats), "features": ";".join(feats)})
+                    protein_pdb = st.session_state.protein_path
+                    core.combine_protein_ligand_pdb(protein_pdb, str(p), cpx)
+
+                    feats = []
+                    method = "distance"
+                    if plip_available and _PA_OK:
+                        xml_path, err, _ = _pa.run_plip_on_complex(
+                            cpx, str(work / "plip_cifp" / "plip_out"), p.stem)
+                        if xml_path:
+                            plip_tbl = _pa.parse_plip_to_table(xml_path)
+                            feats = [
+                                f"{r['type']}:{r['chain']}:{r['resname']}:{r['resnum']}"
+                                for _, r in plip_tbl.iterrows()
+                            ] if not plip_tbl.empty else []
+                            method = "PLIP"
+
+                    if not feats and _PA_OK:
+                        feats = _pa.distance_cifp_features(cpx, cutoff=4.0)
+
+                    analog_feats_map[p.stem] = feats
+                    rows_c.append({
+                        "compound":        p.stem,
+                        "method":          method,
+                        "n_interactions":  len(feats),
+                        "features":        ";".join(feats[:10]),
+                    })
+
+                prog.progress(1.0, text="Done!")
                 cifp_df = pd.DataFrame(rows_c)
-                st.session_state.cifp_results = cifp_df
-                st.success(f"cIFP computed for {len(cifp_df)} poses")
+                st.session_state.cifp_results   = cifp_df
+                st.session_state["_analog_plip"] = analog_feats_map
+
+                # Compare parent vs analogs
+                parent_feats = st.session_state.get("_plip_parent_feats", [])
+                if parent_feats and analog_feats_map and _PA_OK:
+                    cmp_df = _pa.compare_cifp(parent_feats, analog_feats_map)
+                    st.session_state["_cifp_comparison"] = cmp_df
+                    st.success(f"PLIP/cIFP computed for {len(cifp_df)} poses")
+                else:
+                    st.session_state["_cifp_comparison"] = None
+                    st.success(f"cIFP computed for {len(cifp_df)} poses")
+                st.rerun()
+
+        # Show results
+        cifp_df = st.session_state.get("cifp_results")
+        cmp_df  = st.session_state.get("_cifp_comparison")
+
+        if cifp_df is not None and not cifp_df.empty:
+            tab_raw, tab_cmp = st.tabs(["📋 Interaction table", "⚖️ Parent vs Analogs"])
+
+            with tab_raw:
                 st.dataframe(cifp_df, use_container_width=True, hide_index=True)
+
+            with tab_cmp:
+                if cmp_df is not None and not cmp_df.empty:
+                    st.markdown("**Tanimoto similarity to parent interaction fingerprint**")
+                    st.caption(
+                        "🟢 High tanimoto = similar binding mode  "
+                        "· ⚠️ = lost key interaction  "
+                        "· n_new = potentially new contacts"
+                    )
+
+                    def _cmp_style(val):
+                        try:
+                            v = float(val)
+                            if v >= 0.7:   return "background-color:#E6F4EA;color:#1E7E34"
+                            elif v >= 0.4: return "background-color:#FFF3CD;color:#856404"
+                            else:          return "background-color:#FDE8E8;color:#842029"
+                        except Exception:
+                            return ""
+
+                    styled = cmp_df.style.map(_cmp_style, subset=["tanimoto"])
+                    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+                    # Highlight warnings
+                    warn_df = cmp_df[cmp_df["warning"] != ""]
+                    if not warn_df.empty:
+                        st.markdown("**⚠️ Analogs with lost key interactions:**")
+                        for _, row in warn_df.iterrows():
+                            st.warning(f"{row['compound']}: {row['warning']}")
+                else:
+                    st.info(
+                        "Run PLIP analysis in Step 3 first to get parent interaction "
+                        "fingerprint for comparison."
+                    )
 
     st.write("")
     col_back, col_next = st.columns([1, 4])
