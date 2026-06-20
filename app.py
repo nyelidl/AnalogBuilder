@@ -1200,28 +1200,66 @@ elif step == 4:
                      use_container_width=True, height=380, hide_index=True)
 
     with tab_grid:
-        n_grid = min(len(df_show), 20)
-        if n_grid == 0:
+        PAGE_SIZE = 50
+        total_show = len(df_show)
+        if total_show == 0:
             st.info("No analogs match the current filters.")
         else:
+            n_pages = max(1, (total_show + PAGE_SIZE - 1) // PAGE_SIZE)
+
+            if n_pages > 1:
+                pg_col, info_col = st.columns([2, 3])
+                with pg_col:
+                    page_num = st.number_input(
+                        "Page", min_value=1, max_value=n_pages,
+                        value=st.session_state.get("grid_page", 1),
+                        step=1, key="grid_page_input",
+                        label_visibility="collapsed",
+                    )
+                    st.session_state["grid_page"] = int(page_num)
+                with info_col:
+                    start_idx = (int(page_num) - 1) * PAGE_SIZE
+                    end_idx   = min(start_idx + PAGE_SIZE, total_show)
+                    st.markdown(
+                        f'<p style="font-size:0.82rem;color:#8B7355;padding-top:0.45rem;">'
+                        f'Page {int(page_num)} of {n_pages} &nbsp;·&nbsp; '
+                        f'showing compounds {start_idx+1}–{end_idx} of {total_show}</p>',
+                        unsafe_allow_html=True,
+                    )
+                nav_l, nav_r, _ = st.columns([1, 1, 6])
+                with nav_l:
+                    if st.button("◀ Prev", disabled=(int(page_num) <= 1), key="grid_prev"):
+                        st.session_state["grid_page"] = max(1, int(page_num) - 1)
+                        st.rerun()
+                with nav_r:
+                    if st.button("Next ▶", disabled=(int(page_num) >= n_pages), key="grid_next"):
+                        st.session_state["grid_page"] = min(n_pages, int(page_num) + 1)
+                        st.rerun()
+            else:
+                start_idx = 0
+                end_idx   = total_show
+                st.caption(f"{total_show} compounds")
+
+            df_page = df_show.iloc[start_idx:end_idx]
+
             pairs = []
-            for i, (smi, chg) in enumerate(
-                zip(df_show.smiles.head(n_grid), df_show.change.head(n_grid))
-            ):
-                m = Chem.MolFromSmiles(str(smi))
+            for local_i, (abs_i, row) in enumerate(df_page.iterrows()):
+                m = Chem.MolFromSmiles(str(row["smiles"]))
                 if m is not None:
                     try:
                         AllChem.Compute2DCoords(m)
-                        pairs.append((m, f"{i+1}. {chg}"))
+                        global_n = start_idx + local_i + 1
+                        pairs.append((m, f"{global_n}. {row['change']}"))
                     except Exception:
                         pass
+
             if not pairs:
-                st.info("Could not render any structures from the current results.")
+                st.info("Could not render any structures on this page.")
             else:
                 try:
                     png = Draw.MolsToGridImage(
                         [p[0] for p in pairs], legends=[p[1] for p in pairs],
-                        molsPerRow=4, subImgSize=(280, 210), returnPNG=True,
+                        molsPerRow=5, subImgSize=(240, 190), returnPNG=True,
                     )
                     st.image(png, use_container_width=True)
                 except Exception as e:
