@@ -926,6 +926,7 @@ st.markdown(f"## {steps[step-1]}")
 # ─────────────────────────────────────────────────────────────────────────────
 
 if step == 1:
+    md = st.session_state.mode   # alias used throughout Step 1
     # ── Structure track: show receptor loader FIRST ───────────────────────────
     if mode == "structure":
         st.markdown("### Step 1A — Load protein structure")
