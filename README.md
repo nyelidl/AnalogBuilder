@@ -22,13 +22,13 @@
 
 ## Key Features
 
-### 🧬 Ligand-based analog generation
+### <img src="https://github.com/nyelidl/AnalogBuilder/blob/main/.fig/LB.svg" alt="Ligand-based" height="28" valign="middle"/> Ligand-based analog generation
 - Enter a parent SMILES or draw it in the Ketcher 2D editor
 - Click attachment atoms on the 2D structure — multiple sites supported
 - Optional: enter binding-site residues to activate ML-guided fragment ranking
 - Generate up to 1,000+ analogs with property filters
 
-### 🔬 Structure-based analog generation
+### <img src="https://github.com/nyelidl/AnalogBuilder/blob/main/.fig/SB.svg" alt="Structure-based" height="28" valign="middle"/> Structure-based analog generation
 - Load a protein PDB from RCSB search, PDB ID, or file upload
 - **Auto-detect**: if PDB contains a co-crystal ligand → extract SMILES + skip docking
 - If apo PDB → ACD docks your ligand automatically (Mode B)
