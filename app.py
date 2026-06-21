@@ -678,85 +678,22 @@ def _load_receptor_widget(key_prefix: str = "") -> None:
 
 
 def _render_step1_receptor_and_continue(smiles: str, name: str):
-    """Step 1 footer: Mode A/B selector (structure) + continue button."""
+    """Step 1 footer: confirmation + continue button for all tracks."""
     md = st.session_state.mode
 
     if md == "structure":
-        # ── Step 1A: Load receptor FIRST ─────────────────────────────────────
-        st.markdown("### Step 1A — Load protein structure")
-        info_card(
-            "Load your protein from RCSB or upload a PDB file. "
-            "The app will <strong>auto-detect</strong> whether it contains a bound ligand."
-        )
-        _load_receptor_widget(key_prefix="struct")
-
-        # ── Auto-detect: complex vs apo ──────────────────────────────────────
+        # Receptor loading already handled in the step==1 block above.
+        # Just show a compact status line.
         if st.session_state.receptor_path:
-            has_lig = bool(st.session_state.ref_ligand_path)
+            sc = "A" if st.session_state.ref_ligand_path else "B"
+            mode_label = "Co-crystal (Mode A)" if sc == "A" else "Apo / docking (Mode B)"
+            st.caption(
+                f"🧬 Receptor: `{Path(st.session_state.receptor_path).name}` · {mode_label}"
+            )
 
-            if has_lig:
-                # ── Complex detected: ask user what to do ─────────────────────
-                st.markdown("---")
-                st.success(
-                    f"✅ **Co-crystal ligand detected** in "
-                    f"`{Path(st.session_state.receptor_path).name}`"
-                )
-
-                # Try to extract SMILES from co-crystal ligand
-                _extracted_smi = ""
-                try:
-                    _lig_mol_tmp = Chem.MolFromPDBFile(
-                        st.session_state.ref_ligand_path, removeHs=True)
-                    if _lig_mol_tmp:
-                        _extracted_smi = Chem.MolToSmiles(_lig_mol_tmp)
-                        st.session_state["_modeA_extracted_smiles"] = _extracted_smi
-                except Exception:
-                    pass
-
-                _col_smi, _col_opt = st.columns([3, 2])
-                with _col_smi:
-                    if _extracted_smi:
-                        st.markdown("**Co-crystal ligand SMILES (auto-extracted):**")
-                        st.code(_extracted_smi, language=None)
-                        if st.button("Use as parent compound ↑", key="use_extracted"):
-                            st.session_state.parent_smiles = _extracted_smi
-                            st.rerun()
-
-                with _col_opt:
-                    st.markdown("**What would you like to do?**")
-                    _dock_choice = st.radio(
-                        "Docking option",
-                        [
-                            "Use this complex as-is — skip docking",
-                            "Dock my own ligand into this protein instead",
-                        ],
-                        index=0,
-                        key="complex_dock_choice",
-                        label_visibility="collapsed",
-                    )
-                    if _dock_choice.startswith("Use this complex"):
-                        st.session_state.struct_mode = "A"
-                        st.caption("✅ Co-crystal pose will be used directly. No docking needed.")
-                    else:
-                        st.session_state.struct_mode = "B"
-                        st.caption("ℹ️ ACD will dock your ligand after Step 2.")
-
-            else:
-                # ── Apo form: auto → Mode B docking ─────────────────────────
-                st.session_state.struct_mode = "B"
-                st.info(
-                    f"**Apo structure detected** — `{Path(st.session_state.receptor_path).name}`  \n"
-                    "No bound ligand found. ACD docking will run automatically after Step 2."
-                )
-
-        struct_mode = st.session_state.struct_mode
-
-        # ── Step 1B: Parent compound (SMILES) ────────────────────────────────
-        st.markdown("---")
-        st.markdown("### Step 1B — Parent compound")
     st.write("")
     if md == "structure" and not st.session_state.receptor_path:
-        st.caption("⚠️ Load a receptor above before continuing.")
+        st.warning("⚠️ Load a protein structure above before continuing.")
 
     ready = bool(smiles and smiles.strip()) and (
         md != "structure" or bool(st.session_state.receptor_path)
@@ -989,20 +926,111 @@ st.markdown(f"## {steps[step-1]}")
 # ─────────────────────────────────────────────────────────────────────────────
 
 if step == 1:
-    input_options = ["🔍 Search PubChem", "⌨️ Paste SMILES", "✏️ Draw it"]
-    input_tab = st.radio(
-        "How do you want to enter your compound?",
-        input_options,
-        horizontal=True,
-        label_visibility="collapsed",
-    )
+    # ── Structure track: show receptor loader FIRST ───────────────────────────
+    if mode == "structure":
+        st.markdown("### Step 1A — Load protein structure")
+        info_card(
+            "Load your protein from RCSB or upload a PDB file. "
+            "The app will <strong>auto-detect</strong> whether it contains a bound ligand."
+        )
+        _load_receptor_widget(key_prefix="struct")
 
-    draw_mode    = (input_tab == "✏️ Draw it") and _KETCHER_OK
-    paste_mode   = (input_tab == "⌨️ Paste SMILES") or (input_tab == "✏️ Draw it" and not _KETCHER_OK)
-    pubchem_mode = (input_tab == "🔍 Search PubChem")
+        if st.session_state.receptor_path:
+            has_lig = bool(st.session_state.ref_ligand_path)
+            if has_lig:
+                st.success(
+                    f"✅ **Co-crystal ligand detected** in "
+                    f"`{Path(st.session_state.receptor_path).name}`"
+                )
+                _extracted_smi = ""
+                try:
+                    _lig_mol_tmp = Chem.MolFromPDBFile(
+                        st.session_state.ref_ligand_path, removeHs=True)
+                    if _lig_mol_tmp:
+                        _extracted_smi = Chem.MolToSmiles(_lig_mol_tmp)
+                        st.session_state["_modeA_extracted_smiles"] = _extracted_smi
+                except Exception:
+                    pass
+
+                _col_smi, _col_opt = st.columns([3, 2])
+                with _col_smi:
+                    if _extracted_smi:
+                        st.markdown("**Co-crystal ligand SMILES (auto-extracted):**")
+                        st.code(_extracted_smi, language=None)
+                        if st.button("Use as parent compound ↑", key="use_extracted"):
+                            st.session_state.parent_smiles = _extracted_smi
+                            st.rerun()
+                with _col_opt:
+                    st.markdown("**What would you like to do?**")
+                    _dock_choice = st.radio(
+                        "Docking option",
+                        [
+                            "Use this complex as-is — skip docking",
+                            "Dock my own ligand into this protein instead",
+                        ],
+                        index=0,
+                        key="complex_dock_choice",
+                        label_visibility="collapsed",
+                    )
+                    if _dock_choice.startswith("Use this complex"):
+                        st.session_state.struct_mode = "A"
+                        st.caption("✅ Co-crystal pose will be used directly.")
+                    else:
+                        st.session_state.struct_mode = "B"
+                        st.caption("ℹ️ ACD will dock your ligand after Step 2.")
+            else:
+                st.session_state.struct_mode = "B"
+                st.info(
+                    f"**Apo structure** — `{Path(st.session_state.receptor_path).name}`  \n"
+                    "No bound ligand. ACD docking will run automatically after Step 2."
+                )
+
+        st.markdown("---")
+
+    # ── If Mode A and SMILES already extracted, skip full radio ─────────
+    _modeA_smi = st.session_state.get("_modeA_extracted_smiles", "")
+    _is_modeA_auto = (md == "structure"
+                      and st.session_state.get("struct_mode") == "A"
+                      and bool(_modeA_smi))
+
+    # Only show Step 1B header when parent SMILES still needs user input
+    if md == "structure" and not _is_modeA_auto:
+        st.markdown("### Step 1B — Parent compound")
+
+    if _is_modeA_auto:
+        # Show compact SMILES confirmation — no radio needed
+        st.markdown(
+            f'<div style="background:#F0F9F0;border:1.5px solid #C3E6CB;border-radius:10px;'
+            f'padding:0.9rem 1.2rem;margin-bottom:0.6rem;">'
+            f'<div style="font-size:0.78rem;font-weight:600;color:#1E7E34;margin-bottom:4px;">'
+            f'✅ Parent compound — extracted from co-crystal PDB</div>'
+            f'<code style="font-size:0.8rem;color:#155724;word-break:break-all;">{_modeA_smi}</code>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("✏️ Use a different SMILES instead", key="modeA_override_smi"):
+            st.session_state["_modeA_extracted_smiles"] = ""
+            st.rerun()
+        smiles_input  = _modeA_smi
+        draw_mode     = False
+        paste_mode    = False
+        pubchem_mode  = False
+        # Pre-fill session so continue button works
+        if not st.session_state.get("parent_smiles"):
+            st.session_state.parent_smiles = _modeA_smi
+    else:
+        input_options = ["🔍 Search PubChem", "⌨️ Paste SMILES", "✏️ Draw it"]
+        input_tab = st.radio(
+            "How do you want to enter your compound?",
+            input_options,
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        draw_mode    = (input_tab == "✏️ Draw it") and _KETCHER_OK
+        paste_mode   = (input_tab == "⌨️ Paste SMILES") or (input_tab == "✏️ Draw it" and not _KETCHER_OK)
+        pubchem_mode = (input_tab == "🔍 Search PubChem")
 
     if pubchem_mode:
-        st.markdown("#### 🔍 Search compound from PubChem")
         pc_col1, pc_col2 = st.columns([5, 1])
         with pc_col1:
             pc_query = st.text_input("Compound name",
