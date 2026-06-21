@@ -664,77 +664,78 @@ def _render_step1_receptor_and_continue(smiles: str, name: str):
     md = st.session_state.mode
 
     if md == "structure":
-        # ── Ask user: have complex or not? ──────────────────────────────────
-        st.markdown("### Protein structure")
-
-        has_complex = st.radio(
-            "Do you have a protein–ligand complex?",
-            ["Yes — I have a co-crystal / docked complex (PDB with ligand inside)",
-             "No — I only have a protein structure (will dock my ligand)"],
-            index=0 if st.session_state.struct_mode != "B" else 1,
-            key="has_complex_radio",
+        # ── Step 1A: Load receptor FIRST ─────────────────────────────────────
+        st.markdown("### Step 1A — Load protein structure")
+        info_card(
+            "Load your protein from RCSB or upload a PDB file. "
+            "The app will <strong>auto-detect</strong> whether it contains a bound ligand."
         )
-        st.session_state.struct_mode = "A" if has_complex.startswith("Yes") else "B"
-        struct_mode = st.session_state.struct_mode
-        st.markdown("---")
+        _load_receptor_widget(key_prefix="struct")
 
-        if struct_mode == "A":
-            # ── Have complex → load PDB, skip docking ────────────────────────
-            info_card(
-                "<strong>Load your complex PDB</strong> — the app will extract "
-                "the ligand SMILES automatically and use the 3D complex for "
-                "pocket analysis. <strong>No docking needed.</strong>"
-            )
-            col_rec, col_info = st.columns([3, 2])
-            with col_rec:
-                _load_receptor_widget(key_prefix="struct")
-            with col_info:
-                if st.session_state.receptor_path and st.session_state.ref_ligand_path:
-                    st.success("✅ Ligand detected in PDB")
-                    try:
-                        lig_mol = Chem.MolFromPDBFile(
-                            st.session_state.ref_ligand_path, removeHs=True)
-                        if lig_mol:
-                            extracted = Chem.MolToSmiles(lig_mol)
-                            st.session_state["_modeA_extracted_smiles"] = extracted
-                            st.markdown("**Extracted SMILES:**")
-                            st.code(extracted, language=None)
-                            if st.button("Use as parent compound ↑", key="use_extracted"):
-                                st.session_state.parent_smiles = extracted
-                                st.rerun()
-                    except Exception:
-                        st.caption("(Could not auto-extract SMILES)")
-                elif st.session_state.receptor_path:
-                    st.warning(
-                        "No ligand found in this PDB. "
-                        "Switch to **No** above, or try a different PDB file."
-                    )
-                else:
-                    st.markdown(
-                        '<div style="background:#F0EAE0;border-radius:10px;'
-                        'padding:1.2rem;text-align:center;color:#A89070;font-size:0.85rem;">'
-                        'Load a complex PDB to auto-extract SMILES</div>',
-                        unsafe_allow_html=True,
-                    )
+        # ── Auto-detect: complex vs apo ──────────────────────────────────────
+        if st.session_state.receptor_path:
+            has_lig = bool(st.session_state.ref_ligand_path)
 
-        else:
-            # ── No complex → load protein, dock later ────────────────────────
-            info_card(
-                "<strong>Load your protein PDB</strong> — ACD (Anyone Can Dock) "
-                "will dock your ligand after Step 2. "
-                "The docked pose will then be used for pocket analysis."
-            )
-            _load_receptor_widget(key_prefix="struct")
-            if st.session_state.receptor_path:
+            if has_lig:
+                # ── Complex detected: ask user what to do ─────────────────────
+                st.markdown("---")
                 st.success(
-                    f"✅ Protein ready: `{Path(st.session_state.receptor_path).name}`  "
-                    "— ACD docking will run in Step 3."
+                    f"✅ **Co-crystal ligand detected** in "
+                    f"`{Path(st.session_state.receptor_path).name}`"
+                )
+
+                # Try to extract SMILES from co-crystal ligand
+                _extracted_smi = ""
+                try:
+                    _lig_mol_tmp = Chem.MolFromPDBFile(
+                        st.session_state.ref_ligand_path, removeHs=True)
+                    if _lig_mol_tmp:
+                        _extracted_smi = Chem.MolToSmiles(_lig_mol_tmp)
+                        st.session_state["_modeA_extracted_smiles"] = _extracted_smi
+                except Exception:
+                    pass
+
+                _col_smi, _col_opt = st.columns([3, 2])
+                with _col_smi:
+                    if _extracted_smi:
+                        st.markdown("**Co-crystal ligand SMILES (auto-extracted):**")
+                        st.code(_extracted_smi, language=None)
+                        if st.button("Use as parent compound ↑", key="use_extracted"):
+                            st.session_state.parent_smiles = _extracted_smi
+                            st.rerun()
+
+                with _col_opt:
+                    st.markdown("**What would you like to do?**")
+                    _dock_choice = st.radio(
+                        "Docking option",
+                        [
+                            "Use this complex as-is — skip docking",
+                            "Dock my own ligand into this protein instead",
+                        ],
+                        index=0,
+                        key="complex_dock_choice",
+                        label_visibility="collapsed",
+                    )
+                    if _dock_choice.startswith("Use this complex"):
+                        st.session_state.struct_mode = "A"
+                        st.caption("✅ Co-crystal pose will be used directly. No docking needed.")
+                    else:
+                        st.session_state.struct_mode = "B"
+                        st.caption("ℹ️ ACD will dock your ligand after Step 2.")
+
+            else:
+                # ── Apo form: auto → Mode B docking ─────────────────────────
+                st.session_state.struct_mode = "B"
+                st.info(
+                    f"**Apo structure detected** — `{Path(st.session_state.receptor_path).name}`  \n"
+                    "No bound ligand found. ACD docking will run automatically after Step 2."
                 )
 
         struct_mode = st.session_state.struct_mode
 
+        # ── Step 1B: Parent compound (SMILES) ────────────────────────────────
         st.markdown("---")
-
+        st.markdown("### Step 1B — Parent compound")
     st.write("")
     if md == "structure" and not st.session_state.receptor_path:
         st.caption("⚠️ Load a receptor above before continuing.")
