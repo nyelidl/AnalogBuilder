@@ -1,8 +1,9 @@
-<img src="https://github.com/nyelidl/AnalogBuilder/blob/main/.fig/AB.svg" alt="Analog Builder logo" width="120"/>
-
 # Analog Designer
+<img src="https://github.com/nyelidl/AnalogBuilder/blob/main/.fig/AB.svg" alt="Analog Builder logo" width="120"/> 
 
 **Analog Designer** is a Streamlit web application for ML-guided drug analog generation and structure-based computational prioritisation. It integrates pocket analysis, ChemBERTa-powered fragment ranking, molecular docking, protein–ligand interaction profiling, and 3D visualisation in a single browser-deployable interface — no installation, no GPU, no computational chemistry expertise required.
+
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://ligandbuilder.streamlit.app/)
 
 > *21 Jun 2026 · Kowit Hengphasatporn · kowit@ccs.tsukuba.ac.jp · CCS, University of Tsukuba*
 
