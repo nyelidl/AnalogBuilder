@@ -2082,11 +2082,22 @@ elif step == 4:
     else:
         chosen = active_lib
 
-    for smi in st.session_state.custom_frags_text.strip().splitlines():
+    # ── Custom fragments: bypass all rules, generate directly ───────────────
+    _custom_text = st.session_state.custom_frags_text.strip()
+    _custom_frags = []
+    for smi in _custom_text.splitlines():
         smi = smi.strip()
+        if not smi:
+            continue
         ok, _ = core.validate_fragment_smiles(smi)
         if ok:
-            chosen.append(core.Frag(f"custom_{len(chosen)}", smi, "custom", core.G()))
+            _custom_frags.append(core.Frag(f"custom_{len(_custom_frags)}", smi, "custom", core.G()))
+
+    _custom_only = bool(_custom_frags)   # True → ignore library, skip all filters
+    if _custom_only:
+        chosen = _custom_frags   # replace entire library with user fragments
+    else:
+        chosen.extend(_custom_frags)   # append to library as before
 
     selected = st.session_state.selected_atoms
     allow_het = st.session_state.allow_heteroatom_H
@@ -2118,19 +2129,29 @@ elif step == 4:
     }
 
     if st.session_state.analogs_df is None:
-        with st.spinner(f"Generating up to {st.session_state.n_analogs} analogs from {len(chosen):,} fragments…"):
+        if _custom_only:
+            _spinner_msg = f"Generating analogs from {len(chosen)} custom fragment(s) — all rules bypassed…"
+        else:
+            _spinner_msg = f"Generating up to {st.session_state.n_analogs} analogs from {len(chosen):,} fragments…"
+        with st.spinner(_spinner_msg):
             df = core.generate_analogs(
                 mol,
                 selected_atoms=list(selected),
                 chosen_frags=chosen,
                 site_groups=site_groups,
-                weights=weights,
-                avoid_opts=avoid_opts,
-                max_MW=st.session_state.max_MW,
-                max_analogs=st.session_state.n_analogs,   # ← no cap
-                rank_by=st.session_state.get("rank_code", "Balanced (100-pt weights)"),
+                # Custom-only: no weights, no MW filter, no avoid rules, no cap
+                weights=({k: 1.0 for k in weights} if _custom_only else weights),
+                avoid_opts=({k: False for k in avoid_opts} if _custom_only else avoid_opts),
+                max_MW=(9999 if _custom_only else st.session_state.max_MW),
+                max_analogs=(999999 if _custom_only else st.session_state.n_analogs),
+                rank_by=("none" if _custom_only else st.session_state.get("rank_code", "Balanced (100-pt weights)")),
             )
         st.session_state.analogs_df = df
+        if _custom_only and df is not None and not df.empty:
+            st.info(
+                f"✅ Generated **{len(df)} analogs** from {len(chosen)} custom fragment(s). "
+                "All property filters and goal weights were bypassed."
+            )
 
     df = st.session_state.analogs_df
 
@@ -2187,6 +2208,7 @@ elif step == 4:
             st.info("No analogs match the current filters.")
         else:
             n_pages = max(1, (total_show + PAGE_SIZE - 1) // PAGE_SIZE)
+            page_num = 1   # default
 
             if n_pages > 1:
                 pg_col, info_col = st.columns([2, 3])
@@ -2204,12 +2226,11 @@ elif step == 4:
                         f'showing compounds {start_idx+1}–{end_idx} of {total_show}</p>',
                         unsafe_allow_html=True,
                     )
-                start_idx = 0
-                end_idx   = total_show
+            else:
                 st.caption(f"{total_show} compounds")
 
             start_idx = (int(page_num) - 1) * PAGE_SIZE
-            end_idx = min(start_idx + PAGE_SIZE, total_show)
+            end_idx   = min(start_idx + PAGE_SIZE, total_show)
             df_page = df_show.iloc[start_idx:end_idx]
 
             pairs = []
