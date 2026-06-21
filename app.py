@@ -141,6 +141,23 @@ div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
     flex-direction: column !important;
     height: 100% !important;
 }
+/* stMarkdownContainer must also stretch to fill available height */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stMarkdownContainer"] {
+    display: flex !important;
+    flex-direction: column !important;
+    flex: 1 !important;
+}
+/* Card content div fills the stMarkdownContainer */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stMarkdownContainer"]
+    > .mode-card-col {
+    flex: 1 !important;
+}
 /* Card content div */
 .mode-card-col {
     background: #FFFFFF;
@@ -150,6 +167,7 @@ div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
     padding: 2rem 1.5rem 1.2rem;
     text-align: center;
     flex: 1;
+    min-height: 220px;
     box-sizing: border-box;
     transition: border-color 0.2s, box-shadow 0.2s;
 }
