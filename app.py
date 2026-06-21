@@ -2147,7 +2147,6 @@ elif step == 4:
                     page_num = st.number_input(
                         "Page", min_value=1, max_value=n_pages,
                         value=1, step=1, key="grid_page_input",
-                        step=1, key="grid_page_input",
                     )
                 with info_col:
                     start_idx = (int(page_num) - 1) * PAGE_SIZE
