@@ -1785,6 +1785,15 @@ elif step == 3 and mode == "structure":
                     )
                     st.session_state["_void_subpockets"] = subpockets
                     st.session_state["_void_mode"] = va_mode
+                    # Store all pocket residue resnums for viewer grey-out
+                    try:
+                        _all_resnums = [
+                            row.get("resnum", "")
+                            for _, row in p_df.iterrows()
+                        ]
+                        st.session_state["_void_all_pocket_resnums"] = [r for r in _all_resnums if r]
+                    except Exception:
+                        st.session_state["_void_all_pocket_resnums"] = []
                     st.success(
                         f"Mode: **{va_mode}** — "
                         f"found **{len(subpockets)}** unoccupied sub-pocket(s)"
@@ -1825,6 +1834,139 @@ elif step == 3 and mode == "structure":
                     )
             else:
                 st.session_state["_void_size_filter"] = None
+
+            # ── 3D Pocket Viewer (void sub-pockets) ──────────────────────
+            if subpockets:
+                st.markdown("#### 🧬 Pocket 3D view — sub-pocket map")
+                hint(
+                    "Protein pocket coloured by sub-pocket. "
+                    "Each colour represents a distinct unoccupied region detected by void analysis."
+                )
+
+                # Sub-pocket colour palette
+                _SP_COLOURS = [
+                    "orangeCarbon",   # sub-pocket 1
+                    "cyanCarbon",     # sub-pocket 2
+                    "magentaCarbon",  # sub-pocket 3
+                    "greenCarbon",    # sub-pocket 4
+                    "yellowCarbon",   # sub-pocket 5
+                ]
+                _SP_HEX = ["#FF8C00", "#00FFFF", "#FF00FF", "#00FF44", "#FFD700"]
+
+                _va_v3d_col1, _va_v3d_col2 = st.columns([1, 3])
+                with _va_v3d_col1:
+                    _va_labels  = st.checkbox("Residue labels", value=True, key="va3d_labels")
+                    _va_surface = st.checkbox("Protein surface", value=False, key="va3d_surface")
+                    _va_cutoff  = st.slider("Cutoff (Å)", 3.0, 8.0, 6.0, 0.5, key="va3d_cutoff")
+                    _va_height  = st.slider("Height (px)", 300, 600, 440, 50, key="va3d_height")
+
+                    # Legend
+                    st.markdown("**Sub-pocket legend:**")
+                    for sp in subpockets[:5]:
+                        sp_id  = sp["sub_pocket_id"] - 1
+                        colour = _SP_HEX[sp_id % len(_SP_HEX)]
+                        sc     = sp["size_class"]
+                        vol    = sp["void_volume_est_A3"]
+                        st.markdown(
+                            f'<div style="display:flex;align-items:center;gap:8px;'
+                            f'font-size:0.78rem;margin-bottom:3px;">'
+                            f'<div style="width:12px;height:12px;border-radius:3px;'
+                            f'background:{colour};flex-shrink:0"></div>'
+                            f'SP{sp["sub_pocket_id"]} [{sc}, {vol:.0f}ų]</div>',
+                            unsafe_allow_html=True,
+                        )
+                    st.markdown(
+                        '<div style="font-size:0.72rem;color:#888;margin-top:6px;">'
+                        '<span style="color:#AAAAAA">■</span> Protein &nbsp; '
+                        '<span style="color:#888">·</span> All pocket residues</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                with _va_v3d_col2:
+                    try:
+                        import py3Dmol as _p3d
+                        _va_view = _p3d.view(width="100%", height=_va_height)
+                        _va_view.setBackgroundColor(_viewer_bg())
+
+                        # Protein cartoon
+                        rec_pdb = (st.session_state.protein_path
+                                   or st.session_state.receptor_path or "")
+                        if rec_pdb and os.path.exists(rec_pdb):
+                            _va_view.addModel(open(rec_pdb).read(), "pdb")
+                            _va_view.setStyle({"model": 0}, {
+                                "cartoon": {"color": "lightgray", "opacity": 0.30}
+                            })
+                            if _va_surface:
+                                _va_view.addSurface(
+                                    _p3d.SAS,
+                                    {"opacity": 0.18, "color": "white"},
+                                    {"model": 0}
+                                )
+
+                        # Co-crystal / docked ligand (cyan)
+                        ref_pdb = st.session_state.ref_ligand_path or ""
+                        if ref_pdb and os.path.exists(ref_pdb):
+                            _va_view.addModel(open(ref_pdb).read(), "pdb")
+                            _va_view.setStyle({"model": 1}, {
+                                "stick": {"colorscheme": "cyanCarbon", "radius": 0.30}
+                            })
+
+                        # Colour each sub-pocket's residues differently
+                        _zoom_sel = []
+                        for sp in subpockets[:5]:
+                            sp_id    = sp["sub_pocket_id"] - 1
+                            _colour  = _SP_COLOURS[sp_id % len(_SP_COLOURS)]
+                            _hex     = _SP_HEX[sp_id % len(_SP_HEX)]
+                            for member in sp.get("members", []):
+                                _rnum  = member["resnum"]
+                                _chain = member.get("chain", "")
+                                _rname = member.get("resname", "")
+                                _sel   = {"resi": _rnum}
+                                if _chain and _chain.strip():
+                                    _sel["chain"] = _chain
+                                _va_view.setStyle(_sel, {
+                                    "stick": {"colorscheme": _colour, "radius": 0.22}
+                                })
+                                if _va_labels:
+                                    _va_view.addLabel(
+                                        f"{_rname}{_rnum}",
+                                        {
+                                            "fontSize": 10,
+                                            "fontColor": _hex,
+                                            "backgroundColor": "black",
+                                            "backgroundOpacity": 0.55,
+                                            "inFront": True,
+                                        },
+                                        _sel,
+                                    )
+                                _zoom_sel.append(_rnum)
+
+                        # All other pocket residues (not in any sub-pocket)
+                        _sp_residues = {
+                            m["resnum"]
+                            for sp in subpockets
+                            for m in sp.get("members", [])
+                        }
+                        _all_pocket = st.session_state.get("_void_all_pocket_resnums", [])
+                        for _rnum in _all_pocket:
+                            if _rnum not in _sp_residues:
+                                _va_view.setStyle(
+                                    {"resi": _rnum},
+                                    {"stick": {"color": "#555555", "radius": 0.12}}
+                                )
+
+                        # Zoom to pocket
+                        if _zoom_sel:
+                            _va_view.zoomTo({"resi": _zoom_sel})
+                        else:
+                            _va_view.zoomTo()
+
+                        show3d(_va_view, height=_va_height)
+
+                    except ImportError:
+                        st.info("Install `py3Dmol` to enable 3D pocket viewer.")
+                    except Exception as _va_e:
+                        st.warning(f"3D pocket viewer error: {_va_e}")
 
     st.divider()
     st.markdown("### Generation settings")
@@ -2004,11 +2146,9 @@ elif step == 4:
                 with pg_col:
                     page_num = st.number_input(
                         "Page", min_value=1, max_value=n_pages,
-                        value=st.session_state.get("grid_page", 1),
+                        value=1, step=1, key="grid_page_input",
                         step=1, key="grid_page_input",
-                        label_visibility="collapsed",
                     )
-                    st.session_state["grid_page"] = int(page_num)
                 with info_col:
                     start_idx = (int(page_num) - 1) * PAGE_SIZE
                     end_idx   = min(start_idx + PAGE_SIZE, total_show)
@@ -2018,20 +2158,12 @@ elif step == 4:
                         f'showing compounds {start_idx+1}–{end_idx} of {total_show}</p>',
                         unsafe_allow_html=True,
                     )
-                nav_l, nav_r, _ = st.columns([1, 1, 6])
-                with nav_l:
-                    if st.button("◀ Prev", disabled=(int(page_num) <= 1), key="grid_prev"):
-                        st.session_state["grid_page"] = max(1, int(page_num) - 1)
-                        st.rerun()
-                with nav_r:
-                    if st.button("Next ▶", disabled=(int(page_num) >= n_pages), key="grid_next"):
-                        st.session_state["grid_page"] = min(n_pages, int(page_num) + 1)
-                        st.rerun()
-            else:
                 start_idx = 0
                 end_idx   = total_show
                 st.caption(f"{total_show} compounds")
 
+            start_idx = (int(page_num) - 1) * PAGE_SIZE
+            end_idx = min(start_idx + PAGE_SIZE, total_show)
             df_page = df_show.iloc[start_idx:end_idx]
 
             pairs = []
