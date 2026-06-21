@@ -998,6 +998,12 @@ if step == 1:
     if md == "structure" and not _is_modeA_auto:
         st.markdown("### Step 1B — Parent compound")
 
+    # Defaults — overridden below when user can choose input method
+    input_tab    = "⌨️ Paste SMILES"
+    draw_mode    = False
+    paste_mode   = True
+    pubchem_mode = False
+
     if _is_modeA_auto:
         # Show compact SMILES confirmation — no radio needed
         st.markdown(
