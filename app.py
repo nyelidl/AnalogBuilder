@@ -1324,35 +1324,44 @@ elif step == 2:
             except Exception as _de:
                 _diag_svg = None  # fall through to simple diagram
 
-        if _diag_svg:
+        # Always show simple 2D with orange/blue atom highlights first
+        # (so user sees which atoms are selected and which are pocket contacts)
+        try:
+            _svg_simple = core.draw_2d_interaction_svg(
+                mol,
+                selected_atoms=new_sel,
+                contact_atoms=_contact_atoms_2d,
+                width=560, height=380,
+            )
             import base64 as _b64
-            _svg_b64 = _b64.b64encode(_diag_svg.encode() if isinstance(_diag_svg, str) else _diag_svg).decode()
+            _svg_b64_s = _b64.b64encode(_svg_simple.encode()).decode()
+            st.markdown(
+                f'<img src="data:image/svg+xml;base64,{_svg_b64_s}" '
+                f'style="width:100%;background:white;'
+                f'border-radius:8px;border:1px solid #E0D6C8;padding:4px"/>',
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            show_mol(mol, highlight=sorted(new_sel), atom_indices=True)
+
+        # If ACD-style interaction diagram available, show below as bonus
+        if _diag_svg:
+            st.markdown(
+                '<div style="font-size:0.78rem;color:#8B7355;margin:6px 0 2px;">'
+                '🔬 Protein interaction diagram:</div>',
+                unsafe_allow_html=True,
+            )
+            import base64 as _b64
+            _svg_b64 = _b64.b64encode(
+                _diag_svg.encode() if isinstance(_diag_svg, str) else _diag_svg
+            ).decode()
             st.markdown(
                 f'<img src="data:image/svg+xml;base64,{_svg_b64}" '
                 f'style="width:100%;background:white;border-radius:8px;'
                 f'border:1px solid #E0D6C8;padding:4px"/>',
                 unsafe_allow_html=True,
             )
-            hint("Residue labels show interaction type. Dashed lines = H-bond · Solid circles = hydrophobic.")
-        else:
-            # Fallback: simple RDKit 2D with orange/blue atom highlights
-            try:
-                _svg = core.draw_2d_interaction_svg(
-                    mol,
-                    selected_atoms=new_sel,
-                    contact_atoms=_contact_atoms_2d,
-                    width=560, height=400,
-                )
-                import base64 as _b64
-                _svg_b64 = _b64.b64encode(_svg.encode()).decode()
-                st.markdown(
-                    f'<img src="data:image/svg+xml;base64,{_svg_b64}" '
-                    f'style="width:100%;max-width:580px;background:white;'
-                    f'border-radius:8px;border:1px solid #E0D6C8;padding:4px"/>',
-                    unsafe_allow_html=True,
-                )
-            except Exception as _draw_e:
-                show_mol(mol, highlight=sorted(new_sel), atom_indices=True)
+            hint("Dashed lines = H-bond · Solid circles = hydrophobic · Labels = interacting residues.")
 
         # Legend
         st.markdown(
