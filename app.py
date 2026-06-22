@@ -1164,14 +1164,34 @@ elif step == 2:
     attachable = core.attachable_atom_indices(mol, carbon_only=False)
     c_only     = core.attachable_atom_indices(mol, carbon_only=True)
 
-    info_card("Click an atom index in the list to select it. "
-              "Selected atoms will be highlighted on the structure — those are the spots where new groups will be added.")
+    # Get contact atoms for colour-coding (structure track only)
+    _contact_atoms_2d = set()
+    if mode == "structure":
+        _ref_lig   = st.session_state.ref_ligand_path or ""
+        _plip_df   = st.session_state.get("_plip_df")
+        if _ref_lig and os.path.exists(_ref_lig):
+            try:
+                _contact_atoms_2d = core.get_ligand_contact_atoms(
+                    mol, _ref_lig, plip_df=_plip_df)
+            except Exception:
+                pass
 
-    col_pick, col_view = st.columns([1, 1], gap="large")
+    info_card(
+        "Atom indices are shown on the structure. "
+        "<span style='background:#FF8C00;color:white;padding:1px 6px;border-radius:4px;font-size:0.85em'>Orange</span> = attachable C–H sites. "
+        + (
+        "<span style='background:#3399FF;color:white;padding:1px 6px;border-radius:4px;font-size:0.85em'>Blue</span> = atoms contacting the protein pocket — "
+        "good candidates for modification. "
+        if _contact_atoms_2d else ""
+        ) +
+        "Select the atoms where you want to grow new fragments."
+    )
+
+    col_pick, col_view = st.columns([1, 2], gap="large")
 
     with col_pick:
         st.markdown("### Pick attachment points")
-        hint("Stick to C–H sites (carbon atoms) unless you have a specific reason to modify N–H or O–H.")
+        hint("C–H sites (carbon) are safest to modify. Blue-highlighted atoms are nearest to pocket residues.")
 
         new_sel = set()
         for idx in attachable:
@@ -1180,6 +1200,8 @@ elif step == 2:
             label = f"Atom {idx}  ({atype})"
             if idx not in c_only:
                 label += "  *(heteroatom)*"
+            if idx in _contact_atoms_2d:
+                label += "  🔵 pocket contact"
             if st.checkbox(label, value=idx in st.session_state.selected_atoms, key=f"atm_{idx}"):
                 new_sel.add(idx)
 
@@ -1198,12 +1220,50 @@ elif step == 2:
         hint("Off: each analog changes one site. On: all selected sites changed together.")
 
     with col_view:
-        st.markdown("### Structure")
-        show_mol(mol, highlight=sorted(new_sel), atom_indices=True)
-        if new_sel:
-            st.caption(f"Selected: atoms {sorted(new_sel)}")
-        else:
-            st.caption("No atoms selected yet")
+        st.markdown("### Structure — highlighted interaction sites")
+        # Draw 2D SVG with colour-coded highlights
+        try:
+            _svg = core.draw_2d_interaction_svg(
+                mol,
+                selected_atoms=new_sel,
+                contact_atoms=_contact_atoms_2d,
+                width=560, height=400,
+            )
+            st.image(_svg.encode(), width='stretch')
+        except Exception as _draw_e:
+            # Fallback to plain show_mol
+            show_mol(mol, highlight=sorted(new_sel), atom_indices=True)
+
+        # Legend
+        st.markdown(
+            '<div style="font-size:0.78rem;line-height:2;margin-top:4px;">'
+            '<span style="background:#FF8C00;color:white;padding:1px 6px;border-radius:4px;">■</span> Selected for modification &nbsp;&nbsp;'
+            '<span style="background:#3399FF;color:white;padding:1px 6px;border-radius:4px;">■</span> Pocket contact site'
+            + (" &nbsp;&nbsp;<em>(no contact data yet — run pocket analysis in Step 3 first)</em>"
+               if not _contact_atoms_2d and mode == "structure" else "")
+            + '</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Structure-based: show PLIP interaction summary
+        if mode == "structure":
+            _plip_df = st.session_state.get("_plip_df")
+            if _plip_df is not None and not _plip_df.empty:
+                st.markdown("**Detected interactions (from PLIP):**")
+                _int_types = _plip_df["type"].value_counts() if "type" in _plip_df.columns else {}
+                _summary = "  ".join(
+                    f"`{t}` ×{n}" for t, n in _int_types.items()
+                ) if len(_int_types) else "—"
+                st.caption(_summary)
+                with st.expander("Full interaction table"):
+                    _show_cols = [c for c in ["type","resname","resnum","chain","dist_A"]
+                                  if c in _plip_df.columns]
+                    st.dataframe(_plip_df[_show_cols] if _show_cols else _plip_df,
+                                 hide_index=True, width='stretch')
+                hint("Blue atoms on the 2D structure are in contact with these residues — "
+                     "modifying them will change the interaction profile.")
+            else:
+                st.info("ℹ️ Run **pocket analysis** in Step 3 first to see protein-contact atoms highlighted in blue.")
 
     st.write("")
     col_back, col_next = st.columns([1, 4])
@@ -1872,7 +1932,10 @@ elif step == 3 and mode == "structure":
 
         with v3d_s_col2:
             # Load ref ligand mol from PDB if available
-            ref_pdb = st.session_state.ref_ligand_path or ""
+            ref_pdb  = st.session_state.ref_ligand_path or ""
+            prot_pdb = st.session_state.protein_path or st.session_state.receptor_path or ""
+            cpx_pdb  = st.session_state.complex_path or ""
+
             pose_mol_s3 = None
             if ref_pdb and os.path.exists(ref_pdb):
                 try:
@@ -1881,16 +1944,87 @@ elif step == 3 and mode == "structure":
                 except Exception:
                     pass
 
-            render_complex_3d(
-                receptor_pdb   = st.session_state.protein_path or st.session_state.receptor_path or "",
-                pose_mol       = pose_mol_s3,
-                height         = s3_height,
-                cutoff         = s3_cutoff,
-                show_labels    = s3_labels,
-                show_surface   = s3_surface,
-                ref_ligand_pdb = "",
-                key_prefix     = "s3_viewer",
-            )
+            # Build viewer manually for full control over pocket display
+            try:
+                import py3Dmol as _py3_s3
+                _vs3 = _py3_s3.view(width="100%", height=s3_height)
+                _vs3.setBackgroundColor(_viewer_bg())
+                _mi_s3 = 0
+
+                # Protein cartoon
+                if prot_pdb and os.path.exists(prot_pdb):
+                    _vs3.addModel(open(prot_pdb).read(), "pdb")
+                    _vs3.setStyle({"model": _mi_s3}, {
+                        "cartoon": {"color": "spectrum", "opacity": 0.40}
+                    })
+                    if s3_surface:
+                        _vs3.addSurface(_py3_s3.SAS,
+                                        {"opacity": 0.18, "color": "white"},
+                                        {"model": _mi_s3})
+                    _mi_s3 += 1
+
+                # Co-crystal ligand (cyan) — this IS the pose
+                if pose_mol_s3 is not None:
+                    from rdkit.Chem import MolToMolBlock as _MB
+                    _vs3.addModel(_MB(pose_mol_s3), "mol")
+                    _lig_mi = _mi_s3
+                    _vs3.setStyle({"model": _lig_mi}, {
+                        "stick": {"colorscheme": "cyanCarbon", "radius": 0.28}
+                    })
+                    _mi_s3 += 1
+
+                # Pocket residues from distance shell or fpocket
+                # Use complex_path (protein+ligand together) for distance calc
+                _pocket_pdb = cpx_pdb if (cpx_pdb and os.path.exists(str(cpx_pdb))) else prot_pdb
+                if _pocket_pdb and pose_mol_s3 is not None and os.path.exists(_pocket_pdb):
+                    try:
+                        _pocket_res = core.get_interacting_residues(
+                            _pocket_pdb, pose_mol_s3, cutoff=s3_cutoff)
+                        for _rb in _pocket_res:
+                            _sel_s3 = {"model": 0, "resi": _rb["resi"]}
+                            if _rb.get("chain", "").strip():
+                                _sel_s3["chain"] = _rb["chain"]
+                            _vs3.setStyle(_sel_s3, {
+                                "stick":   {"colorscheme": "orangeCarbon", "radius": 0.20},
+                                "cartoon": {"color": "spectrum", "opacity": 0.70},
+                            })
+                            if s3_labels:
+                                _vs3.addLabel(
+                                    f"{_rb['resn']}{_rb['resi']}",
+                                    {"fontSize": 11, "fontColor": "yellow",
+                                     "backgroundColor": "black",
+                                     "backgroundOpacity": 0.65,
+                                     "inFront": True, "showBackground": True},
+                                    _sel_s3,
+                                )
+                    except Exception as _pe:
+                        pass  # pocket detection failed silently
+
+                # If no mol (can't read PDB), show pocket from session state
+                if pose_mol_s3 is None:
+                    # Draw pocket residues from distance shell data stored in session
+                    _pd = st.session_state.get("_void_all_pocket_resnums", [])
+                    for _rn in _pd:
+                        _vs3.setStyle(
+                            {"model": 0, "resi": _rn},
+                            {"stick":   {"colorscheme": "orangeCarbon", "radius": 0.20},
+                             "cartoon": {"color": "spectrum", "opacity": 0.75}},
+                        )
+
+                # Zoom to ligand or pocket
+                if pose_mol_s3 is not None:
+                    _vs3.zoomTo({"model": _lig_mi})
+                elif st.session_state.get("_void_all_pocket_resnums"):
+                    _vs3.zoomTo({"resi": st.session_state["_void_all_pocket_resnums"][:5]})
+                else:
+                    _vs3.zoomTo({"model": 0})
+
+                show3d(_vs3, height=s3_height)
+
+            except ImportError:
+                st.info("Install `py3Dmol` to enable 3D viewer.")
+            except Exception as _s3e:
+                st.warning(f"3D viewer error: {_s3e}")
 
     # ── fpocket real pocket detection ────────────────────────────────────
     _prot_pdb_fp = (st.session_state.protein_path or
@@ -2043,6 +2177,25 @@ elif step == 3 and mode == "structure":
                             _sel_atoms, _atom_xyz, subpockets, _lig_ctr
                         )
                         st.session_state["_atom_subpocket_map"] = _atom_sp_map
+
+                        # ── Filter subpockets to only those near selected atoms ──
+                        # Keep sub-pockets that are directionally matched to
+                        # at least one selected atom (score > 0 = forward direction)
+                        _relevant_sp_ids = set()
+                        for _asp in _atom_sp_map.values():
+                            _relevant_sp_ids.add(_asp.get("sub_pocket_id"))
+                        if _relevant_sp_ids:
+                            _filtered_subpockets = [
+                                sp for sp in subpockets
+                                if sp["sub_pocket_id"] in _relevant_sp_ids
+                            ]
+                            st.session_state["_void_subpockets"] = _filtered_subpockets
+                            if len(_filtered_subpockets) < len(subpockets):
+                                hint(
+                                    f"ℹ️ Showing {len(_filtered_subpockets)} of "
+                                    f"{len(subpockets)} sub-pockets — filtered to "
+                                    "those near your selected attachment atoms."
+                                )
 
                         # 4. Apply both criteria per atom
                         _atom_criteria = core.per_atom_fragment_criteria(
