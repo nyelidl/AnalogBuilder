@@ -1302,14 +1302,37 @@ elif step == 2:
                 and _cpx_pdb and os.path.exists(str(_cpx_pdb))
                 and _ref_lig and os.path.exists(str(_ref_lig))):
             try:
-                # Convert ref ligand PDB → SDF for draw_interaction_diagram
-                from rdkit.Chem import MolToMolBlock
-                _lig_mol_tmp = Chem.MolFromPDBFile(str(_ref_lig), removeHs=False, sanitize=True)
-                if _lig_mol_tmp is not None:
-                    _tmp_sdf = str(get_work_dir() / "ref_lig_for_diagram.sdf")
-                    with open(_tmp_sdf, 'w') as _tsf:
-                        _tsf.write(MolToMolBlock(_lig_mol_tmp))
-                    # Use protein-only PDB (no HETATM) for interaction detection
+                import subprocess as _sp2
+                _tmp_sdf = str(get_work_dir() / "ref_lig_for_diagram.sdf")
+
+                # Method 1: obabel PDB → SDF (best bond orders + 3D coords)
+                _ob = shutil.which("obabel")
+                _sdf_ok = False
+                if _ob:
+                    _r = _sp2.run(
+                        [_ob, str(_ref_lig), "-osdf", "-h", "-O", _tmp_sdf],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    _sdf_ok = _r.returncode == 0 and os.path.exists(_tmp_sdf)
+
+                # Method 2: RDKit MolFromPDBFile + AddHs fallback
+                if not _sdf_ok:
+                    from rdkit.Chem import MolToMolBlock
+                    _lig_mol_tmp = Chem.MolFromPDBFile(str(_ref_lig), removeHs=False, sanitize=True)
+                    if _lig_mol_tmp is None:
+                        _lig_mol_tmp = Chem.MolFromPDBFile(str(_ref_lig), removeHs=False, sanitize=False)
+                    if _lig_mol_tmp is not None:
+                        try:
+                            _lig_mol_tmp = AllChem.AddHs(_lig_mol_tmp, addCoords=True)
+                        except Exception:
+                            pass
+                    if _lig_mol_tmp is not None and _lig_mol_tmp.GetNumConformers() > 0:
+                        with open(_tmp_sdf, 'w') as _tsf:
+                            _tsf.write(MolToMolBlock(_lig_mol_tmp))
+                        _sdf_ok = True
+
+                if _sdf_ok:
+                    # Use protein-only PDB for interaction detection (no HETATM confusion)
                     _prot_only = st.session_state.protein_path or str(_cpx_pdb)
                     _diag_bytes = core.draw_interaction_diagram(
                         receptor_pdb=_prot_only,
@@ -1317,10 +1340,13 @@ elif step == 2:
                         smiles=st.session_state.parent_smiles or "",
                         title=st.session_state.parent_name or "",
                         cutoff=4.5,
-                        size=(580, 480),
+                        size=(580, 500),
                         max_residues=14,
                     )
                     _diag_svg = _diag_bytes.decode() if isinstance(_diag_bytes, bytes) else _diag_bytes
+                    # Reject if error SVG (too small)
+                    if len(_diag_svg) < 500:
+                        _diag_svg = None
             except Exception as _de:
                 _diag_svg = None  # fall through to simple diagram
 
