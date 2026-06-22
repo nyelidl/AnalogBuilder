@@ -5631,9 +5631,9 @@ def build_acd_dock_cmd(
            "--name",     _safe_file_token(name),
            "--center",   center,
            "--ph",       str(ph),
-           "--bx",       str(box_x),
-           "--by",       str(box_y),
-           "--bz",       str(box_z),
+           "--bx",       str(int(box_x)),
+           "--by",       str(int(box_y)),
+           "--bz",       str(int(box_z)),
            "-e",         str(exhaustiveness),
            "-n",         str(num_poses),
            "-o",         output_dir]
@@ -5671,9 +5671,9 @@ def build_acd_batch_cmd(
            "--output",   output_dir,
            "--center",   center,
            "--ph",       str(ph),
-           "--bx",       str(box_x),
-           "--by",       str(box_y),
-           "--bz",       str(box_z),
+           "--bx",       str(int(box_x)),
+           "--by",       str(int(box_y)),
+           "--bz",       str(int(box_z)),
            "-e",         str(exhaustiveness),
            "-n",         str(num_poses)]
     if use_pkanet:
