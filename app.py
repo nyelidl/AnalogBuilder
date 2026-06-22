@@ -1291,26 +1291,68 @@ elif step == 2:
         hint("Off: each analog changes one site. On: all selected sites changed together.")
 
     with col_view:
-        st.markdown("### Structure — highlighted interaction sites")
-        # Draw 2D SVG with colour-coded highlights
-        try:
-            _svg = core.draw_2d_interaction_svg(
-                mol,
-                selected_atoms=new_sel,
-                contact_atoms=_contact_atoms_2d,
-                width=560, height=400,
-            )
+        st.markdown("### Structure — interaction diagram")
+
+        # Try full ACD-style 2D interaction diagram first (needs complex PDB + pose SDF)
+        _cpx_pdb  = st.session_state.complex_path or ""
+        _ref_lig  = st.session_state.ref_ligand_path or ""
+        _diag_svg = None
+
+        if (mode == "structure"
+                and _cpx_pdb and os.path.exists(str(_cpx_pdb))
+                and _ref_lig and os.path.exists(str(_ref_lig))):
+            try:
+                # Convert ref ligand PDB → SDF for draw_interaction_diagram
+                from rdkit.Chem import MolToMolBlock
+                _lig_mol_tmp = Chem.MolFromPDBFile(str(_ref_lig), removeHs=False, sanitize=True)
+                if _lig_mol_tmp is not None:
+                    _tmp_sdf = str(get_work_dir() / "ref_lig_for_diagram.sdf")
+                    with open(_tmp_sdf, 'w') as _tsf:
+                        _tsf.write(MolToMolBlock(_lig_mol_tmp))
+                    # Use protein-only PDB (no HETATM) for interaction detection
+                    _prot_only = st.session_state.protein_path or str(_cpx_pdb)
+                    _diag_bytes = core.draw_interaction_diagram(
+                        receptor_pdb=_prot_only,
+                        pose_sdf=_tmp_sdf,
+                        smiles=st.session_state.parent_smiles or "",
+                        title=st.session_state.parent_name or "",
+                        cutoff=4.5,
+                        size=(580, 480),
+                        max_residues=14,
+                    )
+                    _diag_svg = _diag_bytes.decode() if isinstance(_diag_bytes, bytes) else _diag_bytes
+            except Exception as _de:
+                _diag_svg = None  # fall through to simple diagram
+
+        if _diag_svg:
             import base64 as _b64
-            _svg_b64 = _b64.b64encode(_svg.encode()).decode()
+            _svg_b64 = _b64.b64encode(_diag_svg.encode() if isinstance(_diag_svg, str) else _diag_svg).decode()
             st.markdown(
                 f'<img src="data:image/svg+xml;base64,{_svg_b64}" '
-                f'style="width:100%;max-width:580px;background:white;'
-                f'border-radius:8px;border:1px solid #E0D6C8;padding:4px"/>',
+                f'style="width:100%;background:white;border-radius:8px;'
+                f'border:1px solid #E0D6C8;padding:4px"/>',
                 unsafe_allow_html=True,
             )
-        except Exception as _draw_e:
-            st.warning(f"2D diagram error: {_draw_e}")
-            show_mol(mol, highlight=sorted(new_sel), atom_indices=True)
+            hint("Residue labels show interaction type. Dashed lines = H-bond · Solid circles = hydrophobic.")
+        else:
+            # Fallback: simple RDKit 2D with orange/blue atom highlights
+            try:
+                _svg = core.draw_2d_interaction_svg(
+                    mol,
+                    selected_atoms=new_sel,
+                    contact_atoms=_contact_atoms_2d,
+                    width=560, height=400,
+                )
+                import base64 as _b64
+                _svg_b64 = _b64.b64encode(_svg.encode()).decode()
+                st.markdown(
+                    f'<img src="data:image/svg+xml;base64,{_svg_b64}" '
+                    f'style="width:100%;max-width:580px;background:white;'
+                    f'border-radius:8px;border:1px solid #E0D6C8;padding:4px"/>',
+                    unsafe_allow_html=True,
+                )
+            except Exception as _draw_e:
+                show_mol(mol, highlight=sorted(new_sel), atom_indices=True)
 
         # Legend
         st.markdown(
