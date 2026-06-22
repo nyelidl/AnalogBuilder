@@ -33,6 +33,14 @@ except ImportError:
     _pr = None
     _PR_OK = False
 
+# External fragment libraries (ChEMBL + ZINC)
+try:
+    import external_fragment_library as _efl
+    _EFL_OK = True
+except ImportError:
+    _efl = None
+    _EFL_OK = False
+
 # Void / unoccupied space analyzer
 try:
     import void_analyzer as _va
@@ -1381,6 +1389,68 @@ elif step == 3 and mode == "ligand":
             for k in w:
                 new_w[k] = st.slider(k.capitalize(), 0, 100, int(w[k]), step=5, key=f"w_{k}")
             st.session_state.weights = new_w
+
+        # ── External Fragment Libraries ───────────────────────────────────────
+        st.markdown("### 🌐 External fragment libraries")
+        hint(
+            "Fetch fragments from **ChEMBL** (rule-of-three) or **ZINC** (pre-curated fragment subset). "
+            "Fetched fragments are merged with the built-in library. Cached 24–72 h locally."
+        )
+        _efl_sources = st.multiselect(
+            "Fetch from",
+            ["ChEMBL (rule-of-three, ~300K)", "ZINC Fragments (~300K)"],
+            default=[],
+            key="efl_sources",
+        )
+        _efl_max = st.slider(
+            "Max per source", 50, 2000, 300, 50, key="efl_max",
+            help="Results are cached — first fetch may take 15–60 s."
+        )
+        if _efl_sources:
+            _src_keys = []
+            if any("ChEMBL" in s for s in _efl_sources): _src_keys.append("chembl")
+            if any("ZINC"   in s for s in _efl_sources): _src_keys.append("zinc")
+            _ef1, _ef2 = st.columns([2, 1])
+            with _ef1:
+                if st.button("🔄 Fetch external fragments", key="efl_fetch_btn"):
+                    if not _EFL_OK:
+                        st.error("external_fragment_library.py not found in app folder.")
+                    else:
+                        _prog = st.progress(0.0, text="Connecting…")
+                        def _cb(done, total):
+                            _prog.progress(min(1.0, done / max(total, 1)),
+                                           text=f"Fetched {done}/{total}…")
+                        with st.spinner("Fetching — first run may take 15–60 s…"):
+                            try:
+                                _fetched = _efl.fetch_external_fragments(
+                                    sources=_src_keys,
+                                    max_per_source=_efl_max,
+                                    progress_cb=_cb,
+                                )
+                                st.session_state["_efl_fragments"] = _fetched
+                                _prog.empty()
+                                from collections import Counter as _C
+                                _bs = _C(f["source"] for f in _fetched)
+                                _bc = _C(f["category"] for f in _fetched)
+                                st.success(f"✅ {len(_fetched)} fragments — " +
+                                           "  ".join(f"{s}:{n}" for s,n in _bs.items()))
+                                st.caption("Categories: " +
+                                           "  ".join(f"{c}({n})" for c,n in _bc.most_common(6)))
+                            except Exception as _ee:
+                                _prog.empty()
+                                st.error(f"Fetch failed: {_ee}")
+            with _ef2:
+                _cached_efl = st.session_state.get("_efl_fragments", [])
+                if _cached_efl:
+                    st.metric("Cached", f"{len(_cached_efl):,}")
+                    if st.button("🗑️ Clear", key="efl_clear"):
+                        st.session_state.pop("_efl_fragments", None)
+                        if _EFL_OK: _efl.clear_cache()
+                        st.rerun()
+                if _EFL_OK:
+                    _ci = _efl.cache_info()
+                    st.caption(f"💾 {_ci['files']} files · {_ci['total_mb']:.1f} MB")
+
         st.markdown("**Custom fragments** — one SMILES with `[*]` per line")
         st.session_state.custom_frags_text = st.text_area(
             "Custom fragments", value=st.session_state.custom_frags_text,
@@ -2116,7 +2186,17 @@ elif step == 4:
     if _custom_only:
         chosen = _custom_frags   # replace entire library with user fragments
     else:
-        chosen.extend(_custom_frags)   # append to library as before
+        chosen.extend(_custom_frags)   # append custom to library
+
+    # ── Merge external fragments (ChEMBL / ZINC) if fetched ──────────────────
+    _efl_raw = st.session_state.get("_efl_fragments", [])
+    if _efl_raw and not _custom_only and _EFL_OK:
+        _efl_frags = _efl.to_frag_objects(_efl_raw, core)
+        _existing_names = {f.name for f in chosen}
+        _new_efl = [f for f in _efl_frags if f.name not in _existing_names]
+        chosen.extend(_new_efl)
+        if _new_efl:
+            hint(f"ℹ️ {len(_new_efl)} external fragments (ChEMBL/ZINC) added to library.")
 
     selected = st.session_state.selected_atoms
     allow_het = st.session_state.allow_heteroatom_H
