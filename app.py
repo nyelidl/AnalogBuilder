@@ -22,6 +22,27 @@ import streamlit as st
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
 
+# ── Version guard: ensure Analog Designer core.py is loaded, not ACD core ────
+import importlib.util as _iutil, sys as _sys
+_core_spec = _iutil.find_spec("core")
+if _core_spec:
+    _core_check_path = _core_spec.origin
+    try:
+        with open(_core_check_path, errors="ignore") as _cf:
+            _core_ok = "CATEGORY_BASE_GOALS" in _cf.read(5000)
+    except Exception:
+        _core_ok = False
+    if not _core_ok:
+        import urllib.request as _ur, os as _os
+        _raw = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/core.py"
+        try:
+            _ur.urlretrieve(_raw, _core_check_path)
+            # Force reimport
+            if "core" in _sys.modules:
+                del _sys.modules["core"]
+        except Exception:
+            pass  # will fail with the AttributeError — tells user to push core.py
+
 import core
 # components imported via st.iframe
 
@@ -1168,11 +1189,61 @@ elif step == 2:
     _contact_atoms_2d = set()
     if mode == "structure":
         _ref_lig   = st.session_state.ref_ligand_path or ""
-        _plip_df   = st.session_state.get("_plip_df")
+        _cpx_path  = st.session_state.complex_path or ""
+
+        # Auto-run PLIP if not yet done and complex is available
+        if (st.session_state.get("_plip_df") is None
+                and _cpx_path and os.path.exists(str(_cpx_path))
+                and _PA_OK):
+            try:
+                with st.spinner("Analysing protein-ligand interactions…"):
+                    _xml, _msg, _log = _pa.run_plip_on_complex(
+                        str(_cpx_path), str(get_work_dir() / "plip_step2"), "auto")
+                    if _xml:
+                        _plip_df_auto = _pa.parse_plip_to_table(_xml)
+                        _tags_auto    = _pa.plip_to_residue_tags(_plip_df_auto)
+                        st.session_state["_plip_df"]         = _plip_df_auto
+                        st.session_state["_plip_tag_counts"] = _tags_auto
+            except Exception:
+                pass
+
+        _plip_df = st.session_state.get("_plip_df")
         if _ref_lig and os.path.exists(_ref_lig):
             try:
                 _contact_atoms_2d = core.get_ligand_contact_atoms(
                     mol, _ref_lig, plip_df=_plip_df)
+            except Exception:
+                pass
+
+        # Fallback: distance-based contact if PLIP not available
+        if not _contact_atoms_2d and _cpx_path and os.path.exists(str(_cpx_path)):
+            try:
+                _atom_xyz_c = core.map_attachment_atoms_to_3d(mol, _ref_lig)
+                _, _c_df, _, _ = core.analyze_complex_distance_shell(
+                    str(_cpx_path), pocket_cutoff=6.0, contact_cutoff=4.0)
+                if not _c_df.empty and "resnum" in _c_df.columns:
+                    # Get all ligand atoms within contact distance
+                    _prot_atoms, _lig_atoms = core.read_complex_atoms_for_pocket(str(_cpx_path))
+                    import numpy as _npc
+                    _contact_3d = set()
+                    for _la_idx, _la in enumerate(_lig_atoms):
+                        for _pa_r in _prot_atoms:
+                            if float(_npc.linalg.norm(_la["xyz"] - _pa_r["xyz"])) <= 4.0:
+                                _contact_3d.add(_la_idx)
+                                break
+                    # Map 3D lig indices → 2D via MCS
+                    if _contact_3d and _ref_lig and os.path.exists(_ref_lig):
+                        from rdkit.Chem import rdFMCS as _rFMCS
+                        _m3d = Chem.MolFromPDBFile(_ref_lig, removeHs=True, sanitize=True)
+                        if _m3d:
+                            _mcs = _rFMCS.FindMCS([mol, _m3d], timeout=5,
+                                atomCompare=_rFMCS.AtomCompare.CompareElements,
+                                bondCompare=_rFMCS.BondCompare.CompareAny)
+                            _mm = Chem.MolFromSmarts(_mcs.smartsString)
+                            _mt2d = mol.GetSubstructMatch(_mm)
+                            _mt3d = _m3d.GetSubstructMatch(_mm)
+                            _d3to2 = {_mt3d[i]: _mt2d[i] for i in range(len(_mt2d))}
+                            _contact_atoms_2d = {_d3to2[i] for i in _contact_3d if i in _d3to2}
             except Exception:
                 pass
 
@@ -1229,9 +1300,16 @@ elif step == 2:
                 contact_atoms=_contact_atoms_2d,
                 width=560, height=400,
             )
-            st.image(_svg.encode(), width='stretch')
+            import base64 as _b64
+            _svg_b64 = _b64.b64encode(_svg.encode()).decode()
+            st.markdown(
+                f'<img src="data:image/svg+xml;base64,{_svg_b64}" '
+                f'style="width:100%;max-width:580px;background:white;'
+                f'border-radius:8px;border:1px solid #E0D6C8;padding:4px"/>',
+                unsafe_allow_html=True,
+            )
         except Exception as _draw_e:
-            # Fallback to plain show_mol
+            st.warning(f"2D diagram error: {_draw_e}")
             show_mol(mol, highlight=sorted(new_sel), atom_indices=True)
 
         # Legend
