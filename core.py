@@ -5934,9 +5934,37 @@ def find_pose_sdfs_for_compound(out_dir: str, compound: str) -> List[str]:
 
 
 
+
+# ── Constants needed by 2D interaction diagram ────────────────────────────────
+METAL_RESNAMES = {
+    "ZN","MG","CA","FE","MN","CU","NI","CO","CD","HG","PB","PT","AU",
+    "NA","K","LI","RB","CS","SR","BA","AL","CR","MO","W","V","RU","RH",
+    "PD","AG","IR","OS","RE","TC","GA","IN","SN","TL","BI","LA","CE",
+    "PR","ND","SM","EU","GD","TB","DY","HO","ER","TM","YB","LU",
+    "ZR","HF","TA","SE","TE","PO","AT","FE2","FE3","CU1","CU2",
+}
+HEME_RESNAMES = {"HEM", "HEC", "HEA", "HEB", "HDD", "HDM"}
+EXCLUDE_IONS  = {"HOH","WAT","H2O","SO4","PO4","GOL","EDO","PEG","TRS",
+                 "CL","BR","IOD","F","NA","K","MG","CA","ZN"}
+_ITYPE_PRIORITY = [
+    "metal", "ionic", "halogen", "hbond_to_halogen",
+    "hbond", "pi_pi", "cation_pi", "hydrophobic",
+]
+_CLR_HBOND   = "#1a7a1a"
+_CLR_PIPI    = "#e200e8"
+_CLR_HYDRO   = "#2287ff"
+_CLR_IONIC   = "#aa0077"
+_CLR_METAL   = "#cc8800"
+_CLR_HAL     = "#cc2277"
+_CLR_HBXHAL  = "#6633aa"
+
 # ── 2D Interaction Diagram (from ACD — full implementation) ──────────────
 import math as _math
 
+_ITYPE_PRIORITY = [
+    "metal", "ionic", "halogen", "hbond_to_halogen",
+    "hbond", "pi_pi", "cation_pi", "hydrophobic",
+]
 _CLR_HBOND   = "#1a7a1a"
 _CLR_PIPI    = "#e200e8"
 _CLR_HYDRO   = "#2287ff"
