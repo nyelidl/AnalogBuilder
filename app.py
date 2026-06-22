@@ -2823,44 +2823,83 @@ elif step == 5:
                 except Exception as e:
                     st.warning(f"Could not render structure grid: {e}")
 
-            # ── 3D Viewer ─────────────────────────────────────────────────────────
+            # ── 3D Complex Viewer ────────────────────────────────────────────────
             st.divider()
             st.markdown("### 🧬 3D Complex Viewer")
-            hint("Select a compound to visualise its docked pose in the binding pocket.")
+            hint("Select a compound and pose to visualise the docked complex.")
 
             if result_rows:
                 v3d_compounds = [r["compound"] for r in result_rows if r.get("n_poses", 0) > 0]
                 if v3d_compounds:
-                    v3d_col1, v3d_col2 = st.columns([2, 3])
+                    v3d_col1, v3d_col2 = st.columns([1, 3])
                     with v3d_col1:
                         sel_compound = st.selectbox(
                             "Compound", v3d_compounds, key="v3d_compound_sel")
+
+                        # Load all poses for selected compound
+                        _v3d_sdfs = core.find_pose_sdfs_for_compound(dock_out_dir, sel_compound)
+                        _all_poses = []
+                        if _v3d_sdfs:
+                            try:
+                                from rdkit.Chem import SDMolSupplier as _SDS
+                                _suppl = _SDS(_v3d_sdfs[0], removeHs=False)
+                                for _pm in _suppl:
+                                    if _pm is not None:
+                                        _all_poses.append(_pm)
+                            except Exception:
+                                pass
+
+                        # Pose picker with BE and RMSD
+                        _pose_labels = []
+                        for _pi, _pm in enumerate(_all_poses):
+                            _sc = None
+                            for _prop in _pm.GetPropsAsDict():
+                                if "score" in _prop.lower() or "affinity" in _prop.lower():
+                                    try: _sc = float(_pm.GetProp(_prop))
+                                    except: pass
+                            _lbl = f"Pose {_pi+1}"
+                            if _sc is not None:
+                                _lbl += f"  {_sc:.2f} kcal/mol"
+                            _pose_labels.append(_lbl)
+
+                        if not _pose_labels:
+                            _pose_labels = ["Pose 1 (best)"]
+
+                        sel_pose_label = st.selectbox(
+                            "Pose", _pose_labels, key="v3d_pose_sel")
+                        sel_pose_idx = _pose_labels.index(sel_pose_label)
+                        pose_mol = _all_poses[sel_pose_idx] if _all_poses else None
+
+                        # Controls
+                        st.markdown("**Display options:**")
                         show_labels  = st.checkbox("Residue labels", value=True, key="v3d_labels")
                         show_surface = st.checkbox("Protein surface", value=False, key="v3d_surface")
-                        v3d_cutoff   = st.slider("Pocket cutoff (Å)", 3.0, 6.0, 4.0, 0.5, key="v3d_cutoff")
-                        v3d_height   = st.slider("Viewer height (px)", 300, 700, 480, 50, key="v3d_height")
+                        v3d_cutoff   = st.slider("Pocket cutoff (Å)", 3.0, 8.0, 4.5, 0.5, key="v3d_cutoff")
+                        v3d_height   = st.slider("Height (px)", 350, 700, 500, 50, key="v3d_height")
 
                         # Colour legend
-                        st.markdown("""
-<div style="font-size:0.78rem;line-height:1.8;margin-top:8px;">
-<span style="color:#00FFFF">■</span> Docked ligand &nbsp;
-<span style="color:#FF8C00">■</span> Pocket residues<br>
-<span style="color:#FF00FF">■</span> Reference ligand &nbsp;
-<span style="color:#AAAAAA">■</span> Protein
-</div>""", unsafe_allow_html=True)
+                        st.markdown(
+                            '<div style="font-size:0.77rem;line-height:2;margin-top:10px;">'+
+                            '<span style="color:#00FFFF">■</span> Docked pose<br>'+
+                            '<span style="color:#FF00FF">■</span> Co-crystal ref<br>'+
+                            '<span style="color:#FF8C00">■</span> Pocket residues<br>'+
+                            '<span style="color:#AAAAAA">■</span> Protein</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # RMSD for selected pose
+                        _ref_pdb = st.session_state.ref_ligand_path or ""
+                        if pose_mol and _ref_pdb and os.path.exists(_ref_pdb):
+                            try:
+                                _rmsd_val = core.calc_rmsd_heavy(pose_mol, _ref_pdb)
+                                if _rmsd_val is not None:
+                                    _rmsd_col = "🟢" if _rmsd_val <= 2.0 else ("🟡" if _rmsd_val <= 3.0 else "🔴")
+                                    st.metric("RMSD vs co-crystal", f"{_rmsd_val:.2f} Å", delta=None)
+                                    st.caption(f"{_rmsd_col} {'≤2 Å — binding mode reproduced' if _rmsd_val<=2 else ('2–3 Å — moderate' if _rmsd_val<=3 else '>3 Å — poor reproduction')}")
+                            except Exception:
+                                pass
 
                     with v3d_col2:
-                        # Find best pose SDF for selected compound
-                        sdfs = core.find_pose_sdfs_for_compound(dock_out_dir, sel_compound)
-                        pose_mol = None
-                        if sdfs:
-                            from rdkit.Chem import SDMolSupplier
-                            suppl = SDMolSupplier(sdfs[0], removeHs=False)
-                            for _m in suppl:
-                                if _m is not None:
-                                    pose_mol = _m
-                                    break
-
                         if pose_mol:
                             render_complex_3d(
                                 receptor_pdb  = receptor or "",
@@ -2869,13 +2908,13 @@ elif step == 5:
                                 cutoff        = v3d_cutoff,
                                 show_labels   = show_labels,
                                 show_surface  = show_surface,
-                                ref_ligand_pdb= st.session_state.ref_ligand_path or "",
-                                key_prefix    = f"v3d_{sel_compound}",
+                                ref_ligand_pdb= _ref_pdb,
+                                key_prefix    = f"v3d_{sel_compound}_{sel_pose_idx}",
                             )
                         else:
-                            st.info(f"No pose found for {sel_compound}")
+                            st.info(f"No poses found for **{sel_compound}**.")
                 else:
-                    st.info("No docked poses available yet.")
+                    st.info("No docked poses to display. Run docking first.")
 
             st.divider()
             csv_rows = [{"compound": r["compound"], "SMILES": r["SMILES"],
