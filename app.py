@@ -951,15 +951,10 @@ if step == 1:
                     f"✅ **Co-crystal ligand detected** in "
                     f"`{Path(st.session_state.receptor_path).name}`"
                 )
-                _extracted_smi = ""
-                try:
-                    _lig_mol_tmp = Chem.MolFromPDBFile(
-                        st.session_state.ref_ligand_path, removeHs=True)
-                    if _lig_mol_tmp:
-                        _extracted_smi = Chem.MolToSmiles(_lig_mol_tmp)
-                        st.session_state["_modeA_extracted_smiles"] = _extracted_smi
-                except Exception:
-                    pass
+                _extracted_smi = core.ligand_pdb_to_smiles(
+                    st.session_state.ref_ligand_path)
+                if _extracted_smi:
+                    st.session_state["_modeA_extracted_smiles"] = _extracted_smi
 
                 _col_smi, _col_opt = st.columns([3, 2])
                 with _col_smi:
