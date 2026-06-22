@@ -1,6765 +1,3792 @@
 """
-core.py — Chemistry and computation backend for the Analog Designer application.
-
-Contains:
-  - Fragment library (Frag dataclass + LIBRARY)
-  - Property calculators (SA score, ESOL, Morgan FP)
-  - Analog generation (attach, attach_to_sites, generate_analogs)
-  - Pocket analysis (distance-shell, fpocket alpha-spheres)
-  - Docking helpers (PDB splitting, ACD command builder, score parsing)
-  - PLIP / cIFP interaction fingerprints
-  - 3D ligand file generation
+app.py — ⌬+⌬ Analog Builder · Streamlit web application
+Redesigned UX: warm tones, student-friendly, two separate tracks,
+sidebar progress indicator, advanced options collapsed.
 """
 
 from __future__ import annotations
 
-import glob
+import base64
 import io
 import json
-import math
 import os
-import re
 import shlex
 import shutil
-import subprocess
-import urllib.request
-import xml.etree.ElementTree as ET
+import tempfile
 import zipfile
-from dataclasses import dataclass, field
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
-from rdkit import Chem, RDLogger
-from rdkit.Chem import (
-    AllChem,
-    Crippen,
-    Descriptors,
-    QED,
-    rdMolDescriptors,
-)
-from rdkit.Chem.Draw import rdMolDraw2D
-from rdkit.DataStructs import TanimotoSimilarity
+import streamlit as st
+from rdkit import Chem
+from rdkit.Chem import AllChem, Draw
 
-RDLogger.DisableLog("rdApp.*")
+import core
+# components imported via st.iframe
 
-# ---------------------------------------------------------------------------
-# Optional dependencies
-# ---------------------------------------------------------------------------
-
-_SA_OK = False
+# Module 2: ChemBERTa pocket-aware fragment ranker
 try:
-    from rdkit.Chem import RDConfig
-    import sys as _sys
-    _sys.path.append(os.path.join(RDConfig.RDContribDir, "SA_Score"))
-    import sascorer  # type: ignore
-    _SA_OK = True
+    import pocket_reference as _pr
+    _PR_OK = True
+except ImportError:
+    _pr = None
+    _PR_OK = False
+
+# External fragment libraries (ChEMBL + ZINC)
+try:
+    import external_fragment_library as _efl
+    _EFL_OK = True
+except ImportError:
+    _efl = None
+    _EFL_OK = False
+
+# Void / unoccupied space analyzer
+try:
+    import void_analyzer as _va
+    _VA_OK = True
+except ImportError:
+    _va = None
+    _VA_OK = False
+
+# PLIP interaction analyzer
+try:
+    import plip_analyzer as _pa
+    _PA_OK = True
+except ImportError:
+    _pa = None
+    _PA_OK = False
+
+# Optional in-browser molecule sketcher
+try:
+    from streamlit_ketcher import st_ketcher
+    _KETCHER_OK = True
 except Exception:
-    pass
+    _KETCHER_OK = False
 
+# fpocket pocket detection
+try:
+    import fpocket_analyzer as _fpa
+    _FPA_OK = _fpa.FPOCKET_OK
+except ImportError:
+    _fpa    = None
+    _FPA_OK = False
 
-def sa_score(mol: Chem.Mol) -> float:
-    """Synthetic-accessibility score 1 (easy) .. 10 (hard)."""
-    if _SA_OK:
-        try:
-            return float(sascorer.calculateScore(mol))
-        except Exception:
-            pass
-    nr = rdMolDescriptors.CalcNumRings(mol)
-    nst = len(
-        Chem.FindMolChiralCenters(mol, includeUnassigned=True, useLegacyImplementation=False)
-    )
-    mw = Descriptors.MolWt(mol)
-    sp3 = rdMolDescriptors.CalcFractionCSP3(mol)
-    return max(1.0, min(10.0, 1.5 + 0.6 * nr + 0.7 * nst + mw / 250.0 + sp3))
+# Logo
+LOGO_URL = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/AB.svg"
+LB_URL   = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/LB.svg"
+SB_URL   = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/SB.svg"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier logic helper
+# ─────────────────────────────────────────────────────────────────────────────
 
-def esol_logS(mol: Chem.Mol) -> float:
-    """Delaney ESOL aqueous logS estimate."""
-    clogp = Crippen.MolLogP(mol)
-    mw = Descriptors.MolWt(mol)
-    rb = rdMolDescriptors.CalcNumRotatableBonds(mol)
-    ap = (
-        len(mol.GetAromaticAtoms()) / mol.GetNumHeavyAtoms()
-        if mol.GetNumHeavyAtoms()
-        else 0.0
-    )
-    return 0.16 - 0.63 * clogp - 0.0062 * mw + 0.066 * rb - 0.74 * ap
-
-
-def morgan(mol: Chem.Mol, r: int = 2, n: int = 2048):
-    return AllChem.GetMorganFingerprintAsBitVect(mol, r, nBits=n)
-
-
-# ---------------------------------------------------------------------------
-# Fragment library
-# ---------------------------------------------------------------------------
-
-G = lambda **k: {
-    "potency": 0,
-    "selectivity": 0,
-    "solubility": 0,
-    "metabolic": 0,
-    "synthesis": 0,
-    "novelty": 0,
-    **k,
-}
-
-CATEGORY_BASE_GOALS: Dict[str, Dict] = {
-    "hydrophobic": G(potency=1, selectivity=1, solubility=-1, synthesis=1),
-    "polar": G(potency=1, selectivity=1, solubility=1, synthesis=1),
-    "basic": G(potency=1, selectivity=1, solubility=2, synthesis=0),
-    "acidic": G(potency=1, selectivity=1, solubility=2, synthesis=0),
-    "halogen": G(potency=1, selectivity=1, metabolic=2, solubility=-1, synthesis=1),
-    "aromatic": G(potency=1, selectivity=2, solubility=-1, novelty=1),
-    "solubility": G(solubility=2, selectivity=1, synthesis=0),
-    "bioisostere": G(selectivity=1, metabolic=1, novelty=2, synthesis=-1),
-}
-
-
-def _merge_goals(category: str, **override) -> Dict:
-    base = dict(CATEGORY_BASE_GOALS.get(category, G()))
-    base.update(override)
-    return base
-
-
-@dataclass
-class Frag:
-    name: str
-    smiles: str
-    category: str
-    goals: Dict
-    tox: bool = False
-    size_class: str = "auto"
-    interaction_class: str = "auto"
-    charge_class: str = "auto"
-    source: str = "built_in"
-    notes: str = ""
-
-    @property
-    def heavy(self) -> int:
-        m = Chem.MolFromSmiles(self.smiles.replace("[*]", "[H]"))
-        return m.GetNumHeavyAtoms() if m else 99
-
-
-_FRAGMENT_ROWS = [
-    ("methyl", "[*]C", "hydrophobic"),
-    ("ethyl", "[*]CC", "hydrophobic"),
-    ("n-propyl", "[*]CCC", "hydrophobic"),
-    ("isopropyl", "[*]C(C)C", "hydrophobic"),
-    ("n-butyl", "[*]CCCC", "hydrophobic"),
-    ("tert-butyl", "[*]C(C)(C)C", "hydrophobic"),
-    ("cyclopropyl", "[*]C1CC1", "hydrophobic"),
-    ("cyclobutyl", "[*]C1CCC1", "hydrophobic"),
-    ("cyclopentyl", "[*]C1CCCC1", "hydrophobic"),
-    ("cyclohexyl", "[*]C1CCCCC1", "hydrophobic"),
-    ("vinyl", "[*]C=C", "hydrophobic"),
-    ("ethynyl", "[*]C#C", "hydrophobic"),
-    ("hydroxyl", "[*]O", "polar"),
-    ("methoxy", "[*]OC", "polar"),
-    ("ethoxy", "[*]OCC", "polar"),
-    ("isopropoxy", "[*]OC(C)C", "polar"),
-    ("hydroxymethyl", "[*]CO", "polar"),
-    ("2-hydroxyethyl", "[*]CCO", "polar"),
-    ("acetyl", "[*]C(C)=O", "polar"),
-    ("acetamido", "[*]NC(C)=O", "polar"),
-    ("amide(C(=O)NH2)", "[*]C(N)=O", "polar"),
-    ("N-methylamide", "[*]C(=O)NC", "polar"),
-    ("urea", "[*]NC(=O)N", "polar"),
-    ("methylsulfonyl", "[*]S(C)(=O)=O", "polar"),
-    ("sulfonamide-NH2", "[*]S(N)(=O)=O", "polar"),
-    ("amino", "[*]N", "basic"),
-    ("methylamino", "[*]NC", "basic"),
-    ("dimethylamino", "[*]N(C)C", "basic"),
-    ("azetidine", "[*]N1CCC1", "basic"),
-    ("pyrrolidine", "[*]N1CCCC1", "basic"),
-    ("piperidine", "[*]N1CCCCC1", "basic"),
-    ("morpholine", "[*]N1CCOCC1", "basic"),
-    ("piperazine", "[*]N1CCNCC1", "basic"),
-    ("N-methylpiperazine", "[*]N1CCN(C)CC1", "basic"),
-    ("carboxyl", "[*]C(=O)O", "acidic"),
-    ("carboxymethyl", "[*]CC(=O)O", "acidic"),
-    ("sulfonic-acid", "[*]S(=O)(=O)O", "acidic"),
-    ("sulfonamide", "[*]S(N)(=O)=O", "acidic"),
-    ("tetrazole", "[*]c1nnn[nH]1", "acidic"),
-    ("hydroxamic-acid", "[*]C(=O)NO", "acidic"),
-    ("fluoro", "[*]F", "halogen"),
-    ("chloro", "[*]Cl", "halogen"),
-    ("bromo", "[*]Br", "halogen"),
-    ("iodo", "[*]I", "halogen"),
-    ("cyano", "[*]C#N", "halogen"),
-    ("trifluoromethyl", "[*]C(F)(F)F", "halogen"),
-    ("difluoromethyl", "[*]C(F)F", "halogen"),
-    ("trifluoromethoxy", "[*]OC(F)(F)F", "halogen"),
-    ("phenyl", "[*]c1ccccc1", "aromatic"),
-    ("benzyl", "[*]Cc1ccccc1", "aromatic"),
-    ("4-fluorophenyl", "[*]c1ccc(F)cc1", "aromatic"),
-    ("4-chlorophenyl", "[*]c1ccc(Cl)cc1", "aromatic"),
-    ("4-methylphenyl", "[*]c1ccc(C)cc1", "aromatic"),
-    ("4-methoxyphenyl", "[*]c1ccc(OC)cc1", "aromatic"),
-    ("pyridin-2-yl", "[*]c1ccccn1", "aromatic"),
-    ("pyridin-3-yl", "[*]c1cccnc1", "aromatic"),
-    ("pyridin-4-yl", "[*]c1ccncc1", "aromatic"),
-    ("thiophen-2-yl", "[*]c1cccs1", "aromatic"),
-    ("furan-2-yl", "[*]c1ccco1", "aromatic"),
-    ("imidazol-1-yl", "[*]n1ccnc1", "aromatic"),
-    ("pyrazol-1-yl", "[*]n1cccn1", "aromatic"),
-    ("thiazol-2-yl", "[*]c1nccs1", "aromatic"),
-    ("benzimidazolyl", "[*]c1nc2ccccc2[nH]1", "aromatic"),
-    ("indol-3-yl", "[*]c1c[nH]c2ccccc12", "aromatic"),
-    ("2-hydroxyethoxy", "[*]OCCO", "solubility"),
-    ("PEG2", "[*]OCCOC", "solubility"),
-    ("morpholinoethyl", "[*]CCN1CCOCC1", "solubility"),
-    ("morpholine-carbonyl", "[*]C(=O)N1CCOCC1", "solubility"),
-    ("N-methylpiperazine-carbonyl", "[*]C(=O)N1CCN(C)CC1", "solubility"),
-    ("oxetan-3-yl", "[*]C1COC1", "bioisostere"),
-    ("azetidin-3-yl", "[*]C1CNC1", "bioisostere"),
-    ("tetrahydropyran-4-yl", "[*]C1CCOCC1", "bioisostere"),
-    ("cyclopropyl-carbonyl", "[*]C(=O)C1CC1", "bioisostere"),
-    ("difluorocyclopropyl", "[*]C1(F)CC1F", "bioisostere"),
-    ("oxadiazole-methyl", "[*]Cc1nnco1", "bioisostere"),
-    ("triazole-methyl", "[*]Cn1cncn1", "bioisostere"),
-]
-
-
-# ---------------------------------------------------------------------------
-# Extended fragment library — baked in, no extra files needed for deployment
-# 4,551 additional entries (MW ≤ 250 Da, deduplicated vs built-ins)
-# To regenerate: python build_fragment_library.py  (dev tool only, not deployed)
-# ---------------------------------------------------------------------------
-_EXTENDED_ROWS: List[Tuple[str, str, str]] = [
-    ('n-pentyl', '[*]CCCCC', 'hydrophobic'),
-    ('n-hexyl', '[*]CCCCCC', 'hydrophobic'),
-    ('n-heptyl', '[*]CCCCCCC', 'hydrophobic'),
-    ('n-octyl', '[*]CCCCCCCC', 'hydrophobic'),
-    ('sec-butyl', '[*]C(C)CC', 'hydrophobic'),
-    ('neopentyl', '[*]CC(C)(C)C', 'hydrophobic'),
-    ('2-methylbutyl', '[*]CC(C)CC', 'hydrophobic'),
-    ('3-methylbutyl', '[*]CCC(C)C', 'hydrophobic'),
-    ('2-ethylbutyl', '[*]CC(CC)CC', 'hydrophobic'),
-    ('isobutyl', '[*]CC(C)C', 'hydrophobic'),
-    ('cycloheptyl', '[*]C1CCCCCC1', 'hydrophobic'),
-    ('2-methylcyclopropyl', '[*]C1CC1C', 'hydrophobic'),
-    ('3-methylcyclobutyl', '[*]C1CCC1C', 'hydrophobic'),
-    ('4-methylcyclohexyl', '[*]C1CCC(C)CC1', 'hydrophobic'),
-    ('2-methylcyclohexyl', '[*]C1CCCCC1C', 'hydrophobic'),
-    ('spiro[2.2]pentyl', '[*]C1(CC1)C1CC1', 'hydrophobic'),
-    ('bicyclo[1.1.1]pentyl', '[*]C1(CC2)CC12', 'hydrophobic'),
-    ('norbornyl', '[*]C1CC2CCC1C2', 'hydrophobic'),
-    ('gem-dimethylcyclopropyl', '[*]C1(C)CC1C', 'hydrophobic'),
-    ('spiro[3.3]heptyl', '[*]C1CCC12CCC2', 'hydrophobic'),
-    ('n-propoxy', '[*]OCCC', 'polar'),
-    ('n-butoxy', '[*]OCCCC', 'polar'),
-    ('allyloxy', '[*]OCC=C', 'polar'),
-    ('propargyloxy', '[*]OCC#C', 'polar'),
-    ('cyclopropylmethoxy', '[*]OCC1CC1', 'polar'),
-    ('3-methoxypropoxy', '[*]OCCCOC', 'solubility'),
-    ('tetrahydrofurfuryloxy', '[*]OCC1CCCO1', 'polar'),
-    ('methylthio', '[*]SC', 'polar'),
-    ('ethylthio', '[*]SCC', 'polar'),
-    ('phenylthio', '[*]Sc1ccccc1', 'aromatic'),
-    ('methylsulfinyl', '[*]S(C)=O', 'polar'),
-    ('N-ethylamino', '[*]NCC', 'basic'),
-    ('N-propylamino', '[*]NCCC', 'basic'),
-    ('N-isopropylamino', '[*]NC(C)C', 'basic'),
-    ('N-butylamino', '[*]NCCCC', 'basic'),
-    ('N-cyclopropylamino', '[*]NC1CC1', 'basic'),
-    ('N,N-diethylamino', '[*]N(CC)CC', 'basic'),
-    ('N,N-dipropylamino', '[*]N(CCC)CCC', 'basic'),
-    ('methylfluoro', '[*]CF', 'halogen'),
-    ('ethylfluoro', '[*]CCF', 'halogen'),
-    ('methylchloro', '[*]CCl', 'halogen'),
-    ('ethylchloro', '[*]CCCl', 'halogen'),
-    ('methylbromo', '[*]CBr', 'halogen'),
-    ('ethylbromo', '[*]CCBr', 'halogen'),
-    ('gem-difluoroethyl', '[*]CC(F)F', 'halogen'),
-    ('gem-difluoropropyl', '[*]CCC(F)F', 'halogen'),
-    ('2-fluoroethoxy', '[*]OCCF', 'halogen'),
-    ('2,2-difluoroethoxy', '[*]OCC(F)F', 'halogen'),
-    ('3-fluoropropoxy', '[*]OCCCF', 'halogen'),
-    ('3,3-difluoropropoxy', '[*]OCCC(F)F', 'halogen'),
-    ('difluoromethoxy', '[*]OC(F)F', 'halogen'),
-    ('3-fluoropropyl', '[*]CCCF', 'halogen'),
-    ('cyanomethyl', '[*]CC#N', 'halogen'),
-    ('cyanoethyl', '[*]CCC#N', 'halogen'),
-    ('cyanopropyl', '[*]CCCC#N', 'halogen'),
-    ('azepane', '[*]N1CCCCCC1', 'basic'),
-    ('homopiperazine', '[*]N1CCNCCC1', 'basic'),
-    ('thiomorpholine', '[*]N1CCSCC1', 'basic'),
-    ('1,4-oxazepane', '[*]N1CCOCCC1', 'basic'),
-    ('N-methylhomopiperazine', '[*]N1CCNC(C)CC1', 'basic'),
-    ('N-acetylpiperazine', '[*]N1CCN(C(C)=O)CC1', 'basic'),
-    ('N-Boc-piperazine', '[*]N1CCN(C(=O)OC(C)(C)C)CC1', 'basic'),
-    ('piperidin-4-yl', '[*]C1CCNCC1', 'basic'),
-    ('pyrrolidin-3-yl', '[*]C1CCNC1', 'basic'),
-    ('piperidin-4-ylmethyl', '[*]CC1CCNCC1', 'basic'),
-    ('morpholin-2-ylmethyl', '[*]CC1CNCCO1', 'basic'),
-    ('1-methylpiperidin-4-yl', '[*]C1CCN(C)CC1', 'basic'),
-    ('N-ethylamide', '[*]C(=O)NCC', 'polar'),
-    ('N-propylamide', '[*]C(=O)NCCC', 'polar'),
-    ('N-isopropylamide', '[*]C(=O)NC(C)C', 'polar'),
-    ('piperidine-1-carbonyl', '[*]C(=O)N1CCCCC1', 'polar'),
-    ('pyrrolidine-1-carbonyl', '[*]C(=O)N1CCCC1', 'polar'),
-    ('azetidine-1-carbonyl', '[*]C(=O)N1CCC1', 'polar'),
-    ('dimethylaminocarbonyl', '[*]C(=O)N(C)C', 'polar'),
-    ('diethylaminocarbonyl', '[*]C(=O)N(CC)CC', 'polar'),
-    ('N-methylsulfonamide', '[*]S(=O)(=O)NC', 'polar'),
-    ('N-ethylsulfonamide', '[*]S(=O)(=O)NCC', 'polar'),
-    ('N-dimethylsulfonamide', '[*]S(=O)(=O)N(C)C', 'polar'),
-    ('morpholine-4-sulfonyl', '[*]S(=O)(=O)N1CCOCC1', 'polar'),
-    ('piperidine-1-sulfonyl', '[*]S(=O)(=O)N1CCCCC1', 'polar'),
-    ('methoxycarbonyl', '[*]C(=O)OC', 'polar'),
-    ('ethoxycarbonyl', '[*]C(=O)OCC', 'polar'),
-    ('tert-butoxycarbonyl', '[*]C(=O)OC(C)(C)C', 'polar'),
-    ('4-OH-phenyl', '[*]c1ccc(O)cc1', 'aromatic'),
-    ('4-OEt-phenyl', '[*]c1ccc(OCC)cc1', 'aromatic'),
-    ('4-Et-phenyl', '[*]c1ccc(CC)cc1', 'aromatic'),
-    ('4-iPr-phenyl', '[*]c1ccc(C(C)C)cc1', 'aromatic'),
-    ('4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)cc1', 'aromatic'),
-    ('4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('4-Br-phenyl', '[*]c1ccc(Br)cc1', 'aromatic'),
-    ('4-I-phenyl', '[*]c1ccc(I)cc1', 'aromatic'),
-    ('4-CN-phenyl', '[*]c1ccc(C#N)cc1', 'aromatic'),
-    ('4-NH2-phenyl', '[*]c1ccc(N)cc1', 'aromatic'),
-    ('4-NHMe-phenyl', '[*]c1ccc(NC)cc1', 'aromatic'),
-    ('4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1', 'aromatic'),
-    ('4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1', 'aromatic'),
-    ('4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1', 'aromatic'),
-    ('4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1', 'aromatic'),
-    ('4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1', 'aromatic'),
-    ('4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1', 'aromatic'),
-    ('3-F-phenyl', '[*]c1cccc(F)c1', 'aromatic'),
-    ('3-Cl-phenyl', '[*]c1cccc(Cl)c1', 'aromatic'),
-    ('3-Me-phenyl', '[*]c1cccc(C)c1', 'aromatic'),
-    ('3-OMe-phenyl', '[*]c1cccc(OC)c1', 'aromatic'),
-    ('3-CF3-phenyl', '[*]c1cccc(C(F)(F)F)c1', 'aromatic'),
-    ('3-CN-phenyl', '[*]c1cccc(C#N)c1', 'aromatic'),
-    ('2-F-phenyl', '[*]c1ccccc1F', 'aromatic'),
-    ('2-Cl-phenyl', '[*]c1ccccc1Cl', 'aromatic'),
-    ('2-Me-phenyl', '[*]c1ccccc1C', 'aromatic'),
-    ('2-OMe-phenyl', '[*]c1ccccc1OC', 'aromatic'),
-    ('3,4-diF-phenyl', '[*]c1ccc(F)c(F)c1', 'aromatic'),
-    ('3,4-diCl-phenyl', '[*]c1ccc(Cl)c(Cl)c1', 'aromatic'),
-    ('3,5-diF-phenyl', '[*]c1cc(F)cc(F)c1', 'aromatic'),
-    ('3,5-diCl-phenyl', '[*]c1cc(Cl)cc(Cl)c1', 'aromatic'),
-    ('3,4-diMe-phenyl', '[*]c1ccc(C)c(C)c1', 'aromatic'),
-    ('4-F-3-Me-phenyl', '[*]c1ccc(F)cc1C', 'aromatic'),
-    ('4-Cl-3-CF3-phenyl', '[*]c1ccc(Cl)cc1C(F)(F)F', 'aromatic'),
-    ('4-OMe-3-F-phenyl', '[*]c1ccc(OC)c(F)c1', 'aromatic'),
-    ('3-OMe-4-F-phenyl', '[*]c1ccc(F)c(OC)c1', 'aromatic'),
-    ('2,4-diF-phenyl', '[*]c1ccc(F)cc1F', 'aromatic'),
-    ('2,4-diCl-phenyl', '[*]c1ccc(Cl)cc1Cl', 'aromatic'),
-    ('2,6-diF-phenyl', '[*]c1c(F)cccc1F', 'aromatic'),
-    ('2,6-diCl-phenyl', '[*]c1c(Cl)cccc1Cl', 'aromatic'),
-    ('2,3-diF-phenyl', '[*]c1cccc(F)c1F', 'aromatic'),
-    ('3,4,5-triF-phenyl', '[*]c1cc(F)c(F)c(F)c1', 'aromatic'),
-    ('3,5-diMe-phenyl', '[*]c1c(C)cccc1C', 'aromatic'),
-    ('pyrimidin-2-yl', '[*]c1ncccn1', 'aromatic'),
-    ('pyrimidin-4-yl', '[*]c1ccncn1', 'aromatic'),
-    ('pyrimidin-5-yl', '[*]c1cncnc1', 'aromatic'),
-    ('pyrazin-2-yl', '[*]c1cnccn1', 'aromatic'),
-    ('pyridazin-3-yl', '[*]c1ccnnc1', 'aromatic'),
-    ('thiophen-3-yl', '[*]c1ccsc1', 'aromatic'),
-    ('furan-3-yl', '[*]c1ccoc1', 'aromatic'),
-    ('imidazol-2-yl', '[*]c1ncc[nH]1', 'aromatic'),
-    ('imidazol-4-yl', '[*]c1c[nH]cn1', 'aromatic'),
-    ('1,2,4-triazol-1-yl', '[*]n1cncn1', 'aromatic'),
-    ('1,2,3-triazol-1-yl', '[*]n1ccnn1', 'aromatic'),
-    ('1,2,3-triazol-4-yl', '[*]c1cnn[nH]1', 'aromatic'),
-    ('oxazol-2-yl', '[*]c1ncco1', 'aromatic'),
-    ('oxazol-4-yl', '[*]c1cnco1', 'aromatic'),
-    ('isoxazol-3-yl', '[*]c1cc(no1)', 'aromatic'),
-    ('isoxazol-5-yl', '[*]c1cc(on1)', 'aromatic'),
-    ('isoxazol-4-yl', '[*]c1conc1', 'aromatic'),
-    ('thiazol-4-yl', '[*]c1cncs1', 'aromatic'),
-    ('isothiazol-3-yl', '[*]c1ccns1', 'aromatic'),
-    ('1,3,4-oxadiazol-2-yl', '[*]c1nnco1', 'aromatic'),
-    ('1,2,4-oxadiazol-3-yl', '[*]c1ncno1', 'aromatic'),
-    ('1,3,4-thiadiazol-2-yl', '[*]c1nncs1', 'aromatic'),
-    ('1,2,4-thiadiazol-3-yl', '[*]c1ncns1', 'aromatic'),
-    ('5-Me-pyridin-2-yl', '[*]c1ccc(C)cn1', 'aromatic'),
-    ('5-F-pyridin-2-yl', '[*]c1ccc(F)cn1', 'aromatic'),
-    ('5-Cl-pyridin-2-yl', '[*]c1ccc(Cl)cn1', 'aromatic'),
-    ('5-CF3-pyridin-2-yl', '[*]c1ccc(C(F)(F)F)cn1', 'aromatic'),
-    ('6-Me-pyridin-2-yl', '[*]c1cccc(C)n1', 'aromatic'),
-    ('4-Me-pyridin-2-yl', '[*]c1cc(C)ccn1', 'aromatic'),
-    ('3-F-pyridin-2-yl', '[*]c1cccc(F)n1', 'aromatic'),
-    ('5-Me-pyridin-3-yl', '[*]c1cncc(C)c1', 'aromatic'),
-    ('6-Me-pyridin-3-yl', '[*]c1ccc(C)nc1', 'aromatic'),
-    ('2-Me-pyridin-4-yl', '[*]c1cc(C)ncc1', 'aromatic'),
-    ('5-Me-pyrimidin-2-yl', '[*]c1ncc(C)cn1', 'aromatic'),
-    ('4-OMe-pyrimidin-2-yl', '[*]c1nc(OC)ccn1', 'aromatic'),
-    ('4-NH2-pyrimidin-2-yl', '[*]c1nc(N)ccn1', 'aromatic'),
-    ('5-Me-thiophen-2-yl', '[*]c1ccc(C)s1', 'aromatic'),
-    ('4-Me-thiophen-2-yl', '[*]c1cc(C)cs1', 'aromatic'),
-    ('5-F-thiophen-2-yl', '[*]c1ccc(F)s1', 'aromatic'),
-    ('3-Me-thiophen-2-yl', '[*]c1ccsc1C', 'aromatic'),
-    ('4-Me-furan-2-yl', '[*]c1cc(C)co1', 'aromatic'),
-    ('5-Me-furan-2-yl', '[*]c1ccc(C)o1', 'aromatic'),
-    ('3-Me-furan-2-yl', '[*]c1ccoc1C', 'aromatic'),
-    ('1-Me-pyrazol-3-yl', '[*]c1ccn(C)n1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl', '[*]c1cn(C)nc1', 'aromatic'),
-    ('4-Me-oxazol-2-yl', '[*]c1nc(C)co1', 'aromatic'),
-    ('5-Me-oxazol-2-yl', '[*]c1ncc(C)o1', 'aromatic'),
-    ('4-Me-thiazol-2-yl', '[*]c1nc(C)cs1', 'aromatic'),
-    ('5-Me-thiazol-2-yl', '[*]c1sc(C)nc1', 'aromatic'),
-    ('4-CF3-thiazol-2-yl', '[*]c1nc(C(F)(F)F)cs1', 'aromatic'),
-    ('benzofuran-2-yl', '[*]c1cc2ccccc2o1', 'aromatic'),
-    ('benzofuran-5-yl', '[*]c1ccc2occc2c1', 'aromatic'),
-    ('benzothiophen-2-yl', '[*]c1cc2ccccc2s1', 'aromatic'),
-    ('benzothiophen-5-yl', '[*]c1ccc2sccc2c1', 'aromatic'),
-    ('benzoxazol-2-yl', '[*]c1nc2ccccc2o1', 'aromatic'),
-    ('benzoxazol-5-yl', '[*]c1ccc2nc(oc2c1)', 'aromatic'),
-    ('benzothiazol-2-yl', '[*]c1nc2ccccc2s1', 'aromatic'),
-    ('benzothiazol-5-yl', '[*]c1ccc2nc(sc2c1)', 'aromatic'),
-    ('1H-indol-2-yl', '[*]c1cc2ccccc2[nH]1', 'aromatic'),
-    ('1H-indol-5-yl', '[*]c1ccc2[nH]ccc2c1', 'aromatic'),
-    ('isoindol-5-yl', '[*]c1ccc2cc[nH]c2c1', 'aromatic'),
-    ('1H-indazol-5-yl', '[*]c1ccc2[nH]ncc2c1', 'aromatic'),
-    ('quinolin-2-yl', '[*]c1ccc2ncccc2c1', 'aromatic'),
-    ('quinolin-3-yl', '[*]c1cnc2ccccc2c1', 'aromatic'),
-    ('quinolin-6-yl', '[*]c1ccc2cccnc2c1', 'aromatic'),
-    ('isoquinolin-1-yl', '[*]c1nccc2ccccc12', 'aromatic'),
-    ('chroman-6-yl', '[*]c1ccc2CCCOc2c1', 'aromatic'),
-    ('octahydroindol-1-yl', '[*]N1CCCCC1C1CCCC1', 'basic'),
-    ('decahydroquinolin-1-yl', '[*]N1CCCCC2CCCCC12', 'basic'),
-    ('2-azabicyclo[2.2.1]hept-5-en-2-yl', '[*]N1CC2CC1C=C2', 'basic'),
-    ('3-azabicyclo[3.1.0]hexyl', '[*]N1CCC2(C1)CC2', 'basic'),
-    ('2-oxa-5-azabicyclo[2.2.1]heptyl', '[*]N1CC2COC1C2', 'basic'),
-    ('oxetan-2-yl', '[*]C1CCO1', 'bioisostere'),
-    ('3-methyloxetan-3-yl', '[*]C1(C)COC1', 'bioisostere'),
-    ('oxetane-3-methyl', '[*]CC1COC1', 'bioisostere'),
-    ('tetrahydrofuran-2-yl', '[*]C1CCCO1', 'polar'),
-    ('tetrahydrofuran-3-yl', '[*]C1COCC1', 'polar'),
-    ('tetrahydrofurfuryl', '[*]CC1CCCO1', 'polar'),
-    ('tetrahydropyran-2-yl', '[*]C1CCCCO1', 'bioisostere'),
-    ('1,3-dioxolan-2-yl', '[*]C1OCCO1', 'polar'),
-    ('1,3-dioxan-2-yl', '[*]C1OCCCO1', 'polar'),
-    ('1-methylazetidine-3-yl', '[*]C1CN(C)C1', 'bioisostere'),
-    ('thietane-3-yl', '[*]C1CSC1', 'bioisostere'),
-    ('1,3-dithian-2-yl', '[*]C1SCCCS1', 'polar'),
-    ('PEG2_2', '[*]OCCOCCO', 'solubility'),
-    ('4-hydroxyalkyl-4', '[*]CCCO', 'solubility'),
-    ('5-hydroxyalkyl-5', '[*]CCCCO', 'solubility'),
-    ('morpholinomethyl', '[*]CN1CCOCC1', 'solubility'),
-    ('3-morpholinopropyl', '[*]CCCN1CCOCC1', 'solubility'),
-    ('piperidinomethyl', '[*]CN1CCCCC1', 'solubility'),
-    ('piperazinomethyl', '[*]CN1CCNCC1', 'solubility'),
-    ('N-methylpiperazinomethyl', '[*]CN1CCN(C)CC1', 'solubility'),
-    ('2-piperidinoethyl', '[*]CCN1CCCCC1', 'solubility'),
-    ('4-hydroxymethylpiperidyl', '[*]C1CCN(CC)CC1', 'solubility'),
-    ('3-hydroxypyrrolidyl', '[*]N1CCC(O)C1', 'solubility'),
-    ('3-hydroxymethylpiperidyl', '[*]N1CCCC(CO)C1', 'solubility'),
-    ('dimethylaminoethyl', '[*]CCN(C)C', 'solubility'),
-    ('dimethylaminopropyl', '[*]CCCN(C)C', 'solubility'),
-    ('3-aminopropyl', '[*]CCCN', 'basic'),
-    ('4-aminobutyl', '[*]CCCCN', 'basic'),
-    ('2-aminoethoxy', '[*]OCCN', 'solubility'),
-    ('tetrazole-CH2', '[*]Cc1nnn[nH]1', 'bioisostere'),
-    ('acylsulfonamide', '[*]C(=O)NS(C)(=O)=O', 'bioisostere'),
-    ('1-Me-tetrazol-5-yl', '[*]c1nnn(C)n1', 'bioisostere'),
-    ('cyanamide', '[*]NC#N', 'bioisostere'),
-    ('oxadiazol-2-one', '[*]c1nncn1O', 'bioisostere'),
-    ('thiadiazolyl-methyl', '[*]Cc1nncs1', 'bioisostere'),
-    ('bicyclo[1.1.1]pent-1-yl', '[*]C12CC(CC1)C2', 'bioisostere'),
-    ('1-methylcyclopropyl', '[*]C1(C)CC1', 'bioisostere'),
-    ('1-fluorocyclopropyl', '[*]C1(F)CC1', 'bioisostere'),
-    ('1-trifluoromethylcyclopropyl', '[*]C1(C(F)(F)F)CC1', 'bioisostere'),
-    ('1-oxa-6-azaspiro[3.3]heptyl', '[*]N1CC2(COC2)C1', 'bioisostere'),
-    ('3-azaspiro[3.3]heptyl', '[*]N1CCC1(CC1)C1', 'bioisostere'),
-    ('6-oxa-1-azaspiro[3.3]heptyl', '[*]N1CCC12OCC2', 'bioisostere'),
-    ('1,2,3-triazol-4-ylmethyl', '[*]Cc1cnn[nH]1', 'bioisostere'),
-    ('propargyl', '[*]CC#C', 'bioisostere'),
-    ('prop-1-en-2-yl', '[*]C(=C)C', 'bioisostere'),
-    ('4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1', 'halogen'),
-    ('4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1', 'halogen'),
-    ('4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1', 'polar'),
-    ('4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1', 'polar'),
-    ('4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1', 'aromatic'),
-    ('4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1', 'basic'),
-    ('4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1', 'basic'),
-    ('4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1', 'basic'),
-    ('3-Br-phenyl', '[*]c1cccc(Br)c1', 'aromatic'),
-    ('3-Et-phenyl', '[*]c1cccc(CC)c1', 'aromatic'),
-    ('3-iPr-phenyl', '[*]c1cccc(C(C)C)c1', 'aromatic'),
-    ('3-tBu-phenyl', '[*]c1cccc(C(C)(C)C)c1', 'aromatic'),
-    ('3-OEt-phenyl', '[*]c1cccc(OCC)c1', 'aromatic'),
-    ('3-OH-phenyl', '[*]c1cccc(O)c1', 'aromatic'),
-    ('3-CHF2-phenyl', '[*]c1cccc(C(F)F)c1', 'aromatic'),
-    ('3-OCF3-phenyl', '[*]c1cccc(OC(F)(F)F)c1', 'aromatic'),
-    ('3-NH2-phenyl', '[*]c1cccc(N)c1', 'aromatic'),
-    ('3-NHMe-phenyl', '[*]c1cccc(NC)c1', 'aromatic'),
-    ('3-NMe2-phenyl', '[*]c1cccc(N(C)C)c1', 'aromatic'),
-    ('3-COOH-phenyl', '[*]c1cccc(C(=O)O)c1', 'aromatic'),
-    ('3-COOMe-phenyl', '[*]c1cccc(C(=O)OC)c1', 'aromatic'),
-    ('3-COMe-phenyl', '[*]c1cccc(C(C)=O)c1', 'aromatic'),
-    ('3-SO2Me-phenyl', '[*]c1cccc(S(C)(=O)=O)c1', 'aromatic'),
-    ('3-SO2NH2-phenyl', '[*]c1cccc(S(N)(=O)=O)c1', 'aromatic'),
-    ('3-NHAc-phenyl', '[*]c1cccc(NC(C)=O)c1', 'aromatic'),
-    ('3-NHSO2Me-phenyl', '[*]c1cccc(NS(C)(=O)=O)c1', 'aromatic'),
-    ('3-cyclopropyl-phenyl', '[*]c1cccc(C1CC1)c1', 'aromatic'),
-    ('3-morpholino-phenyl', '[*]c1cccc(N1CCOCC1)c1', 'aromatic'),
-    ('3-piperidino-phenyl', '[*]c1cccc(N1CCCCC1)c1', 'aromatic'),
-    ('3-pyrrolidino-phenyl', '[*]c1cccc(N1CCCC1)c1', 'aromatic'),
-    ('2-Br-phenyl', '[*]c1ccccc1Br', 'aromatic'),
-    ('2-Et-phenyl', '[*]c1ccccc1CC', 'aromatic'),
-    ('2-iPr-phenyl', '[*]c1ccccc1C(C)C', 'aromatic'),
-    ('2-tBu-phenyl', '[*]c1ccccc1C(C)(C)C', 'aromatic'),
-    ('2-OEt-phenyl', '[*]c1ccccc1OCC', 'aromatic'),
-    ('2-OH-phenyl', '[*]c1ccccc1O', 'aromatic'),
-    ('2-CF3-phenyl', '[*]c1ccccc1C(F)(F)F', 'aromatic'),
-    ('2-CHF2-phenyl', '[*]c1ccccc1C(F)F', 'aromatic'),
-    ('2-OCF3-phenyl', '[*]c1ccccc1OC(F)(F)F', 'aromatic'),
-    ('2-CN-phenyl', '[*]c1ccccc1C#N', 'aromatic'),
-    ('2-NH2-phenyl', '[*]c1ccccc1N', 'aromatic'),
-    ('2-NHMe-phenyl', '[*]c1ccccc1NC', 'aromatic'),
-    ('2-NMe2-phenyl', '[*]c1ccccc1N(C)C', 'aromatic'),
-    ('2-COOH-phenyl', '[*]c1ccccc1C(=O)O', 'aromatic'),
-    ('2-COOMe-phenyl', '[*]c1ccccc1C(=O)OC', 'aromatic'),
-    ('2-COMe-phenyl', '[*]c1ccccc1C(C)=O', 'aromatic'),
-    ('2-SO2Me-phenyl', '[*]c1ccccc1S(C)(=O)=O', 'aromatic'),
-    ('2-SO2NH2-phenyl', '[*]c1ccccc1S(N)(=O)=O', 'aromatic'),
-    ('2-NHAc-phenyl', '[*]c1ccccc1NC(C)=O', 'aromatic'),
-    ('2-NHSO2Me-phenyl', '[*]c1ccccc1NS(C)(=O)=O', 'aromatic'),
-    ('2-cyclopropyl-phenyl', '[*]c1ccccc1C1CC1', 'aromatic'),
-    ('2-morpholino-phenyl', '[*]c1ccccc1N1CCOCC1', 'aromatic'),
-    ('2-piperidino-phenyl', '[*]c1ccccc1N1CCCCC1', 'aromatic'),
-    ('2-pyrrolidino-phenyl', '[*]c1ccccc1N1CCCC1', 'aromatic'),
-    ('3-F-4-Cl-phenyl', '[*]c1ccc(Cl)c(F)c1', 'aromatic'),
-    ('3-F-4-Br-phenyl', '[*]c1ccc(Br)c(F)c1', 'aromatic'),
-    ('3-F-4-Me-phenyl', '[*]c1ccc(C)c(F)c1', 'aromatic'),
-    ('3-F-4-Et-phenyl', '[*]c1ccc(CC)c(F)c1', 'aromatic'),
-    ('3-F-4-iPr-phenyl', '[*]c1ccc(C(C)C)c(F)c1', 'aromatic'),
-    ('3-F-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)c(F)c1', 'aromatic'),
-    ('3-F-4-OEt-phenyl', '[*]c1ccc(OCC)c(F)c1', 'aromatic'),
-    ('3-F-4-OH-phenyl', '[*]c1ccc(O)c(F)c1', 'aromatic'),
-    ('3-F-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(F)c1', 'aromatic'),
-    ('3-F-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(F)c1', 'aromatic'),
-    ('3-F-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(F)c1', 'aromatic'),
-    ('3-F-4-CN-phenyl', '[*]c1ccc(C#N)c(F)c1', 'aromatic'),
-    ('3-F-4-NH2-phenyl', '[*]c1ccc(N)c(F)c1', 'aromatic'),
-    ('3-F-4-NHMe-phenyl', '[*]c1ccc(NC)c(F)c1', 'aromatic'),
-    ('3-F-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(F)c1', 'aromatic'),
-    ('3-F-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(F)c1', 'aromatic'),
-    ('3-F-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(F)c1', 'aromatic'),
-    ('3-F-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(F)c1', 'aromatic'),
-    ('3-F-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(F)c1', 'aromatic'),
-    ('3-F-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(F)c1', 'aromatic'),
-    ('3-F-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(F)c1', 'aromatic'),
-    ('3-F-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(F)c1', 'aromatic'),
-    ('3-F-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(F)c1', 'aromatic'),
-    ('3-F-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(F)c1', 'aromatic'),
-    ('3-F-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(F)c1', 'aromatic'),
-    ('3-F-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(F)c1', 'aromatic'),
-    ('3-Cl-4-Br-phenyl', '[*]c1ccc(Br)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-Me-phenyl', '[*]c1ccc(C)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-Et-phenyl', '[*]c1ccc(CC)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-iPr-phenyl', '[*]c1ccc(C(C)C)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-OMe-phenyl', '[*]c1ccc(OC)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-OEt-phenyl', '[*]c1ccc(OCC)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-OH-phenyl', '[*]c1ccc(O)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-CN-phenyl', '[*]c1ccc(C#N)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-NH2-phenyl', '[*]c1ccc(N)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-NHMe-phenyl', '[*]c1ccc(NC)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(Cl)c1', 'aromatic'),
-    ('3-Cl-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(Cl)c1', 'aromatic'),
-    ('3-Br-4-Me-phenyl', '[*]c1ccc(C)c(Br)c1', 'aromatic'),
-    ('3-Br-4-Et-phenyl', '[*]c1ccc(CC)c(Br)c1', 'aromatic'),
-    ('3-Br-4-iPr-phenyl', '[*]c1ccc(C(C)C)c(Br)c1', 'aromatic'),
-    ('3-Br-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)c(Br)c1', 'aromatic'),
-    ('3-Br-4-OMe-phenyl', '[*]c1ccc(OC)c(Br)c1', 'aromatic'),
-    ('3-Br-4-OEt-phenyl', '[*]c1ccc(OCC)c(Br)c1', 'aromatic'),
-    ('3-Br-4-OH-phenyl', '[*]c1ccc(O)c(Br)c1', 'aromatic'),
-    ('3-Br-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(Br)c1', 'aromatic'),
-    ('3-Br-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(Br)c1', 'aromatic'),
-    ('3-Br-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(Br)c1', 'aromatic'),
-    ('3-Br-4-CN-phenyl', '[*]c1ccc(C#N)c(Br)c1', 'aromatic'),
-    ('3-Br-4-NH2-phenyl', '[*]c1ccc(N)c(Br)c1', 'aromatic'),
-    ('3-Br-4-NHMe-phenyl', '[*]c1ccc(NC)c(Br)c1', 'aromatic'),
-    ('3-Br-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(Br)c1', 'aromatic'),
-    ('3-Br-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(Br)c1', 'aromatic'),
-    ('3-Br-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(Br)c1', 'aromatic'),
-    ('3-Br-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(Br)c1', 'aromatic'),
-    ('3-Br-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(Br)c1', 'aromatic'),
-    ('3-Br-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(Br)c1', 'aromatic'),
-    ('3-Br-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(Br)c1', 'aromatic'),
-    ('3-Br-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(Br)c1', 'aromatic'),
-    ('3-Br-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(Br)c1', 'aromatic'),
-    ('3-Br-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(Br)c1', 'aromatic'),
-    ('3-Br-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(Br)c1', 'aromatic'),
-    ('3-Me-4-Et-phenyl', '[*]c1ccc(CC)c(C)c1', 'aromatic'),
-    ('3-Me-4-iPr-phenyl', '[*]c1ccc(C(C)C)c(C)c1', 'aromatic'),
-    ('3-Me-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)c(C)c1', 'aromatic'),
-    ('3-Me-4-OMe-phenyl', '[*]c1ccc(OC)c(C)c1', 'aromatic'),
-    ('3-Me-4-OEt-phenyl', '[*]c1ccc(OCC)c(C)c1', 'aromatic'),
-    ('3-Me-4-OH-phenyl', '[*]c1ccc(O)c(C)c1', 'aromatic'),
-    ('3-Me-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(C)c1', 'aromatic'),
-    ('3-Me-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(C)c1', 'aromatic'),
-    ('3-Me-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(C)c1', 'aromatic'),
-    ('3-Me-4-CN-phenyl', '[*]c1ccc(C#N)c(C)c1', 'aromatic'),
-    ('3-Me-4-NH2-phenyl', '[*]c1ccc(N)c(C)c1', 'aromatic'),
-    ('3-Me-4-NHMe-phenyl', '[*]c1ccc(NC)c(C)c1', 'aromatic'),
-    ('3-Me-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(C)c1', 'aromatic'),
-    ('3-Me-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(C)c1', 'aromatic'),
-    ('3-Me-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(C)c1', 'aromatic'),
-    ('3-Me-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(C)c1', 'aromatic'),
-    ('3-Me-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(C)c1', 'aromatic'),
-    ('3-Me-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(C)c1', 'aromatic'),
-    ('3-Me-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(C)c1', 'aromatic'),
-    ('3-Me-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(C)c1', 'aromatic'),
-    ('3-Me-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(C)c1', 'aromatic'),
-    ('3-Me-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(C)c1', 'aromatic'),
-    ('3-Me-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(C)c1', 'aromatic'),
-    ('3-Me-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(C)c1', 'aromatic'),
-    ('3-Et-4-iPr-phenyl', '[*]c1ccc(C(C)C)c(CC)c1', 'aromatic'),
-    ('3-Et-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)c(CC)c1', 'aromatic'),
-    ('3-Et-4-OMe-phenyl', '[*]c1ccc(OC)c(CC)c1', 'aromatic'),
-    ('3-Et-4-OEt-phenyl', '[*]c1ccc(OCC)c(CC)c1', 'aromatic'),
-    ('3-Et-4-OH-phenyl', '[*]c1ccc(O)c(CC)c1', 'aromatic'),
-    ('3-Et-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(CC)c1', 'aromatic'),
-    ('3-Et-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(CC)c1', 'aromatic'),
-    ('3-Et-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(CC)c1', 'aromatic'),
-    ('3-Et-4-CN-phenyl', '[*]c1ccc(C#N)c(CC)c1', 'aromatic'),
-    ('3-Et-4-NH2-phenyl', '[*]c1ccc(N)c(CC)c1', 'aromatic'),
-    ('3-Et-4-NHMe-phenyl', '[*]c1ccc(NC)c(CC)c1', 'aromatic'),
-    ('3-Et-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(CC)c1', 'aromatic'),
-    ('3-Et-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(CC)c1', 'aromatic'),
-    ('3-Et-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(CC)c1', 'aromatic'),
-    ('3-Et-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(CC)c1', 'aromatic'),
-    ('3-Et-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(CC)c1', 'aromatic'),
-    ('3-Et-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(CC)c1', 'aromatic'),
-    ('3-Et-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(CC)c1', 'aromatic'),
-    ('3-Et-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(CC)c1', 'aromatic'),
-    ('3-Et-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(CC)c1', 'aromatic'),
-    ('3-Et-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(CC)c1', 'aromatic'),
-    ('3-Et-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(CC)c1', 'aromatic'),
-    ('3-Et-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(CC)c1', 'aromatic'),
-    ('3-iPr-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-OMe-phenyl', '[*]c1ccc(OC)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-OEt-phenyl', '[*]c1ccc(OCC)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-OH-phenyl', '[*]c1ccc(O)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-CN-phenyl', '[*]c1ccc(C#N)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-NH2-phenyl', '[*]c1ccc(N)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-NHMe-phenyl', '[*]c1ccc(NC)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(C(C)C)c1', 'aromatic'),
-    ('3-iPr-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(C(C)C)c1', 'aromatic'),
-    ('3-tBu-4-OMe-phenyl', '[*]c1ccc(OC)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-OEt-phenyl', '[*]c1ccc(OCC)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-OH-phenyl', '[*]c1ccc(O)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-CN-phenyl', '[*]c1ccc(C#N)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-NH2-phenyl', '[*]c1ccc(N)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-NHMe-phenyl', '[*]c1ccc(NC)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-tBu-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(C(C)(C)C)c1', 'aromatic'),
-    ('3-OMe-4-OEt-phenyl', '[*]c1ccc(OCC)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-OH-phenyl', '[*]c1ccc(O)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-CN-phenyl', '[*]c1ccc(C#N)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-NH2-phenyl', '[*]c1ccc(N)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-NHMe-phenyl', '[*]c1ccc(NC)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(OC)c1', 'aromatic'),
-    ('3-OEt-4-OH-phenyl', '[*]c1ccc(O)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-CN-phenyl', '[*]c1ccc(C#N)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-NH2-phenyl', '[*]c1ccc(N)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-NHMe-phenyl', '[*]c1ccc(NC)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(OCC)c1', 'aromatic'),
-    ('3-OEt-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(OCC)c1', 'aromatic'),
-    ('3-OH-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(O)c1', 'aromatic'),
-    ('3-OH-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(O)c1', 'aromatic'),
-    ('3-OH-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(O)c1', 'aromatic'),
-    ('3-OH-4-CN-phenyl', '[*]c1ccc(C#N)c(O)c1', 'aromatic'),
-    ('3-OH-4-NH2-phenyl', '[*]c1ccc(N)c(O)c1', 'aromatic'),
-    ('3-OH-4-NHMe-phenyl', '[*]c1ccc(NC)c(O)c1', 'aromatic'),
-    ('3-OH-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(O)c1', 'aromatic'),
-    ('3-OH-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(O)c1', 'aromatic'),
-    ('3-OH-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(O)c1', 'aromatic'),
-    ('3-OH-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(O)c1', 'aromatic'),
-    ('3-OH-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(O)c1', 'aromatic'),
-    ('3-OH-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(O)c1', 'aromatic'),
-    ('3-OH-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(O)c1', 'aromatic'),
-    ('3-OH-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(O)c1', 'aromatic'),
-    ('3-OH-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(O)c1', 'aromatic'),
-    ('3-OH-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(O)c1', 'aromatic'),
-    ('3-OH-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(O)c1', 'aromatic'),
-    ('3-OH-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(O)c1', 'aromatic'),
-    ('3-CF3-4-CHF2-phenyl', '[*]c1ccc(C(F)F)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-CN-phenyl', '[*]c1ccc(C#N)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-NH2-phenyl', '[*]c1ccc(N)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-NHMe-phenyl', '[*]c1ccc(NC)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-CN-phenyl', '[*]c1ccc(C#N)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-NH2-phenyl', '[*]c1ccc(N)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-NHMe-phenyl', '[*]c1ccc(NC)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(C(F)F)c1', 'aromatic'),
-    ('3-CHF2-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(C(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-CN-phenyl', '[*]c1ccc(C#N)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-NH2-phenyl', '[*]c1ccc(N)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-NHMe-phenyl', '[*]c1ccc(NC)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-OCF3-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(OC(F)(F)F)c1', 'aromatic'),
-    ('3-CN-4-NH2-phenyl', '[*]c1ccc(N)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-NHMe-phenyl', '[*]c1ccc(NC)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(C#N)c1', 'aromatic'),
-    ('3-NH2-4-NHMe-phenyl', '[*]c1ccc(NC)c(N)c1', 'aromatic'),
-    ('3-NH2-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(N)c1', 'aromatic'),
-    ('3-NH2-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(N)c1', 'aromatic'),
-    ('3-NH2-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(N)c1', 'aromatic'),
-    ('3-NH2-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(N)c1', 'aromatic'),
-    ('3-NH2-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(N)c1', 'aromatic'),
-    ('3-NH2-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(N)c1', 'aromatic'),
-    ('3-NH2-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(N)c1', 'aromatic'),
-    ('3-NH2-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(N)c1', 'aromatic'),
-    ('3-NH2-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(N)c1', 'aromatic'),
-    ('3-NH2-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(N)c1', 'aromatic'),
-    ('3-NH2-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(N)c1', 'aromatic'),
-    ('3-NH2-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(N)c1', 'aromatic'),
-    ('3-NHMe-4-NMe2-phenyl', '[*]c1ccc(N(C)C)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(NC)c1', 'aromatic'),
-    ('3-NHMe-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(NC)c1', 'aromatic'),
-    ('3-NMe2-4-COOH-phenyl', '[*]c1ccc(C(=O)O)c(N(C)C)c1', 'aromatic'),
-    ('3-NMe2-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(N(C)C)c1', 'aromatic'),
-    ('3-NMe2-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(N(C)C)c1', 'aromatic'),
-    ('3-NMe2-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(N(C)C)c1', 'aromatic'),
-    ('3-NMe2-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(N(C)C)c1', 'aromatic'),
-    ('3-NMe2-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(N(C)C)c1', 'aromatic'),
-    ('3-NMe2-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(N(C)C)c1', 'aromatic'),
-    ('3-NMe2-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(N(C)C)c1', 'aromatic'),
-    ('3-NMe2-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(N(C)C)c1', 'aromatic'),
-    ('3-NMe2-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(N(C)C)c1', 'aromatic'),
-    ('3-NMe2-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(N(C)C)c1', 'aromatic'),
-    ('3-COOH-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)c(C(=O)O)c1', 'aromatic'),
-    ('3-COOH-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(C(=O)O)c1', 'aromatic'),
-    ('3-COOH-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(C(=O)O)c1', 'aromatic'),
-    ('3-COOH-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(C(=O)O)c1', 'aromatic'),
-    ('3-COOH-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(C(=O)O)c1', 'aromatic'),
-    ('3-COOH-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(C(=O)O)c1', 'aromatic'),
-    ('3-COOH-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(C(=O)O)c1', 'aromatic'),
-    ('3-COOH-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(C(=O)O)c1', 'aromatic'),
-    ('3-COOH-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(C(=O)O)c1', 'aromatic'),
-    ('3-COOH-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(C(=O)O)c1', 'aromatic'),
-    ('3-COOMe-4-COMe-phenyl', '[*]c1ccc(C(C)=O)c(C(=O)OC)c1', 'aromatic'),
-    ('3-COOMe-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(C(=O)OC)c1', 'aromatic'),
-    ('3-COOMe-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(C(=O)OC)c1', 'aromatic'),
-    ('3-COOMe-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(C(=O)OC)c1', 'aromatic'),
-    ('3-COOMe-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(C(=O)OC)c1', 'aromatic'),
-    ('3-COOMe-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(C(=O)OC)c1', 'aromatic'),
-    ('3-COOMe-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(C(=O)OC)c1', 'aromatic'),
-    ('3-COOMe-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(C(=O)OC)c1', 'aromatic'),
-    ('3-COOMe-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(C(=O)OC)c1', 'aromatic'),
-    ('3-COMe-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)c(C(C)=O)c1', 'aromatic'),
-    ('3-COMe-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(C(C)=O)c1', 'aromatic'),
-    ('3-COMe-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(C(C)=O)c1', 'aromatic'),
-    ('3-COMe-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(C(C)=O)c1', 'aromatic'),
-    ('3-COMe-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(C(C)=O)c1', 'aromatic'),
-    ('3-COMe-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(C(C)=O)c1', 'aromatic'),
-    ('3-COMe-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(C(C)=O)c1', 'aromatic'),
-    ('3-COMe-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(C(C)=O)c1', 'aromatic'),
-    ('3-SO2Me-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)c(S(C)(=O)=O)c1', 'aromatic'),
-    ('3-SO2Me-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(S(C)(=O)=O)c1', 'aromatic'),
-    ('3-SO2Me-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(S(C)(=O)=O)c1', 'aromatic'),
-    ('3-SO2Me-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(S(C)(=O)=O)c1', 'aromatic'),
-    ('3-SO2Me-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(S(C)(=O)=O)c1', 'aromatic'),
-    ('3-SO2Me-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(S(C)(=O)=O)c1', 'aromatic'),
-    ('3-SO2Me-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(S(C)(=O)=O)c1', 'aromatic'),
-    ('3-SO2NH2-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)c(S(N)(=O)=O)c1', 'aromatic'),
-    ('3-SO2NH2-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(S(N)(=O)=O)c1', 'aromatic'),
-    ('3-SO2NH2-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(S(N)(=O)=O)c1', 'aromatic'),
-    ('3-SO2NH2-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(S(N)(=O)=O)c1', 'aromatic'),
-    ('3-SO2NH2-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(S(N)(=O)=O)c1', 'aromatic'),
-    ('3-NHAc-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)c(NC(C)=O)c1', 'aromatic'),
-    ('3-NHAc-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(NC(C)=O)c1', 'aromatic'),
-    ('3-NHAc-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(NC(C)=O)c1', 'aromatic'),
-    ('3-NHAc-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(NC(C)=O)c1', 'aromatic'),
-    ('3-NHAc-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(NC(C)=O)c1', 'aromatic'),
-    ('3-NHSO2Me-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)c(NS(C)(=O)=O)c1', 'aromatic'),
-    ('3-NHSO2Me-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(NS(C)(=O)=O)c1', 'aromatic'),
-    ('3-cyclopropyl-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)c(C1CC1)c1', 'aromatic'),
-    ('3-cyclopropyl-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(C1CC1)c1', 'aromatic'),
-    ('3-cyclopropyl-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(C1CC1)c1', 'aromatic'),
-    ('3-morpholino-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)c(N1CCOCC1)c1', 'aromatic'),
-    ('3-morpholino-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(N1CCOCC1)c1', 'aromatic'),
-    ('3-piperidino-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)c(N1CCCCC1)c1', 'aromatic'),
-    ('2-F-4-Cl-phenyl', '[*]c1ccc(Cl)cc1F', 'aromatic'),
-    ('2-F-4-Br-phenyl', '[*]c1ccc(Br)cc1F', 'aromatic'),
-    ('2-F-4-Me-phenyl', '[*]c1ccc(C)cc1F', 'aromatic'),
-    ('2-F-4-Et-phenyl', '[*]c1ccc(CC)cc1F', 'aromatic'),
-    ('2-F-4-iPr-phenyl', '[*]c1ccc(C(C)C)cc1F', 'aromatic'),
-    ('2-F-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)cc1F', 'aromatic'),
-    ('2-F-4-OMe-phenyl', '[*]c1ccc(OC)cc1F', 'aromatic'),
-    ('2-F-4-OEt-phenyl', '[*]c1ccc(OCC)cc1F', 'aromatic'),
-    ('2-F-4-OH-phenyl', '[*]c1ccc(O)cc1F', 'aromatic'),
-    ('2-F-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1F', 'aromatic'),
-    ('2-F-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1F', 'aromatic'),
-    ('2-F-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1F', 'aromatic'),
-    ('2-F-4-CN-phenyl', '[*]c1ccc(C#N)cc1F', 'aromatic'),
-    ('2-F-4-NH2-phenyl', '[*]c1ccc(N)cc1F', 'aromatic'),
-    ('2-F-4-NHMe-phenyl', '[*]c1ccc(NC)cc1F', 'aromatic'),
-    ('2-F-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1F', 'aromatic'),
-    ('2-F-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1F', 'aromatic'),
-    ('2-F-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1F', 'aromatic'),
-    ('2-F-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1F', 'aromatic'),
-    ('2-F-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1F', 'aromatic'),
-    ('2-F-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1F', 'aromatic'),
-    ('2-F-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1F', 'aromatic'),
-    ('2-F-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1F', 'aromatic'),
-    ('2-F-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1F', 'aromatic'),
-    ('2-F-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1F', 'aromatic'),
-    ('2-F-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1F', 'aromatic'),
-    ('2-F-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1F', 'aromatic'),
-    ('2-Cl-4-Br-phenyl', '[*]c1ccc(Br)cc1Cl', 'aromatic'),
-    ('2-Cl-4-Me-phenyl', '[*]c1ccc(C)cc1Cl', 'aromatic'),
-    ('2-Cl-4-Et-phenyl', '[*]c1ccc(CC)cc1Cl', 'aromatic'),
-    ('2-Cl-4-iPr-phenyl', '[*]c1ccc(C(C)C)cc1Cl', 'aromatic'),
-    ('2-Cl-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)cc1Cl', 'aromatic'),
-    ('2-Cl-4-OMe-phenyl', '[*]c1ccc(OC)cc1Cl', 'aromatic'),
-    ('2-Cl-4-OEt-phenyl', '[*]c1ccc(OCC)cc1Cl', 'aromatic'),
-    ('2-Cl-4-OH-phenyl', '[*]c1ccc(O)cc1Cl', 'aromatic'),
-    ('2-Cl-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1Cl', 'aromatic'),
-    ('2-Cl-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1Cl', 'aromatic'),
-    ('2-Cl-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1Cl', 'aromatic'),
-    ('2-Cl-4-CN-phenyl', '[*]c1ccc(C#N)cc1Cl', 'aromatic'),
-    ('2-Cl-4-NH2-phenyl', '[*]c1ccc(N)cc1Cl', 'aromatic'),
-    ('2-Cl-4-NHMe-phenyl', '[*]c1ccc(NC)cc1Cl', 'aromatic'),
-    ('2-Cl-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1Cl', 'aromatic'),
-    ('2-Cl-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1Cl', 'aromatic'),
-    ('2-Cl-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1Cl', 'aromatic'),
-    ('2-Cl-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1Cl', 'aromatic'),
-    ('2-Cl-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1Cl', 'aromatic'),
-    ('2-Cl-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1Cl', 'aromatic'),
-    ('2-Cl-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1Cl', 'aromatic'),
-    ('2-Cl-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1Cl', 'aromatic'),
-    ('2-Cl-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1Cl', 'aromatic'),
-    ('2-Cl-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1Cl', 'aromatic'),
-    ('2-Cl-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1Cl', 'aromatic'),
-    ('2-Cl-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1Cl', 'aromatic'),
-    ('2-Br-4-Me-phenyl', '[*]c1ccc(C)cc1Br', 'aromatic'),
-    ('2-Br-4-Et-phenyl', '[*]c1ccc(CC)cc1Br', 'aromatic'),
-    ('2-Br-4-iPr-phenyl', '[*]c1ccc(C(C)C)cc1Br', 'aromatic'),
-    ('2-Br-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)cc1Br', 'aromatic'),
-    ('2-Br-4-OMe-phenyl', '[*]c1ccc(OC)cc1Br', 'aromatic'),
-    ('2-Br-4-OEt-phenyl', '[*]c1ccc(OCC)cc1Br', 'aromatic'),
-    ('2-Br-4-OH-phenyl', '[*]c1ccc(O)cc1Br', 'aromatic'),
-    ('2-Br-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1Br', 'aromatic'),
-    ('2-Br-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1Br', 'aromatic'),
-    ('2-Br-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1Br', 'aromatic'),
-    ('2-Br-4-CN-phenyl', '[*]c1ccc(C#N)cc1Br', 'aromatic'),
-    ('2-Br-4-NH2-phenyl', '[*]c1ccc(N)cc1Br', 'aromatic'),
-    ('2-Br-4-NHMe-phenyl', '[*]c1ccc(NC)cc1Br', 'aromatic'),
-    ('2-Br-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1Br', 'aromatic'),
-    ('2-Br-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1Br', 'aromatic'),
-    ('2-Br-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1Br', 'aromatic'),
-    ('2-Br-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1Br', 'aromatic'),
-    ('2-Br-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1Br', 'aromatic'),
-    ('2-Br-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1Br', 'aromatic'),
-    ('2-Br-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1Br', 'aromatic'),
-    ('2-Br-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1Br', 'aromatic'),
-    ('2-Br-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1Br', 'aromatic'),
-    ('2-Br-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1Br', 'aromatic'),
-    ('2-Br-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1Br', 'aromatic'),
-    ('2-Me-4-Et-phenyl', '[*]c1ccc(CC)cc1C', 'aromatic'),
-    ('2-Me-4-iPr-phenyl', '[*]c1ccc(C(C)C)cc1C', 'aromatic'),
-    ('2-Me-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)cc1C', 'aromatic'),
-    ('2-Me-4-OMe-phenyl', '[*]c1ccc(OC)cc1C', 'aromatic'),
-    ('2-Me-4-OEt-phenyl', '[*]c1ccc(OCC)cc1C', 'aromatic'),
-    ('2-Me-4-OH-phenyl', '[*]c1ccc(O)cc1C', 'aromatic'),
-    ('2-Me-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1C', 'aromatic'),
-    ('2-Me-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1C', 'aromatic'),
-    ('2-Me-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1C', 'aromatic'),
-    ('2-Me-4-CN-phenyl', '[*]c1ccc(C#N)cc1C', 'aromatic'),
-    ('2-Me-4-NH2-phenyl', '[*]c1ccc(N)cc1C', 'aromatic'),
-    ('2-Me-4-NHMe-phenyl', '[*]c1ccc(NC)cc1C', 'aromatic'),
-    ('2-Me-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1C', 'aromatic'),
-    ('2-Me-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1C', 'aromatic'),
-    ('2-Me-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1C', 'aromatic'),
-    ('2-Me-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1C', 'aromatic'),
-    ('2-Me-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1C', 'aromatic'),
-    ('2-Me-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1C', 'aromatic'),
-    ('2-Me-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1C', 'aromatic'),
-    ('2-Me-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1C', 'aromatic'),
-    ('2-Me-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1C', 'aromatic'),
-    ('2-Me-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1C', 'aromatic'),
-    ('2-Me-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1C', 'aromatic'),
-    ('2-Me-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1C', 'aromatic'),
-    ('2-Et-4-iPr-phenyl', '[*]c1ccc(C(C)C)cc1CC', 'aromatic'),
-    ('2-Et-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)cc1CC', 'aromatic'),
-    ('2-Et-4-OMe-phenyl', '[*]c1ccc(OC)cc1CC', 'aromatic'),
-    ('2-Et-4-OEt-phenyl', '[*]c1ccc(OCC)cc1CC', 'aromatic'),
-    ('2-Et-4-OH-phenyl', '[*]c1ccc(O)cc1CC', 'aromatic'),
-    ('2-Et-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1CC', 'aromatic'),
-    ('2-Et-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1CC', 'aromatic'),
-    ('2-Et-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1CC', 'aromatic'),
-    ('2-Et-4-CN-phenyl', '[*]c1ccc(C#N)cc1CC', 'aromatic'),
-    ('2-Et-4-NH2-phenyl', '[*]c1ccc(N)cc1CC', 'aromatic'),
-    ('2-Et-4-NHMe-phenyl', '[*]c1ccc(NC)cc1CC', 'aromatic'),
-    ('2-Et-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1CC', 'aromatic'),
-    ('2-Et-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1CC', 'aromatic'),
-    ('2-Et-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1CC', 'aromatic'),
-    ('2-Et-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1CC', 'aromatic'),
-    ('2-Et-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1CC', 'aromatic'),
-    ('2-Et-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1CC', 'aromatic'),
-    ('2-Et-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1CC', 'aromatic'),
-    ('2-Et-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1CC', 'aromatic'),
-    ('2-Et-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1CC', 'aromatic'),
-    ('2-Et-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1CC', 'aromatic'),
-    ('2-Et-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1CC', 'aromatic'),
-    ('2-Et-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1CC', 'aromatic'),
-    ('2-iPr-4-tBu-phenyl', '[*]c1ccc(C(C)(C)C)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-OMe-phenyl', '[*]c1ccc(OC)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-OEt-phenyl', '[*]c1ccc(OCC)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-OH-phenyl', '[*]c1ccc(O)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-CN-phenyl', '[*]c1ccc(C#N)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-NH2-phenyl', '[*]c1ccc(N)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-NHMe-phenyl', '[*]c1ccc(NC)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1C(C)C', 'aromatic'),
-    ('2-iPr-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1C(C)C', 'aromatic'),
-    ('2-tBu-4-OMe-phenyl', '[*]c1ccc(OC)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-OEt-phenyl', '[*]c1ccc(OCC)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-OH-phenyl', '[*]c1ccc(O)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-CN-phenyl', '[*]c1ccc(C#N)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-NH2-phenyl', '[*]c1ccc(N)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-NHMe-phenyl', '[*]c1ccc(NC)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1C(C)(C)C', 'aromatic'),
-    ('2-tBu-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1C(C)(C)C', 'aromatic'),
-    ('2-OMe-4-OEt-phenyl', '[*]c1ccc(OCC)cc1OC', 'aromatic'),
-    ('2-OMe-4-OH-phenyl', '[*]c1ccc(O)cc1OC', 'aromatic'),
-    ('2-OMe-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1OC', 'aromatic'),
-    ('2-OMe-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1OC', 'aromatic'),
-    ('2-OMe-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1OC', 'aromatic'),
-    ('2-OMe-4-CN-phenyl', '[*]c1ccc(C#N)cc1OC', 'aromatic'),
-    ('2-OMe-4-NH2-phenyl', '[*]c1ccc(N)cc1OC', 'aromatic'),
-    ('2-OMe-4-NHMe-phenyl', '[*]c1ccc(NC)cc1OC', 'aromatic'),
-    ('2-OMe-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1OC', 'aromatic'),
-    ('2-OMe-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1OC', 'aromatic'),
-    ('2-OMe-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1OC', 'aromatic'),
-    ('2-OMe-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1OC', 'aromatic'),
-    ('2-OMe-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1OC', 'aromatic'),
-    ('2-OMe-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1OC', 'aromatic'),
-    ('2-OMe-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1OC', 'aromatic'),
-    ('2-OMe-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1OC', 'aromatic'),
-    ('2-OMe-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1OC', 'aromatic'),
-    ('2-OMe-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1OC', 'aromatic'),
-    ('2-OMe-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1OC', 'aromatic'),
-    ('2-OMe-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1OC', 'aromatic'),
-    ('2-OEt-4-OH-phenyl', '[*]c1ccc(O)cc1OCC', 'aromatic'),
-    ('2-OEt-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1OCC', 'aromatic'),
-    ('2-OEt-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1OCC', 'aromatic'),
-    ('2-OEt-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1OCC', 'aromatic'),
-    ('2-OEt-4-CN-phenyl', '[*]c1ccc(C#N)cc1OCC', 'aromatic'),
-    ('2-OEt-4-NH2-phenyl', '[*]c1ccc(N)cc1OCC', 'aromatic'),
-    ('2-OEt-4-NHMe-phenyl', '[*]c1ccc(NC)cc1OCC', 'aromatic'),
-    ('2-OEt-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1OCC', 'aromatic'),
-    ('2-OEt-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1OCC', 'aromatic'),
-    ('2-OEt-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1OCC', 'aromatic'),
-    ('2-OEt-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1OCC', 'aromatic'),
-    ('2-OEt-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1OCC', 'aromatic'),
-    ('2-OEt-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1OCC', 'aromatic'),
-    ('2-OEt-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1OCC', 'aromatic'),
-    ('2-OEt-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1OCC', 'aromatic'),
-    ('2-OEt-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1OCC', 'aromatic'),
-    ('2-OEt-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1OCC', 'aromatic'),
-    ('2-OEt-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1OCC', 'aromatic'),
-    ('2-OEt-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1OCC', 'aromatic'),
-    ('2-OH-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1O', 'aromatic'),
-    ('2-OH-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1O', 'aromatic'),
-    ('2-OH-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1O', 'aromatic'),
-    ('2-OH-4-CN-phenyl', '[*]c1ccc(C#N)cc1O', 'aromatic'),
-    ('2-OH-4-NH2-phenyl', '[*]c1ccc(N)cc1O', 'aromatic'),
-    ('2-OH-4-NHMe-phenyl', '[*]c1ccc(NC)cc1O', 'aromatic'),
-    ('2-OH-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1O', 'aromatic'),
-    ('2-OH-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1O', 'aromatic'),
-    ('2-OH-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1O', 'aromatic'),
-    ('2-OH-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1O', 'aromatic'),
-    ('2-OH-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1O', 'aromatic'),
-    ('2-OH-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1O', 'aromatic'),
-    ('2-OH-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1O', 'aromatic'),
-    ('2-OH-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1O', 'aromatic'),
-    ('2-OH-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1O', 'aromatic'),
-    ('2-OH-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1O', 'aromatic'),
-    ('2-OH-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1O', 'aromatic'),
-    ('2-OH-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1O', 'aromatic'),
-    ('2-CF3-4-CHF2-phenyl', '[*]c1ccc(C(F)F)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-CN-phenyl', '[*]c1ccc(C#N)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-NH2-phenyl', '[*]c1ccc(N)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-NHMe-phenyl', '[*]c1ccc(NC)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1C(F)(F)F', 'aromatic'),
-    ('2-CHF2-4-OCF3-phenyl', '[*]c1ccc(OC(F)(F)F)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-CN-phenyl', '[*]c1ccc(C#N)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-NH2-phenyl', '[*]c1ccc(N)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-NHMe-phenyl', '[*]c1ccc(NC)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1C(F)F', 'aromatic'),
-    ('2-CHF2-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1C(F)F', 'aromatic'),
-    ('2-OCF3-4-CN-phenyl', '[*]c1ccc(C#N)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-NH2-phenyl', '[*]c1ccc(N)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-NHMe-phenyl', '[*]c1ccc(NC)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1OC(F)(F)F', 'aromatic'),
-    ('2-OCF3-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1OC(F)(F)F', 'aromatic'),
-    ('2-CN-4-NH2-phenyl', '[*]c1ccc(N)cc1C#N', 'aromatic'),
-    ('2-CN-4-NHMe-phenyl', '[*]c1ccc(NC)cc1C#N', 'aromatic'),
-    ('2-CN-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1C#N', 'aromatic'),
-    ('2-CN-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1C#N', 'aromatic'),
-    ('2-CN-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1C#N', 'aromatic'),
-    ('2-CN-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1C#N', 'aromatic'),
-    ('2-CN-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1C#N', 'aromatic'),
-    ('2-CN-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1C#N', 'aromatic'),
-    ('2-CN-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1C#N', 'aromatic'),
-    ('2-CN-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1C#N', 'aromatic'),
-    ('2-CN-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1C#N', 'aromatic'),
-    ('2-CN-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1C#N', 'aromatic'),
-    ('2-CN-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1C#N', 'aromatic'),
-    ('2-CN-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1C#N', 'aromatic'),
-    ('2-NH2-4-NHMe-phenyl', '[*]c1ccc(NC)cc1N', 'aromatic'),
-    ('2-NH2-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1N', 'aromatic'),
-    ('2-NH2-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1N', 'aromatic'),
-    ('2-NH2-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1N', 'aromatic'),
-    ('2-NH2-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1N', 'aromatic'),
-    ('2-NH2-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1N', 'aromatic'),
-    ('2-NH2-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1N', 'aromatic'),
-    ('2-NH2-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1N', 'aromatic'),
-    ('2-NH2-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1N', 'aromatic'),
-    ('2-NH2-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1N', 'aromatic'),
-    ('2-NH2-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1N', 'aromatic'),
-    ('2-NH2-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1N', 'aromatic'),
-    ('2-NH2-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1N', 'aromatic'),
-    ('2-NHMe-4-NMe2-phenyl', '[*]c1ccc(N(C)C)cc1NC', 'aromatic'),
-    ('2-NHMe-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1NC', 'aromatic'),
-    ('2-NHMe-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1NC', 'aromatic'),
-    ('2-NHMe-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1NC', 'aromatic'),
-    ('2-NHMe-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1NC', 'aromatic'),
-    ('2-NHMe-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1NC', 'aromatic'),
-    ('2-NHMe-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1NC', 'aromatic'),
-    ('2-NHMe-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1NC', 'aromatic'),
-    ('2-NHMe-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1NC', 'aromatic'),
-    ('2-NHMe-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1NC', 'aromatic'),
-    ('2-NHMe-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1NC', 'aromatic'),
-    ('2-NHMe-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1NC', 'aromatic'),
-    ('2-NMe2-4-COOH-phenyl', '[*]c1ccc(C(=O)O)cc1N(C)C', 'aromatic'),
-    ('2-NMe2-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1N(C)C', 'aromatic'),
-    ('2-NMe2-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1N(C)C', 'aromatic'),
-    ('2-NMe2-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1N(C)C', 'aromatic'),
-    ('2-NMe2-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1N(C)C', 'aromatic'),
-    ('2-NMe2-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1N(C)C', 'aromatic'),
-    ('2-NMe2-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1N(C)C', 'aromatic'),
-    ('2-NMe2-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1N(C)C', 'aromatic'),
-    ('2-NMe2-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1N(C)C', 'aromatic'),
-    ('2-NMe2-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1N(C)C', 'aromatic'),
-    ('2-NMe2-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1N(C)C', 'aromatic'),
-    ('2-COOH-4-COOMe-phenyl', '[*]c1ccc(C(=O)OC)cc1C(=O)O', 'aromatic'),
-    ('2-COOH-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1C(=O)O', 'aromatic'),
-    ('2-COOH-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1C(=O)O', 'aromatic'),
-    ('2-COOH-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1C(=O)O', 'aromatic'),
-    ('2-COOH-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1C(=O)O', 'aromatic'),
-    ('2-COOH-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1C(=O)O', 'aromatic'),
-    ('2-COOH-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1C(=O)O', 'aromatic'),
-    ('2-COOH-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1C(=O)O', 'aromatic'),
-    ('2-COOH-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1C(=O)O', 'aromatic'),
-    ('2-COOH-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1C(=O)O', 'aromatic'),
-    ('2-COOMe-4-COMe-phenyl', '[*]c1ccc(C(C)=O)cc1C(=O)OC', 'aromatic'),
-    ('2-COOMe-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1C(=O)OC', 'aromatic'),
-    ('2-COOMe-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1C(=O)OC', 'aromatic'),
-    ('2-COOMe-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1C(=O)OC', 'aromatic'),
-    ('2-COOMe-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1C(=O)OC', 'aromatic'),
-    ('2-COOMe-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1C(=O)OC', 'aromatic'),
-    ('2-COOMe-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1C(=O)OC', 'aromatic'),
-    ('2-COOMe-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1C(=O)OC', 'aromatic'),
-    ('2-COOMe-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1C(=O)OC', 'aromatic'),
-    ('2-COMe-4-SO2Me-phenyl', '[*]c1ccc(S(C)(=O)=O)cc1C(C)=O', 'aromatic'),
-    ('2-COMe-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1C(C)=O', 'aromatic'),
-    ('2-COMe-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1C(C)=O', 'aromatic'),
-    ('2-COMe-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1C(C)=O', 'aromatic'),
-    ('2-COMe-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1C(C)=O', 'aromatic'),
-    ('2-COMe-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1C(C)=O', 'aromatic'),
-    ('2-COMe-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1C(C)=O', 'aromatic'),
-    ('2-COMe-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1C(C)=O', 'aromatic'),
-    ('2-SO2Me-4-SO2NH2-phenyl', '[*]c1ccc(S(N)(=O)=O)cc1S(C)(=O)=O', 'aromatic'),
-    ('2-SO2Me-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1S(C)(=O)=O', 'aromatic'),
-    ('2-SO2Me-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1S(C)(=O)=O', 'aromatic'),
-    ('2-SO2Me-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1S(C)(=O)=O', 'aromatic'),
-    ('2-SO2Me-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1S(C)(=O)=O', 'aromatic'),
-    ('2-SO2Me-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1S(C)(=O)=O', 'aromatic'),
-    ('2-SO2Me-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1S(C)(=O)=O', 'aromatic'),
-    ('2-SO2NH2-4-NHAc-phenyl', '[*]c1ccc(NC(C)=O)cc1S(N)(=O)=O', 'aromatic'),
-    ('2-SO2NH2-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1S(N)(=O)=O', 'aromatic'),
-    ('2-SO2NH2-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1S(N)(=O)=O', 'aromatic'),
-    ('2-SO2NH2-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1S(N)(=O)=O', 'aromatic'),
-    ('2-SO2NH2-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1S(N)(=O)=O', 'aromatic'),
-    ('2-NHAc-4-NHSO2Me-phenyl', '[*]c1ccc(NS(C)(=O)=O)cc1NC(C)=O', 'aromatic'),
-    ('2-NHAc-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1NC(C)=O', 'aromatic'),
-    ('2-NHAc-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1NC(C)=O', 'aromatic'),
-    ('2-NHAc-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1NC(C)=O', 'aromatic'),
-    ('2-NHAc-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1NC(C)=O', 'aromatic'),
-    ('2-NHSO2Me-4-cyclopropyl-phenyl', '[*]c1ccc(C1CC1)cc1NS(C)(=O)=O', 'aromatic'),
-    ('2-NHSO2Me-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1NS(C)(=O)=O', 'aromatic'),
-    ('2-cyclopropyl-4-morpholino-phenyl', '[*]c1ccc(N1CCOCC1)cc1C1CC1', 'aromatic'),
-    ('2-cyclopropyl-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1C1CC1', 'aromatic'),
-    ('2-cyclopropyl-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1C1CC1', 'aromatic'),
-    ('2-morpholino-4-piperidino-phenyl', '[*]c1ccc(N1CCCCC1)cc1N1CCOCC1', 'aromatic'),
-    ('2-morpholino-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1N1CCOCC1', 'aromatic'),
-    ('2-piperidino-4-pyrrolidino-phenyl', '[*]c1ccc(N1CCCC1)cc1N1CCCCC1', 'aromatic'),
-    ('5-Br-pyridin-2-yl', '[*]c1ccc(Br)cn1', 'aromatic'),
-    ('5-Et-pyridin-2-yl', '[*]c1ccc(CC)cn1', 'aromatic'),
-    ('5-iPr-pyridin-2-yl', '[*]c1ccc(C(C)C)cn1', 'aromatic'),
-    ('5-tBu-pyridin-2-yl', '[*]c1ccc(C(C)(C)C)cn1', 'aromatic'),
-    ('5-OMe-pyridin-2-yl', '[*]c1ccc(OC)cn1', 'aromatic'),
-    ('5-OEt-pyridin-2-yl', '[*]c1ccc(OCC)cn1', 'aromatic'),
-    ('5-OH-pyridin-2-yl', '[*]c1ccc(O)cn1', 'aromatic'),
-    ('5-CHF2-pyridin-2-yl', '[*]c1ccc(C(F)F)cn1', 'aromatic'),
-    ('5-OCF3-pyridin-2-yl', '[*]c1ccc(OC(F)(F)F)cn1', 'aromatic'),
-    ('5-CN-pyridin-2-yl', '[*]c1ccc(C#N)cn1', 'aromatic'),
-    ('5-NH2-pyridin-2-yl', '[*]c1ccc(N)cn1', 'aromatic'),
-    ('5-NHMe-pyridin-2-yl', '[*]c1ccc(NC)cn1', 'aromatic'),
-    ('5-NMe2-pyridin-2-yl', '[*]c1ccc(N(C)C)cn1', 'aromatic'),
-    ('5-COOH-pyridin-2-yl', '[*]c1ccc(C(=O)O)cn1', 'aromatic'),
-    ('5-COOMe-pyridin-2-yl', '[*]c1ccc(C(=O)OC)cn1', 'aromatic'),
-    ('5-COMe-pyridin-2-yl', '[*]c1ccc(C(C)=O)cn1', 'aromatic'),
-    ('4-F-pyridin-2-yl', '[*]c1cc(F)ccn1', 'aromatic'),
-    ('4-Cl-pyridin-2-yl', '[*]c1cc(Cl)ccn1', 'aromatic'),
-    ('4-Br-pyridin-2-yl', '[*]c1cc(Br)ccn1', 'aromatic'),
-    ('4-Et-pyridin-2-yl', '[*]c1cc(CC)ccn1', 'aromatic'),
-    ('4-iPr-pyridin-2-yl', '[*]c1cc(C(C)C)ccn1', 'aromatic'),
-    ('4-tBu-pyridin-2-yl', '[*]c1cc(C(C)(C)C)ccn1', 'aromatic'),
-    ('4-OMe-pyridin-2-yl', '[*]c1cc(OC)ccn1', 'aromatic'),
-    ('4-OEt-pyridin-2-yl', '[*]c1cc(OCC)ccn1', 'aromatic'),
-    ('4-OH-pyridin-2-yl', '[*]c1cc(O)ccn1', 'aromatic'),
-    ('4-CF3-pyridin-2-yl', '[*]c1cc(C(F)(F)F)ccn1', 'aromatic'),
-    ('4-CHF2-pyridin-2-yl', '[*]c1cc(C(F)F)ccn1', 'aromatic'),
-    ('4-OCF3-pyridin-2-yl', '[*]c1cc(OC(F)(F)F)ccn1', 'aromatic'),
-    ('4-CN-pyridin-2-yl', '[*]c1cc(C#N)ccn1', 'aromatic'),
-    ('4-NH2-pyridin-2-yl', '[*]c1cc(N)ccn1', 'aromatic'),
-    ('4-NHMe-pyridin-2-yl', '[*]c1cc(NC)ccn1', 'aromatic'),
-    ('4-NMe2-pyridin-2-yl', '[*]c1cc(N(C)C)ccn1', 'aromatic'),
-    ('4-COOH-pyridin-2-yl', '[*]c1cc(C(=O)O)ccn1', 'aromatic'),
-    ('4-COOMe-pyridin-2-yl', '[*]c1cc(C(=O)OC)ccn1', 'aromatic'),
-    ('4-COMe-pyridin-2-yl', '[*]c1cc(C(C)=O)ccn1', 'aromatic'),
-    ('3-Cl-pyridin-2-yl', '[*]c1cccc(Cl)n1', 'aromatic'),
-    ('3-Br-pyridin-2-yl', '[*]c1cccc(Br)n1', 'aromatic'),
-    ('3-Et-pyridin-2-yl', '[*]c1cccc(CC)n1', 'aromatic'),
-    ('3-iPr-pyridin-2-yl', '[*]c1cccc(C(C)C)n1', 'aromatic'),
-    ('3-tBu-pyridin-2-yl', '[*]c1cccc(C(C)(C)C)n1', 'aromatic'),
-    ('3-OMe-pyridin-2-yl', '[*]c1cccc(OC)n1', 'aromatic'),
-    ('3-OEt-pyridin-2-yl', '[*]c1cccc(OCC)n1', 'aromatic'),
-    ('3-OH-pyridin-2-yl', '[*]c1cccc(O)n1', 'aromatic'),
-    ('3-CF3-pyridin-2-yl', '[*]c1cccc(C(F)(F)F)n1', 'aromatic'),
-    ('3-CHF2-pyridin-2-yl', '[*]c1cccc(C(F)F)n1', 'aromatic'),
-    ('3-OCF3-pyridin-2-yl', '[*]c1cccc(OC(F)(F)F)n1', 'aromatic'),
-    ('3-CN-pyridin-2-yl', '[*]c1cccc(C#N)n1', 'aromatic'),
-    ('3-NH2-pyridin-2-yl', '[*]c1cccc(N)n1', 'aromatic'),
-    ('3-NHMe-pyridin-2-yl', '[*]c1cccc(NC)n1', 'aromatic'),
-    ('3-NMe2-pyridin-2-yl', '[*]c1cccc(N(C)C)n1', 'aromatic'),
-    ('3-COOH-pyridin-2-yl', '[*]c1cccc(C(=O)O)n1', 'aromatic'),
-    ('3-COOMe-pyridin-2-yl', '[*]c1cccc(C(=O)OC)n1', 'aromatic'),
-    ('3-COMe-pyridin-2-yl', '[*]c1cccc(C(C)=O)n1', 'aromatic'),
-    ('5-F-pyridin-3-yl', '[*]c1cncc(F)c1', 'aromatic'),
-    ('5-Cl-pyridin-3-yl', '[*]c1cncc(Cl)c1', 'aromatic'),
-    ('5-Br-pyridin-3-yl', '[*]c1cncc(Br)c1', 'aromatic'),
-    ('5-Et-pyridin-3-yl', '[*]c1cncc(CC)c1', 'aromatic'),
-    ('5-iPr-pyridin-3-yl', '[*]c1cncc(C(C)C)c1', 'aromatic'),
-    ('5-tBu-pyridin-3-yl', '[*]c1cncc(C(C)(C)C)c1', 'aromatic'),
-    ('5-OMe-pyridin-3-yl', '[*]c1cncc(OC)c1', 'aromatic'),
-    ('5-OEt-pyridin-3-yl', '[*]c1cncc(OCC)c1', 'aromatic'),
-    ('5-OH-pyridin-3-yl', '[*]c1cncc(O)c1', 'aromatic'),
-    ('5-CF3-pyridin-3-yl', '[*]c1cncc(C(F)(F)F)c1', 'aromatic'),
-    ('5-CHF2-pyridin-3-yl', '[*]c1cncc(C(F)F)c1', 'aromatic'),
-    ('5-OCF3-pyridin-3-yl', '[*]c1cncc(OC(F)(F)F)c1', 'aromatic'),
-    ('5-CN-pyridin-3-yl', '[*]c1cncc(C#N)c1', 'aromatic'),
-    ('5-NH2-pyridin-3-yl', '[*]c1cncc(N)c1', 'aromatic'),
-    ('5-NHMe-pyridin-3-yl', '[*]c1cncc(NC)c1', 'aromatic'),
-    ('5-NMe2-pyridin-3-yl', '[*]c1cncc(N(C)C)c1', 'aromatic'),
-    ('5-COOH-pyridin-3-yl', '[*]c1cncc(C(=O)O)c1', 'aromatic'),
-    ('5-COOMe-pyridin-3-yl', '[*]c1cncc(C(=O)OC)c1', 'aromatic'),
-    ('5-COMe-pyridin-3-yl', '[*]c1cncc(C(C)=O)c1', 'aromatic'),
-    ('6-F-pyridin-3-yl', '[*]c1ccc(F)nc1', 'aromatic'),
-    ('6-Cl-pyridin-3-yl', '[*]c1ccc(Cl)nc1', 'aromatic'),
-    ('6-Br-pyridin-3-yl', '[*]c1ccc(Br)nc1', 'aromatic'),
-    ('6-Et-pyridin-3-yl', '[*]c1ccc(CC)nc1', 'aromatic'),
-    ('6-iPr-pyridin-3-yl', '[*]c1ccc(C(C)C)nc1', 'aromatic'),
-    ('6-tBu-pyridin-3-yl', '[*]c1ccc(C(C)(C)C)nc1', 'aromatic'),
-    ('6-OMe-pyridin-3-yl', '[*]c1ccc(OC)nc1', 'aromatic'),
-    ('6-OEt-pyridin-3-yl', '[*]c1ccc(OCC)nc1', 'aromatic'),
-    ('6-OH-pyridin-3-yl', '[*]c1ccc(O)nc1', 'aromatic'),
-    ('6-CF3-pyridin-3-yl', '[*]c1ccc(C(F)(F)F)nc1', 'aromatic'),
-    ('6-CHF2-pyridin-3-yl', '[*]c1ccc(C(F)F)nc1', 'aromatic'),
-    ('6-OCF3-pyridin-3-yl', '[*]c1ccc(OC(F)(F)F)nc1', 'aromatic'),
-    ('6-CN-pyridin-3-yl', '[*]c1ccc(C#N)nc1', 'aromatic'),
-    ('6-NH2-pyridin-3-yl', '[*]c1ccc(N)nc1', 'aromatic'),
-    ('6-NHMe-pyridin-3-yl', '[*]c1ccc(NC)nc1', 'aromatic'),
-    ('6-NMe2-pyridin-3-yl', '[*]c1ccc(N(C)C)nc1', 'aromatic'),
-    ('6-COOH-pyridin-3-yl', '[*]c1ccc(C(=O)O)nc1', 'aromatic'),
-    ('6-COOMe-pyridin-3-yl', '[*]c1ccc(C(=O)OC)nc1', 'aromatic'),
-    ('6-COMe-pyridin-3-yl', '[*]c1ccc(C(C)=O)nc1', 'aromatic'),
-    ('2-F-pyridin-4-yl', '[*]c1cc(F)ncc1', 'aromatic'),
-    ('2-Cl-pyridin-4-yl', '[*]c1cc(Cl)ncc1', 'aromatic'),
-    ('2-Br-pyridin-4-yl', '[*]c1cc(Br)ncc1', 'aromatic'),
-    ('2-Et-pyridin-4-yl', '[*]c1cc(CC)ncc1', 'aromatic'),
-    ('2-iPr-pyridin-4-yl', '[*]c1cc(C(C)C)ncc1', 'aromatic'),
-    ('2-tBu-pyridin-4-yl', '[*]c1cc(C(C)(C)C)ncc1', 'aromatic'),
-    ('2-OMe-pyridin-4-yl', '[*]c1cc(OC)ncc1', 'aromatic'),
-    ('2-OEt-pyridin-4-yl', '[*]c1cc(OCC)ncc1', 'aromatic'),
-    ('2-OH-pyridin-4-yl', '[*]c1cc(O)ncc1', 'aromatic'),
-    ('2-CF3-pyridin-4-yl', '[*]c1cc(C(F)(F)F)ncc1', 'aromatic'),
-    ('2-CHF2-pyridin-4-yl', '[*]c1cc(C(F)F)ncc1', 'aromatic'),
-    ('2-OCF3-pyridin-4-yl', '[*]c1cc(OC(F)(F)F)ncc1', 'aromatic'),
-    ('2-CN-pyridin-4-yl', '[*]c1cc(C#N)ncc1', 'aromatic'),
-    ('2-NH2-pyridin-4-yl', '[*]c1cc(N)ncc1', 'aromatic'),
-    ('2-NHMe-pyridin-4-yl', '[*]c1cc(NC)ncc1', 'aromatic'),
-    ('2-NMe2-pyridin-4-yl', '[*]c1cc(N(C)C)ncc1', 'aromatic'),
-    ('2-COOH-pyridin-4-yl', '[*]c1cc(C(=O)O)ncc1', 'aromatic'),
-    ('2-COOMe-pyridin-4-yl', '[*]c1cc(C(=O)OC)ncc1', 'aromatic'),
-    ('2-COMe-pyridin-4-yl', '[*]c1cc(C(C)=O)ncc1', 'aromatic'),
-    ('N-Me-piperidine', '[*]NC1CCCCC1', 'basic'),
-    ('N-Et-piperidine', '[*]NCC1CCCCC1', 'basic'),
-    ('N-iPr-piperidine', '[*]NC(C)C1CCCCC1', 'basic'),
-    ('N-cPr-piperidine', '[*]NC1CC11CCCCC1', 'basic'),
-    ('N-tBu-piperidine', '[*]NC(C)(C)C1CCCCC1', 'basic'),
-    ('N-allyl-piperidine', '[*]NCC=C1CCCCC1', 'basic'),
-    ('N-Me-pyrrolidine', '[*]NC1CCCC1', 'basic'),
-    ('N-Et-pyrrolidine', '[*]NCC1CCCC1', 'basic'),
-    ('N-iPr-pyrrolidine', '[*]NC(C)C1CCCC1', 'basic'),
-    ('N-cPr-pyrrolidine', '[*]NC1CC11CCCC1', 'basic'),
-    ('N-tBu-pyrrolidine', '[*]NC(C)(C)C1CCCC1', 'basic'),
-    ('N-allyl-pyrrolidine', '[*]NCC=C1CCCC1', 'basic'),
-    ('N-Me-azetidine', '[*]NC1CCC1', 'basic'),
-    ('N-Et-azetidine', '[*]NCC1CCC1', 'basic'),
-    ('N-iPr-azetidine', '[*]NC(C)C1CCC1', 'basic'),
-    ('N-cPr-azetidine', '[*]NC1CC11CCC1', 'basic'),
-    ('N-tBu-azetidine', '[*]NC(C)(C)C1CCC1', 'basic'),
-    ('N-allyl-azetidine', '[*]NCC=C1CCC1', 'basic'),
-    ('N-Me-morpholine', '[*]NC1CCOCC1', 'basic'),
-    ('N-Et-morpholine', '[*]NCC1CCOCC1', 'basic'),
-    ('N-iPr-morpholine', '[*]NC(C)C1CCOCC1', 'basic'),
-    ('N-cPr-morpholine', '[*]NC1CC11CCOCC1', 'basic'),
-    ('N-tBu-morpholine', '[*]NC(C)(C)C1CCOCC1', 'basic'),
-    ('N-allyl-morpholine', '[*]NCC=C1CCOCC1', 'basic'),
-    ('N-Me-piperazine', '[*]NC1CCNCC1', 'basic'),
-    ('N-Et-piperazine', '[*]NCC1CCNCC1', 'basic'),
-    ('N-iPr-piperazine', '[*]NC(C)C1CCNCC1', 'basic'),
-    ('N-cPr-piperazine', '[*]NC1CC11CCNCC1', 'basic'),
-    ('N-tBu-piperazine', '[*]NC(C)(C)C1CCNCC1', 'basic'),
-    ('N-allyl-piperazine', '[*]NCC=C1CCNCC1', 'basic'),
-    ('N-Me-azepane', '[*]NC1CCCCCC1', 'basic'),
-    ('N-Et-azepane', '[*]NCC1CCCCCC1', 'basic'),
-    ('N-iPr-azepane', '[*]NC(C)C1CCCCCC1', 'basic'),
-    ('N-cPr-azepane', '[*]NC1CC11CCCCCC1', 'basic'),
-    ('N-tBu-azepane', '[*]NC(C)(C)C1CCCCCC1', 'basic'),
-    ('N-allyl-azepane', '[*]NCC=C1CCCCCC1', 'basic'),
-    ('N-Me-homomorpholine', '[*]NC1CCCOCC1', 'basic'),
-    ('N-Et-homomorpholine', '[*]NCC1CCCOCC1', 'basic'),
-    ('N-iPr-homomorpholine', '[*]NC(C)C1CCCOCC1', 'basic'),
-    ('N-cPr-homomorpholine', '[*]NC1CC11CCCOCC1', 'basic'),
-    ('N-tBu-homomorpholine', '[*]NC(C)(C)C1CCCOCC1', 'basic'),
-    ('N-allyl-homomorpholine', '[*]NCC=C1CCCOCC1', 'basic'),
-    ('piperidin-3-yl-methyl', '[*]CC1CNCCC1', 'basic'),
-    ('pyrrolidin-3-yl-methyl', '[*]CC1CNCC1', 'basic'),
-    ('azetidin-3-yl-methyl', '[*]CC1CNC1', 'basic'),
-    ('carbonyl-NH', '[*]C(=O)NN', 'polar'),
-    ('carbonyl-NHMe', '[*]C(=O)NNC', 'polar'),
-    ('carbonyl-NHEt', '[*]C(=O)NNCC', 'polar'),
-    ('carbonyl-NHiPr', '[*]C(=O)NNC(C)C', 'polar'),
-    ('carbonyl-NHtBu', '[*]C(=O)NNC(C)(C)C', 'polar'),
-    ('carbonyl-NHcPr', '[*]C(=O)NNC1CC1', 'polar'),
-    ('carbonyl-NHcPent', '[*]C(=O)NNC1CCCC1', 'polar'),
-    ('carbonyl-NHcHex', '[*]C(=O)NNC1CCCCC1', 'polar'),
-    ('carbonyl-NMe2', '[*]C(=O)NN(C)C', 'polar'),
-    ('carbonyl-NEt2', '[*]C(=O)NN(CC)CC', 'polar'),
-    ('carbonyl-NHBn', '[*]C(=O)NNCc1ccccc1', 'polar'),
-    ('carbonyl-NH-4-FBn', '[*]C(=O)NNCc1ccc(F)cc1', 'polar'),
-    ('carbonyl-piperidyl', '[*]C(=O)NN1CCCCC1', 'polar'),
-    ('carbonyl-morpholyl', '[*]C(=O)NN1CCOCC1', 'polar'),
-    ('carbonyl-pyrrolidyl', '[*]C(=O)NN1CCCC1', 'polar'),
-    ('carbonyl-azetidinyl', '[*]C(=O)NN1CCC1', 'polar'),
-    ('methylene-carbonyl-NH', '[*]CC(=O)NN', 'polar'),
-    ('methylene-carbonyl-NHMe', '[*]CC(=O)NNC', 'polar'),
-    ('methylene-carbonyl-NHEt', '[*]CC(=O)NNCC', 'polar'),
-    ('methylene-carbonyl-NHiPr', '[*]CC(=O)NNC(C)C', 'polar'),
-    ('methylene-carbonyl-NHtBu', '[*]CC(=O)NNC(C)(C)C', 'polar'),
-    ('methylene-carbonyl-NHcPr', '[*]CC(=O)NNC1CC1', 'polar'),
-    ('methylene-carbonyl-NHcPent', '[*]CC(=O)NNC1CCCC1', 'polar'),
-    ('methylene-carbonyl-NHcHex', '[*]CC(=O)NNC1CCCCC1', 'polar'),
-    ('methylene-carbonyl-NMe2', '[*]CC(=O)NN(C)C', 'polar'),
-    ('methylene-carbonyl-NEt2', '[*]CC(=O)NN(CC)CC', 'polar'),
-    ('methylene-carbonyl-NHBn', '[*]CC(=O)NNCc1ccccc1', 'polar'),
-    ('methylene-carbonyl-NH-4-FBn', '[*]CC(=O)NNCc1ccc(F)cc1', 'polar'),
-    ('methylene-carbonyl-piperidyl', '[*]CC(=O)NN1CCCCC1', 'polar'),
-    ('methylene-carbonyl-morpholyl', '[*]CC(=O)NN1CCOCC1', 'polar'),
-    ('methylene-carbonyl-pyrrolidyl', '[*]CC(=O)NN1CCCC1', 'polar'),
-    ('methylene-carbonyl-azetidinyl', '[*]CC(=O)NN1CCC1', 'polar'),
-    ('ethylene-carbonyl-NH', '[*]CCC(=O)NN', 'polar'),
-    ('ethylene-carbonyl-NHMe', '[*]CCC(=O)NNC', 'polar'),
-    ('ethylene-carbonyl-NHEt', '[*]CCC(=O)NNCC', 'polar'),
-    ('ethylene-carbonyl-NHiPr', '[*]CCC(=O)NNC(C)C', 'polar'),
-    ('ethylene-carbonyl-NHtBu', '[*]CCC(=O)NNC(C)(C)C', 'polar'),
-    ('ethylene-carbonyl-NHcPr', '[*]CCC(=O)NNC1CC1', 'polar'),
-    ('ethylene-carbonyl-NHcPent', '[*]CCC(=O)NNC1CCCC1', 'polar'),
-    ('ethylene-carbonyl-NHcHex', '[*]CCC(=O)NNC1CCCCC1', 'polar'),
-    ('ethylene-carbonyl-NMe2', '[*]CCC(=O)NN(C)C', 'polar'),
-    ('ethylene-carbonyl-NEt2', '[*]CCC(=O)NN(CC)CC', 'polar'),
-    ('ethylene-carbonyl-NHBn', '[*]CCC(=O)NNCc1ccccc1', 'polar'),
-    ('ethylene-carbonyl-NH-4-FBn', '[*]CCC(=O)NNCc1ccc(F)cc1', 'polar'),
-    ('ethylene-carbonyl-piperidyl', '[*]CCC(=O)NN1CCCCC1', 'polar'),
-    ('ethylene-carbonyl-morpholyl', '[*]CCC(=O)NN1CCOCC1', 'polar'),
-    ('ethylene-carbonyl-pyrrolidyl', '[*]CCC(=O)NN1CCCC1', 'polar'),
-    ('ethylene-carbonyl-azetidinyl', '[*]CCC(=O)NN1CCC1', 'polar'),
-    ('carbamate-NH', '[*]OC(=O)NN', 'polar'),
-    ('carbamate-NHMe', '[*]OC(=O)NNC', 'polar'),
-    ('carbamate-NHEt', '[*]OC(=O)NNCC', 'polar'),
-    ('carbamate-NHiPr', '[*]OC(=O)NNC(C)C', 'polar'),
-    ('carbamate-NHtBu', '[*]OC(=O)NNC(C)(C)C', 'polar'),
-    ('carbamate-NHcPr', '[*]OC(=O)NNC1CC1', 'polar'),
-    ('carbamate-NHcPent', '[*]OC(=O)NNC1CCCC1', 'polar'),
-    ('carbamate-NHcHex', '[*]OC(=O)NNC1CCCCC1', 'polar'),
-    ('carbamate-NMe2', '[*]OC(=O)NN(C)C', 'polar'),
-    ('carbamate-NEt2', '[*]OC(=O)NN(CC)CC', 'polar'),
-    ('carbamate-NHBn', '[*]OC(=O)NNCc1ccccc1', 'polar'),
-    ('carbamate-NH-4-FBn', '[*]OC(=O)NNCc1ccc(F)cc1', 'polar'),
-    ('carbamate-piperidyl', '[*]OC(=O)NN1CCCCC1', 'polar'),
-    ('carbamate-morpholyl', '[*]OC(=O)NN1CCOCC1', 'polar'),
-    ('carbamate-pyrrolidyl', '[*]OC(=O)NN1CCCC1', 'polar'),
-    ('carbamate-azetidinyl', '[*]OC(=O)NN1CCC1', 'polar'),
-    ('reverse-amide-NHMe', '[*]NC(=O)NC', 'polar'),
-    ('reverse-amide-NHEt', '[*]NC(=O)NCC', 'polar'),
-    ('reverse-amide-NHiPr', '[*]NC(=O)NC(C)C', 'polar'),
-    ('reverse-amide-NHtBu', '[*]NC(=O)NC(C)(C)C', 'polar'),
-    ('reverse-amide-NHcPr', '[*]NC(=O)NC1CC1', 'polar'),
-    ('reverse-amide-NHcPent', '[*]NC(=O)NC1CCCC1', 'polar'),
-    ('reverse-amide-NHcHex', '[*]NC(=O)NC1CCCCC1', 'polar'),
-    ('reverse-amide-NMe2', '[*]NC(=O)N(C)C', 'polar'),
-    ('reverse-amide-NEt2', '[*]NC(=O)N(CC)CC', 'polar'),
-    ('reverse-amide-NHBn', '[*]NC(=O)NCc1ccccc1', 'polar'),
-    ('reverse-amide-NH-4-FBn', '[*]NC(=O)NCc1ccc(F)cc1', 'polar'),
-    ('reverse-amide-piperidyl', '[*]NC(=O)N1CCCCC1', 'polar'),
-    ('reverse-amide-morpholyl', '[*]NC(=O)N1CCOCC1', 'polar'),
-    ('reverse-amide-pyrrolidyl', '[*]NC(=O)N1CCCC1', 'polar'),
-    ('reverse-amide-azetidinyl', '[*]NC(=O)N1CCC1', 'polar'),
-    ('sulfonamide-NH', '[*]S(=O)(=O)NN', 'polar'),
-    ('sulfonamide-NHMe', '[*]S(=O)(=O)NNC', 'polar'),
-    ('sulfonamide-NHEt', '[*]S(=O)(=O)NNCC', 'polar'),
-    ('sulfonamide-NHiPr', '[*]S(=O)(=O)NNC(C)C', 'polar'),
-    ('sulfonamide-NHtBu', '[*]S(=O)(=O)NNC(C)(C)C', 'polar'),
-    ('sulfonamide-NHcPr', '[*]S(=O)(=O)NNC1CC1', 'polar'),
-    ('sulfonamide-NHcPent', '[*]S(=O)(=O)NNC1CCCC1', 'polar'),
-    ('sulfonamide-NHcHex', '[*]S(=O)(=O)NNC1CCCCC1', 'polar'),
-    ('sulfonamide-NMe2', '[*]S(=O)(=O)NN(C)C', 'polar'),
-    ('sulfonamide-NEt2', '[*]S(=O)(=O)NN(CC)CC', 'polar'),
-    ('sulfonamide-NHBn', '[*]S(=O)(=O)NNCc1ccccc1', 'polar'),
-    ('sulfonamide-NH-4-FBn', '[*]S(=O)(=O)NNCc1ccc(F)cc1', 'polar'),
-    ('sulfonamide-piperidyl', '[*]S(=O)(=O)NN1CCCCC1', 'polar'),
-    ('sulfonamide-morpholyl', '[*]S(=O)(=O)NN1CCOCC1', 'polar'),
-    ('sulfonamide-pyrrolidyl', '[*]S(=O)(=O)NN1CCCC1', 'polar'),
-    ('sulfonamide-azetidinyl', '[*]S(=O)(=O)NN1CCC1', 'polar'),
-    ('methyl-sulfonamide-NH', '[*]CS(=O)(=O)NN', 'polar'),
-    ('methyl-sulfonamide-NHMe', '[*]CS(=O)(=O)NNC', 'polar'),
-    ('methyl-sulfonamide-NHEt', '[*]CS(=O)(=O)NNCC', 'polar'),
-    ('methyl-sulfonamide-NHiPr', '[*]CS(=O)(=O)NNC(C)C', 'polar'),
-    ('methyl-sulfonamide-NHtBu', '[*]CS(=O)(=O)NNC(C)(C)C', 'polar'),
-    ('methyl-sulfonamide-NHcPr', '[*]CS(=O)(=O)NNC1CC1', 'polar'),
-    ('methyl-sulfonamide-NHcPent', '[*]CS(=O)(=O)NNC1CCCC1', 'polar'),
-    ('methyl-sulfonamide-NHcHex', '[*]CS(=O)(=O)NNC1CCCCC1', 'polar'),
-    ('methyl-sulfonamide-NMe2', '[*]CS(=O)(=O)NN(C)C', 'polar'),
-    ('methyl-sulfonamide-NEt2', '[*]CS(=O)(=O)NN(CC)CC', 'polar'),
-    ('methyl-sulfonamide-NHBn', '[*]CS(=O)(=O)NNCc1ccccc1', 'polar'),
-    ('methyl-sulfonamide-NH-4-FBn', '[*]CS(=O)(=O)NNCc1ccc(F)cc1', 'polar'),
-    ('methyl-sulfonamide-piperidyl', '[*]CS(=O)(=O)NN1CCCCC1', 'polar'),
-    ('methyl-sulfonamide-morpholyl', '[*]CS(=O)(=O)NN1CCOCC1', 'polar'),
-    ('methyl-sulfonamide-pyrrolidyl', '[*]CS(=O)(=O)NN1CCCC1', 'polar'),
-    ('methyl-sulfonamide-azetidinyl', '[*]CS(=O)(=O)NN1CCC1', 'polar'),
-    ('4-F-phenyl-methyl', '[*]Cc1ccc(F)cc1', 'aromatic'),
-    ('4-Cl-phenyl-methyl', '[*]Cc1ccc(Cl)cc1', 'aromatic'),
-    ('4-Me-phenyl-methyl', '[*]Cc1ccc(C)cc1', 'aromatic'),
-    ('4-OMe-phenyl-methyl', '[*]Cc1ccc(OC)cc1', 'aromatic'),
-    ('4-CF3-phenyl-methyl', '[*]Cc1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('3-F-phenyl-methyl', '[*]Cc1cccc(F)c1', 'aromatic'),
-    ('3-Cl-phenyl-methyl', '[*]Cc1cccc(Cl)c1', 'aromatic'),
-    ('3-CF3-phenyl-methyl', '[*]Cc1cccc(C(F)(F)F)c1', 'aromatic'),
-    ('pyridin-2-yl-methyl', '[*]Cc1ccccn1', 'aromatic'),
-    ('pyridin-3-yl-methyl', '[*]Cc1cccnc1', 'aromatic'),
-    ('pyridin-4-yl-methyl', '[*]Cc1ccncc1', 'aromatic'),
-    ('pyrimidin-2-yl-methyl', '[*]Cc1ncccn1', 'aromatic'),
-    ('pyrimidin-5-yl-methyl', '[*]Cc1cncnc1', 'aromatic'),
-    ('thiophen-2-yl-methyl', '[*]Cc1cccs1', 'aromatic'),
-    ('thiophen-3-yl-methyl', '[*]Cc1ccsc1', 'aromatic'),
-    ('furan-2-yl-methyl', '[*]Cc1ccco1', 'aromatic'),
-    ('thiazol-2-yl-methyl', '[*]Cc1nccs1', 'aromatic'),
-    ('oxazol-2-yl-methyl', '[*]Cc1ncco1', 'aromatic'),
-    ('1-Me-pyrazol-3-yl-methyl', '[*]Cc1ccn(C)n1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-methyl', '[*]Cc1cn(C)nc1', 'aromatic'),
-    ('isoxazol-3-yl-methyl', '[*]Cc1cc(no1)', 'aromatic'),
-    ('isoxazol-5-yl-methyl', '[*]Cc1cc(on1)', 'aromatic'),
-    ('benzimidazol-2-yl-methyl', '[*]Cc1nc2ccccc2[nH]1', 'aromatic'),
-    ('quinolin-2-yl-methyl', '[*]Cc1ccc2ncccc2c1', 'aromatic'),
-    ('indol-3-yl-methyl', '[*]Cc1c[nH]c2ccccc12', 'aromatic'),
-    ('phenyl-ethyl', '[*]CCc1ccccc1', 'aromatic'),
-    ('4-F-phenyl-ethyl', '[*]CCc1ccc(F)cc1', 'aromatic'),
-    ('4-Cl-phenyl-ethyl', '[*]CCc1ccc(Cl)cc1', 'aromatic'),
-    ('4-Me-phenyl-ethyl', '[*]CCc1ccc(C)cc1', 'aromatic'),
-    ('4-OMe-phenyl-ethyl', '[*]CCc1ccc(OC)cc1', 'aromatic'),
-    ('4-CF3-phenyl-ethyl', '[*]CCc1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('3-F-phenyl-ethyl', '[*]CCc1cccc(F)c1', 'aromatic'),
-    ('3-Cl-phenyl-ethyl', '[*]CCc1cccc(Cl)c1', 'aromatic'),
-    ('3-CF3-phenyl-ethyl', '[*]CCc1cccc(C(F)(F)F)c1', 'aromatic'),
-    ('pyridin-2-yl-ethyl', '[*]CCc1ccccn1', 'aromatic'),
-    ('pyridin-3-yl-ethyl', '[*]CCc1cccnc1', 'aromatic'),
-    ('pyridin-4-yl-ethyl', '[*]CCc1ccncc1', 'aromatic'),
-    ('pyrimidin-2-yl-ethyl', '[*]CCc1ncccn1', 'aromatic'),
-    ('pyrimidin-5-yl-ethyl', '[*]CCc1cncnc1', 'aromatic'),
-    ('thiophen-2-yl-ethyl', '[*]CCc1cccs1', 'aromatic'),
-    ('thiophen-3-yl-ethyl', '[*]CCc1ccsc1', 'aromatic'),
-    ('furan-2-yl-ethyl', '[*]CCc1ccco1', 'aromatic'),
-    ('thiazol-2-yl-ethyl', '[*]CCc1nccs1', 'aromatic'),
-    ('oxazol-2-yl-ethyl', '[*]CCc1ncco1', 'aromatic'),
-    ('1-Me-pyrazol-3-yl-ethyl', '[*]CCc1ccn(C)n1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-ethyl', '[*]CCc1cn(C)nc1', 'aromatic'),
-    ('isoxazol-3-yl-ethyl', '[*]CCc1cc(no1)', 'aromatic'),
-    ('isoxazol-5-yl-ethyl', '[*]CCc1cc(on1)', 'aromatic'),
-    ('1,2,4-triazol-1-yl-ethyl', '[*]CCn1cncn1', 'aromatic'),
-    ('benzimidazol-2-yl-ethyl', '[*]CCc1nc2ccccc2[nH]1', 'aromatic'),
-    ('quinolin-2-yl-ethyl', '[*]CCc1ccc2ncccc2c1', 'aromatic'),
-    ('indol-3-yl-ethyl', '[*]CCc1c[nH]c2ccccc12', 'aromatic'),
-    ('phenyl-propyl', '[*]CCCc1ccccc1', 'aromatic'),
-    ('4-F-phenyl-propyl', '[*]CCCc1ccc(F)cc1', 'aromatic'),
-    ('4-Cl-phenyl-propyl', '[*]CCCc1ccc(Cl)cc1', 'aromatic'),
-    ('4-Me-phenyl-propyl', '[*]CCCc1ccc(C)cc1', 'aromatic'),
-    ('4-OMe-phenyl-propyl', '[*]CCCc1ccc(OC)cc1', 'aromatic'),
-    ('4-CF3-phenyl-propyl', '[*]CCCc1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('3-F-phenyl-propyl', '[*]CCCc1cccc(F)c1', 'aromatic'),
-    ('3-Cl-phenyl-propyl', '[*]CCCc1cccc(Cl)c1', 'aromatic'),
-    ('3-CF3-phenyl-propyl', '[*]CCCc1cccc(C(F)(F)F)c1', 'aromatic'),
-    ('pyridin-2-yl-propyl', '[*]CCCc1ccccn1', 'aromatic'),
-    ('pyridin-3-yl-propyl', '[*]CCCc1cccnc1', 'aromatic'),
-    ('pyridin-4-yl-propyl', '[*]CCCc1ccncc1', 'aromatic'),
-    ('pyrimidin-2-yl-propyl', '[*]CCCc1ncccn1', 'aromatic'),
-    ('pyrimidin-5-yl-propyl', '[*]CCCc1cncnc1', 'aromatic'),
-    ('thiophen-2-yl-propyl', '[*]CCCc1cccs1', 'aromatic'),
-    ('thiophen-3-yl-propyl', '[*]CCCc1ccsc1', 'aromatic'),
-    ('furan-2-yl-propyl', '[*]CCCc1ccco1', 'aromatic'),
-    ('thiazol-2-yl-propyl', '[*]CCCc1nccs1', 'aromatic'),
-    ('oxazol-2-yl-propyl', '[*]CCCc1ncco1', 'aromatic'),
-    ('1-Me-pyrazol-3-yl-propyl', '[*]CCCc1ccn(C)n1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-propyl', '[*]CCCc1cn(C)nc1', 'aromatic'),
-    ('isoxazol-3-yl-propyl', '[*]CCCc1cc(no1)', 'aromatic'),
-    ('isoxazol-5-yl-propyl', '[*]CCCc1cc(on1)', 'aromatic'),
-    ('1,2,4-triazol-1-yl-propyl', '[*]CCCn1cncn1', 'aromatic'),
-    ('benzimidazol-2-yl-propyl', '[*]CCCc1nc2ccccc2[nH]1', 'aromatic'),
-    ('quinolin-2-yl-propyl', '[*]CCCc1ccc2ncccc2c1', 'aromatic'),
-    ('indol-3-yl-propyl', '[*]CCCc1c[nH]c2ccccc12', 'aromatic'),
-    ('phenyl-oxy', '[*]Oc1ccccc1', 'aromatic'),
-    ('4-F-phenyl-oxy', '[*]Oc1ccc(F)cc1', 'aromatic'),
-    ('4-Cl-phenyl-oxy', '[*]Oc1ccc(Cl)cc1', 'aromatic'),
-    ('4-Me-phenyl-oxy', '[*]Oc1ccc(C)cc1', 'aromatic'),
-    ('4-OMe-phenyl-oxy', '[*]Oc1ccc(OC)cc1', 'aromatic'),
-    ('4-CF3-phenyl-oxy', '[*]Oc1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('3-F-phenyl-oxy', '[*]Oc1cccc(F)c1', 'aromatic'),
-    ('3-Cl-phenyl-oxy', '[*]Oc1cccc(Cl)c1', 'aromatic'),
-    ('3-CF3-phenyl-oxy', '[*]Oc1cccc(C(F)(F)F)c1', 'aromatic'),
-    ('pyridin-2-yl-oxy', '[*]Oc1ccccn1', 'aromatic'),
-    ('pyridin-3-yl-oxy', '[*]Oc1cccnc1', 'aromatic'),
-    ('pyridin-4-yl-oxy', '[*]Oc1ccncc1', 'aromatic'),
-    ('pyrimidin-2-yl-oxy', '[*]Oc1ncccn1', 'aromatic'),
-    ('pyrimidin-5-yl-oxy', '[*]Oc1cncnc1', 'aromatic'),
-    ('thiophen-2-yl-oxy', '[*]Oc1cccs1', 'aromatic'),
-    ('thiophen-3-yl-oxy', '[*]Oc1ccsc1', 'aromatic'),
-    ('furan-2-yl-oxy', '[*]Oc1ccco1', 'aromatic'),
-    ('thiazol-2-yl-oxy', '[*]Oc1nccs1', 'aromatic'),
-    ('oxazol-2-yl-oxy', '[*]Oc1ncco1', 'aromatic'),
-    ('1-Me-pyrazol-3-yl-oxy', '[*]Oc1ccn(C)n1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-oxy', '[*]Oc1cn(C)nc1', 'aromatic'),
-    ('isoxazol-3-yl-oxy', '[*]Oc1cc(no1)', 'aromatic'),
-    ('isoxazol-5-yl-oxy', '[*]Oc1cc(on1)', 'aromatic'),
-    ('1,2,4-triazol-1-yl-oxy', '[*]On1cncn1', 'aromatic'),
-    ('benzimidazol-2-yl-oxy', '[*]Oc1nc2ccccc2[nH]1', 'aromatic'),
-    ('quinolin-2-yl-oxy', '[*]Oc1ccc2ncccc2c1', 'aromatic'),
-    ('indol-3-yl-oxy', '[*]Oc1c[nH]c2ccccc12', 'aromatic'),
-    ('phenyl-oxyethyl', '[*]OCCc1ccccc1', 'aromatic'),
-    ('4-F-phenyl-oxyethyl', '[*]OCCc1ccc(F)cc1', 'aromatic'),
-    ('4-Cl-phenyl-oxyethyl', '[*]OCCc1ccc(Cl)cc1', 'aromatic'),
-    ('4-Me-phenyl-oxyethyl', '[*]OCCc1ccc(C)cc1', 'aromatic'),
-    ('4-OMe-phenyl-oxyethyl', '[*]OCCc1ccc(OC)cc1', 'aromatic'),
-    ('4-CF3-phenyl-oxyethyl', '[*]OCCc1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('3-F-phenyl-oxyethyl', '[*]OCCc1cccc(F)c1', 'aromatic'),
-    ('3-Cl-phenyl-oxyethyl', '[*]OCCc1cccc(Cl)c1', 'aromatic'),
-    ('3-CF3-phenyl-oxyethyl', '[*]OCCc1cccc(C(F)(F)F)c1', 'aromatic'),
-    ('pyridin-2-yl-oxyethyl', '[*]OCCc1ccccn1', 'aromatic'),
-    ('pyridin-3-yl-oxyethyl', '[*]OCCc1cccnc1', 'aromatic'),
-    ('pyridin-4-yl-oxyethyl', '[*]OCCc1ccncc1', 'aromatic'),
-    ('pyrimidin-2-yl-oxyethyl', '[*]OCCc1ncccn1', 'aromatic'),
-    ('pyrimidin-5-yl-oxyethyl', '[*]OCCc1cncnc1', 'aromatic'),
-    ('thiophen-2-yl-oxyethyl', '[*]OCCc1cccs1', 'aromatic'),
-    ('thiophen-3-yl-oxyethyl', '[*]OCCc1ccsc1', 'aromatic'),
-    ('furan-2-yl-oxyethyl', '[*]OCCc1ccco1', 'aromatic'),
-    ('thiazol-2-yl-oxyethyl', '[*]OCCc1nccs1', 'aromatic'),
-    ('oxazol-2-yl-oxyethyl', '[*]OCCc1ncco1', 'aromatic'),
-    ('1-Me-pyrazol-3-yl-oxyethyl', '[*]OCCc1ccn(C)n1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-oxyethyl', '[*]OCCc1cn(C)nc1', 'aromatic'),
-    ('isoxazol-3-yl-oxyethyl', '[*]OCCc1cc(no1)', 'aromatic'),
-    ('isoxazol-5-yl-oxyethyl', '[*]OCCc1cc(on1)', 'aromatic'),
-    ('1,2,4-triazol-1-yl-oxyethyl', '[*]OCCn1cncn1', 'aromatic'),
-    ('benzimidazol-2-yl-oxyethyl', '[*]OCCc1nc2ccccc2[nH]1', 'aromatic'),
-    ('quinolin-2-yl-oxyethyl', '[*]OCCc1ccc2ncccc2c1', 'aromatic'),
-    ('indol-3-yl-oxyethyl', '[*]OCCc1c[nH]c2ccccc12', 'aromatic'),
-    ('3-OMe-4-OMe-phenyl', '[*]c1ccc(OC)c(OC)c1', 'aromatic'),
-    ('3-OMe-4-Et-phenyl', '[*]c1ccc(CC)c(OC)c1', 'aromatic'),
-    ('3-CF3-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-OH-phenyl', '[*]c1ccc(O)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-Et-phenyl', '[*]c1ccc(CC)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-4-OEt-phenyl', '[*]c1ccc(OCC)c(C(F)(F)F)c1', 'aromatic'),
-    ('3-CN-4-CN-phenyl', '[*]c1ccc(C#N)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-OH-phenyl', '[*]c1ccc(O)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-Et-phenyl', '[*]c1ccc(CC)c(C#N)c1', 'aromatic'),
-    ('3-CN-4-OEt-phenyl', '[*]c1ccc(OCC)c(C#N)c1', 'aromatic'),
-    ('3-OH-4-OH-phenyl', '[*]c1ccc(O)c(O)c1', 'aromatic'),
-    ('3-OH-4-Et-phenyl', '[*]c1ccc(CC)c(O)c1', 'aromatic'),
-    ('3-OH-4-OEt-phenyl', '[*]c1ccc(OCC)c(O)c1', 'aromatic'),
-    ('3-NH2-4-NH2-phenyl', '[*]c1ccc(N)c(N)c1', 'aromatic'),
-    ('3-NH2-4-Et-phenyl', '[*]c1ccc(CC)c(N)c1', 'aromatic'),
-    ('3-NH2-4-OEt-phenyl', '[*]c1ccc(OCC)c(N)c1', 'aromatic'),
-    ('3-Et-4-Et-phenyl', '[*]c1ccc(CC)c(CC)c1', 'aromatic'),
-    ('3-OEt-4-OEt-phenyl', '[*]c1ccc(OCC)c(OCC)c1', 'aromatic'),
-    ('3-F-5-Cl-phenyl', '[*]c1cc(F)cc(Cl)c1', 'aromatic'),
-    ('3-F-5-Me-phenyl', '[*]c1cc(F)cc(C)c1', 'aromatic'),
-    ('3-F-5-OMe-phenyl', '[*]c1cc(F)cc(OC)c1', 'aromatic'),
-    ('3-F-5-CF3-phenyl', '[*]c1cc(F)cc(C(F)(F)F)c1', 'aromatic'),
-    ('3-F-5-CN-phenyl', '[*]c1cc(F)cc(C#N)c1', 'aromatic'),
-    ('3-F-5-OH-phenyl', '[*]c1cc(F)cc(O)c1', 'aromatic'),
-    ('3-F-5-NH2-phenyl', '[*]c1cc(F)cc(N)c1', 'aromatic'),
-    ('3-F-5-Et-phenyl', '[*]c1cc(F)cc(CC)c1', 'aromatic'),
-    ('3-F-5-OEt-phenyl', '[*]c1cc(F)cc(OCC)c1', 'aromatic'),
-    ('3-Cl-5-Me-phenyl', '[*]c1cc(Cl)cc(C)c1', 'aromatic'),
-    ('3-Cl-5-OMe-phenyl', '[*]c1cc(Cl)cc(OC)c1', 'aromatic'),
-    ('3-Cl-5-CF3-phenyl', '[*]c1cc(Cl)cc(C(F)(F)F)c1', 'aromatic'),
-    ('3-Cl-5-CN-phenyl', '[*]c1cc(Cl)cc(C#N)c1', 'aromatic'),
-    ('3-Cl-5-OH-phenyl', '[*]c1cc(Cl)cc(O)c1', 'aromatic'),
-    ('3-Cl-5-NH2-phenyl', '[*]c1cc(Cl)cc(N)c1', 'aromatic'),
-    ('3-Cl-5-Et-phenyl', '[*]c1cc(Cl)cc(CC)c1', 'aromatic'),
-    ('3-Cl-5-OEt-phenyl', '[*]c1cc(Cl)cc(OCC)c1', 'aromatic'),
-    ('3-Me-5-Me-phenyl', '[*]c1cc(C)cc(C)c1', 'aromatic'),
-    ('3-Me-5-OMe-phenyl', '[*]c1cc(C)cc(OC)c1', 'aromatic'),
-    ('3-Me-5-CF3-phenyl', '[*]c1cc(C)cc(C(F)(F)F)c1', 'aromatic'),
-    ('3-Me-5-CN-phenyl', '[*]c1cc(C)cc(C#N)c1', 'aromatic'),
-    ('3-Me-5-OH-phenyl', '[*]c1cc(C)cc(O)c1', 'aromatic'),
-    ('3-Me-5-NH2-phenyl', '[*]c1cc(C)cc(N)c1', 'aromatic'),
-    ('3-Me-5-Et-phenyl', '[*]c1cc(C)cc(CC)c1', 'aromatic'),
-    ('3-Me-5-OEt-phenyl', '[*]c1cc(C)cc(OCC)c1', 'aromatic'),
-    ('3-OMe-5-OMe-phenyl', '[*]c1cc(OC)cc(OC)c1', 'aromatic'),
-    ('3-OMe-5-CF3-phenyl', '[*]c1cc(OC)cc(C(F)(F)F)c1', 'aromatic'),
-    ('3-OMe-5-CN-phenyl', '[*]c1cc(OC)cc(C#N)c1', 'aromatic'),
-    ('3-OMe-5-OH-phenyl', '[*]c1cc(OC)cc(O)c1', 'aromatic'),
-    ('3-OMe-5-NH2-phenyl', '[*]c1cc(OC)cc(N)c1', 'aromatic'),
-    ('3-OMe-5-Et-phenyl', '[*]c1cc(OC)cc(CC)c1', 'aromatic'),
-    ('3-OMe-5-OEt-phenyl', '[*]c1cc(OC)cc(OCC)c1', 'aromatic'),
-    ('3-CF3-5-CF3-phenyl', '[*]c1cc(C(F)(F)F)cc(C(F)(F)F)c1', 'aromatic'),
-    ('3-CF3-5-CN-phenyl', '[*]c1cc(C(F)(F)F)cc(C#N)c1', 'aromatic'),
-    ('3-CF3-5-OH-phenyl', '[*]c1cc(C(F)(F)F)cc(O)c1', 'aromatic'),
-    ('3-CF3-5-NH2-phenyl', '[*]c1cc(C(F)(F)F)cc(N)c1', 'aromatic'),
-    ('3-CF3-5-Et-phenyl', '[*]c1cc(C(F)(F)F)cc(CC)c1', 'aromatic'),
-    ('3-CF3-5-OEt-phenyl', '[*]c1cc(C(F)(F)F)cc(OCC)c1', 'aromatic'),
-    ('3-CN-5-CN-phenyl', '[*]c1cc(C#N)cc(C#N)c1', 'aromatic'),
-    ('3-CN-5-OH-phenyl', '[*]c1cc(C#N)cc(O)c1', 'aromatic'),
-    ('3-CN-5-NH2-phenyl', '[*]c1cc(C#N)cc(N)c1', 'aromatic'),
-    ('3-CN-5-Et-phenyl', '[*]c1cc(C#N)cc(CC)c1', 'aromatic'),
-    ('3-CN-5-OEt-phenyl', '[*]c1cc(C#N)cc(OCC)c1', 'aromatic'),
-    ('3-OH-5-OH-phenyl', '[*]c1cc(O)cc(O)c1', 'aromatic'),
-    ('3-OH-5-NH2-phenyl', '[*]c1cc(O)cc(N)c1', 'aromatic'),
-    ('3-OH-5-Et-phenyl', '[*]c1cc(O)cc(CC)c1', 'aromatic'),
-    ('3-OH-5-OEt-phenyl', '[*]c1cc(O)cc(OCC)c1', 'aromatic'),
-    ('3-NH2-5-NH2-phenyl', '[*]c1cc(N)cc(N)c1', 'aromatic'),
-    ('3-NH2-5-Et-phenyl', '[*]c1cc(N)cc(CC)c1', 'aromatic'),
-    ('3-NH2-5-OEt-phenyl', '[*]c1cc(N)cc(OCC)c1', 'aromatic'),
-    ('3-Et-5-Et-phenyl', '[*]c1cc(CC)cc(CC)c1', 'aromatic'),
-    ('3-Et-5-OEt-phenyl', '[*]c1cc(CC)cc(OCC)c1', 'aromatic'),
-    ('3-OEt-5-OEt-phenyl', '[*]c1cc(OCC)cc(OCC)c1', 'aromatic'),
-    ('2-Me-4-Me-phenyl', '[*]c1ccc(C)cc1C', 'aromatic'),
-    ('2-OMe-4-OMe-phenyl', '[*]c1ccc(OC)cc1OC', 'aromatic'),
-    ('2-OMe-4-Et-phenyl', '[*]c1ccc(CC)cc1OC', 'aromatic'),
-    ('2-CF3-4-CF3-phenyl', '[*]c1ccc(C(F)(F)F)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-OH-phenyl', '[*]c1ccc(O)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-Et-phenyl', '[*]c1ccc(CC)cc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-4-OEt-phenyl', '[*]c1ccc(OCC)cc1C(F)(F)F', 'aromatic'),
-    ('2-CN-4-CN-phenyl', '[*]c1ccc(C#N)cc1C#N', 'aromatic'),
-    ('2-CN-4-OH-phenyl', '[*]c1ccc(O)cc1C#N', 'aromatic'),
-    ('2-CN-4-Et-phenyl', '[*]c1ccc(CC)cc1C#N', 'aromatic'),
-    ('2-CN-4-OEt-phenyl', '[*]c1ccc(OCC)cc1C#N', 'aromatic'),
-    ('2-OH-4-OH-phenyl', '[*]c1ccc(O)cc1O', 'aromatic'),
-    ('2-OH-4-Et-phenyl', '[*]c1ccc(CC)cc1O', 'aromatic'),
-    ('2-OH-4-OEt-phenyl', '[*]c1ccc(OCC)cc1O', 'aromatic'),
-    ('2-NH2-4-NH2-phenyl', '[*]c1ccc(N)cc1N', 'aromatic'),
-    ('2-NH2-4-Et-phenyl', '[*]c1ccc(CC)cc1N', 'aromatic'),
-    ('2-NH2-4-OEt-phenyl', '[*]c1ccc(OCC)cc1N', 'aromatic'),
-    ('2-Et-4-Et-phenyl', '[*]c1ccc(CC)cc1CC', 'aromatic'),
-    ('2-OEt-4-OEt-phenyl', '[*]c1ccc(OCC)cc1OCC', 'aromatic'),
-    ('2-F-3-Cl-phenyl', '[*]c1cccc(Cl)c1F', 'aromatic'),
-    ('2-F-3-Me-phenyl', '[*]c1cccc(C)c1F', 'aromatic'),
-    ('2-F-3-OMe-phenyl', '[*]c1cccc(OC)c1F', 'aromatic'),
-    ('2-F-3-CF3-phenyl', '[*]c1cccc(C(F)(F)F)c1F', 'aromatic'),
-    ('2-F-3-CN-phenyl', '[*]c1cccc(C#N)c1F', 'aromatic'),
-    ('2-F-3-OH-phenyl', '[*]c1cccc(O)c1F', 'aromatic'),
-    ('2-F-3-NH2-phenyl', '[*]c1cccc(N)c1F', 'aromatic'),
-    ('2-F-3-Et-phenyl', '[*]c1cccc(CC)c1F', 'aromatic'),
-    ('2-F-3-OEt-phenyl', '[*]c1cccc(OCC)c1F', 'aromatic'),
-    ('2-Cl-3-Cl-phenyl', '[*]c1cccc(Cl)c1Cl', 'aromatic'),
-    ('2-Cl-3-Me-phenyl', '[*]c1cccc(C)c1Cl', 'aromatic'),
-    ('2-Cl-3-OMe-phenyl', '[*]c1cccc(OC)c1Cl', 'aromatic'),
-    ('2-Cl-3-CF3-phenyl', '[*]c1cccc(C(F)(F)F)c1Cl', 'aromatic'),
-    ('2-Cl-3-CN-phenyl', '[*]c1cccc(C#N)c1Cl', 'aromatic'),
-    ('2-Cl-3-OH-phenyl', '[*]c1cccc(O)c1Cl', 'aromatic'),
-    ('2-Cl-3-NH2-phenyl', '[*]c1cccc(N)c1Cl', 'aromatic'),
-    ('2-Cl-3-Et-phenyl', '[*]c1cccc(CC)c1Cl', 'aromatic'),
-    ('2-Cl-3-OEt-phenyl', '[*]c1cccc(OCC)c1Cl', 'aromatic'),
-    ('2-Me-3-Me-phenyl', '[*]c1cccc(C)c1C', 'aromatic'),
-    ('2-Me-3-OMe-phenyl', '[*]c1cccc(OC)c1C', 'aromatic'),
-    ('2-Me-3-CF3-phenyl', '[*]c1cccc(C(F)(F)F)c1C', 'aromatic'),
-    ('2-Me-3-CN-phenyl', '[*]c1cccc(C#N)c1C', 'aromatic'),
-    ('2-Me-3-OH-phenyl', '[*]c1cccc(O)c1C', 'aromatic'),
-    ('2-Me-3-NH2-phenyl', '[*]c1cccc(N)c1C', 'aromatic'),
-    ('2-Me-3-Et-phenyl', '[*]c1cccc(CC)c1C', 'aromatic'),
-    ('2-Me-3-OEt-phenyl', '[*]c1cccc(OCC)c1C', 'aromatic'),
-    ('2-OMe-3-OMe-phenyl', '[*]c1cccc(OC)c1OC', 'aromatic'),
-    ('2-OMe-3-CF3-phenyl', '[*]c1cccc(C(F)(F)F)c1OC', 'aromatic'),
-    ('2-OMe-3-CN-phenyl', '[*]c1cccc(C#N)c1OC', 'aromatic'),
-    ('2-OMe-3-OH-phenyl', '[*]c1cccc(O)c1OC', 'aromatic'),
-    ('2-OMe-3-NH2-phenyl', '[*]c1cccc(N)c1OC', 'aromatic'),
-    ('2-OMe-3-Et-phenyl', '[*]c1cccc(CC)c1OC', 'aromatic'),
-    ('2-OMe-3-OEt-phenyl', '[*]c1cccc(OCC)c1OC', 'aromatic'),
-    ('2-CF3-3-CF3-phenyl', '[*]c1cccc(C(F)(F)F)c1C(F)(F)F', 'aromatic'),
-    ('2-CF3-3-CN-phenyl', '[*]c1cccc(C#N)c1C(F)(F)F', 'aromatic'),
-    ('2-CF3-3-OH-phenyl', '[*]c1cccc(O)c1C(F)(F)F', 'aromatic'),
-    ('2-CF3-3-NH2-phenyl', '[*]c1cccc(N)c1C(F)(F)F', 'aromatic'),
-    ('2-CF3-3-Et-phenyl', '[*]c1cccc(CC)c1C(F)(F)F', 'aromatic'),
-    ('2-CF3-3-OEt-phenyl', '[*]c1cccc(OCC)c1C(F)(F)F', 'aromatic'),
-    ('2-CN-3-CN-phenyl', '[*]c1cccc(C#N)c1C#N', 'aromatic'),
-    ('2-CN-3-OH-phenyl', '[*]c1cccc(O)c1C#N', 'aromatic'),
-    ('2-CN-3-NH2-phenyl', '[*]c1cccc(N)c1C#N', 'aromatic'),
-    ('2-CN-3-Et-phenyl', '[*]c1cccc(CC)c1C#N', 'aromatic'),
-    ('2-CN-3-OEt-phenyl', '[*]c1cccc(OCC)c1C#N', 'aromatic'),
-    ('2-OH-3-OH-phenyl', '[*]c1cccc(O)c1O', 'aromatic'),
-    ('2-OH-3-NH2-phenyl', '[*]c1cccc(N)c1O', 'aromatic'),
-    ('2-OH-3-Et-phenyl', '[*]c1cccc(CC)c1O', 'aromatic'),
-    ('2-OH-3-OEt-phenyl', '[*]c1cccc(OCC)c1O', 'aromatic'),
-    ('2-NH2-3-NH2-phenyl', '[*]c1cccc(N)c1N', 'aromatic'),
-    ('2-NH2-3-Et-phenyl', '[*]c1cccc(CC)c1N', 'aromatic'),
-    ('2-NH2-3-OEt-phenyl', '[*]c1cccc(OCC)c1N', 'aromatic'),
-    ('2-Et-3-Et-phenyl', '[*]c1cccc(CC)c1CC', 'aromatic'),
-    ('2-Et-3-OEt-phenyl', '[*]c1cccc(OCC)c1CC', 'aromatic'),
-    ('2-OEt-3-OEt-phenyl', '[*]c1cccc(OCC)c1OCC', 'aromatic'),
-    ('2-F-6-Cl-phenyl', '[*]c1c(F)cccc1Cl', 'aromatic'),
-    ('2-F-6-Me-phenyl', '[*]c1c(F)cccc1C', 'aromatic'),
-    ('2-F-6-OMe-phenyl', '[*]c1c(F)cccc1OC', 'aromatic'),
-    ('2-F-6-CF3-phenyl', '[*]c1c(F)cccc1C(F)(F)F', 'aromatic'),
-    ('2-F-6-CN-phenyl', '[*]c1c(F)cccc1C#N', 'aromatic'),
-    ('2-F-6-OH-phenyl', '[*]c1c(F)cccc1O', 'aromatic'),
-    ('2-F-6-NH2-phenyl', '[*]c1c(F)cccc1N', 'aromatic'),
-    ('2-F-6-Et-phenyl', '[*]c1c(F)cccc1CC', 'aromatic'),
-    ('2-F-6-OEt-phenyl', '[*]c1c(F)cccc1OCC', 'aromatic'),
-    ('2-Cl-6-Me-phenyl', '[*]c1c(Cl)cccc1C', 'aromatic'),
-    ('2-Cl-6-OMe-phenyl', '[*]c1c(Cl)cccc1OC', 'aromatic'),
-    ('2-Cl-6-CF3-phenyl', '[*]c1c(Cl)cccc1C(F)(F)F', 'aromatic'),
-    ('2-Cl-6-CN-phenyl', '[*]c1c(Cl)cccc1C#N', 'aromatic'),
-    ('2-Cl-6-OH-phenyl', '[*]c1c(Cl)cccc1O', 'aromatic'),
-    ('2-Cl-6-NH2-phenyl', '[*]c1c(Cl)cccc1N', 'aromatic'),
-    ('2-Cl-6-Et-phenyl', '[*]c1c(Cl)cccc1CC', 'aromatic'),
-    ('2-Cl-6-OEt-phenyl', '[*]c1c(Cl)cccc1OCC', 'aromatic'),
-    ('2-Me-6-OMe-phenyl', '[*]c1c(C)cccc1OC', 'aromatic'),
-    ('2-Me-6-CF3-phenyl', '[*]c1c(C)cccc1C(F)(F)F', 'aromatic'),
-    ('2-Me-6-CN-phenyl', '[*]c1c(C)cccc1C#N', 'aromatic'),
-    ('2-Me-6-OH-phenyl', '[*]c1c(C)cccc1O', 'aromatic'),
-    ('2-Me-6-NH2-phenyl', '[*]c1c(C)cccc1N', 'aromatic'),
-    ('2-Me-6-Et-phenyl', '[*]c1c(C)cccc1CC', 'aromatic'),
-    ('2-Me-6-OEt-phenyl', '[*]c1c(C)cccc1OCC', 'aromatic'),
-    ('2-OMe-6-OMe-phenyl', '[*]c1c(OC)cccc1OC', 'aromatic'),
-    ('2-OMe-6-CF3-phenyl', '[*]c1c(OC)cccc1C(F)(F)F', 'aromatic'),
-    ('2-OMe-6-CN-phenyl', '[*]c1c(OC)cccc1C#N', 'aromatic'),
-    ('2-OMe-6-OH-phenyl', '[*]c1c(OC)cccc1O', 'aromatic'),
-    ('2-OMe-6-NH2-phenyl', '[*]c1c(OC)cccc1N', 'aromatic'),
-    ('2-OMe-6-Et-phenyl', '[*]c1c(OC)cccc1CC', 'aromatic'),
-    ('2-OMe-6-OEt-phenyl', '[*]c1c(OC)cccc1OCC', 'aromatic'),
-    ('2-CF3-6-CF3-phenyl', '[*]c1c(C(F)(F)F)cccc1C(F)(F)F', 'aromatic'),
-    ('2-CF3-6-CN-phenyl', '[*]c1c(C(F)(F)F)cccc1C#N', 'aromatic'),
-    ('2-CF3-6-OH-phenyl', '[*]c1c(C(F)(F)F)cccc1O', 'aromatic'),
-    ('2-CF3-6-NH2-phenyl', '[*]c1c(C(F)(F)F)cccc1N', 'aromatic'),
-    ('2-CF3-6-Et-phenyl', '[*]c1c(C(F)(F)F)cccc1CC', 'aromatic'),
-    ('2-CF3-6-OEt-phenyl', '[*]c1c(C(F)(F)F)cccc1OCC', 'aromatic'),
-    ('2-CN-6-CN-phenyl', '[*]c1c(C#N)cccc1C#N', 'aromatic'),
-    ('2-CN-6-OH-phenyl', '[*]c1c(C#N)cccc1O', 'aromatic'),
-    ('2-CN-6-NH2-phenyl', '[*]c1c(C#N)cccc1N', 'aromatic'),
-    ('2-CN-6-Et-phenyl', '[*]c1c(C#N)cccc1CC', 'aromatic'),
-    ('2-CN-6-OEt-phenyl', '[*]c1c(C#N)cccc1OCC', 'aromatic'),
-    ('2-OH-6-OH-phenyl', '[*]c1c(O)cccc1O', 'aromatic'),
-    ('2-OH-6-NH2-phenyl', '[*]c1c(O)cccc1N', 'aromatic'),
-    ('2-OH-6-Et-phenyl', '[*]c1c(O)cccc1CC', 'aromatic'),
-    ('2-OH-6-OEt-phenyl', '[*]c1c(O)cccc1OCC', 'aromatic'),
-    ('2-NH2-6-NH2-phenyl', '[*]c1c(N)cccc1N', 'aromatic'),
-    ('2-NH2-6-Et-phenyl', '[*]c1c(N)cccc1CC', 'aromatic'),
-    ('2-NH2-6-OEt-phenyl', '[*]c1c(N)cccc1OCC', 'aromatic'),
-    ('2-Et-6-Et-phenyl', '[*]c1c(CC)cccc1CC', 'aromatic'),
-    ('2-Et-6-OEt-phenyl', '[*]c1c(CC)cccc1OCC', 'aromatic'),
-    ('2-OEt-6-OEt-phenyl', '[*]c1c(OCC)cccc1OCC', 'aromatic'),
-    ('5-SO2Me-pyridin-2-yl', '[*]c1ccc(S(C)(=O)=O)cn1', 'aromatic'),
-    ('5-cyclopropyl-pyridin-2-yl', '[*]c1ccc(C1CC1)cn1', 'aromatic'),
-    ('5-NHAc-pyridin-2-yl', '[*]c1ccc(NC(C)=O)cn1', 'aromatic'),
-    ('5-morpholino-pyridin-2-yl', '[*]c1ccc(N1CCOCC1)cn1', 'aromatic'),
-    ('5-piperidino-pyridin-2-yl', '[*]c1ccc(N1CCCCC1)cn1', 'aromatic'),
-    ('5-pyrrolidino-pyridin-2-yl', '[*]c1ccc(N1CCCC1)cn1', 'aromatic'),
-    ('5-SMe-pyridin-2-yl', '[*]c1ccc(SC)cn1', 'aromatic'),
-    ('5-NHSO2Me-pyridin-2-yl', '[*]c1ccc(NS(C)(=O)=O)cn1', 'aromatic'),
-    ('4-SO2Me-pyridin-2-yl', '[*]c1cc(S(C)(=O)=O)ccn1', 'aromatic'),
-    ('4-cyclopropyl-pyridin-2-yl', '[*]c1cc(C1CC1)ccn1', 'aromatic'),
-    ('4-NHAc-pyridin-2-yl', '[*]c1cc(NC(C)=O)ccn1', 'aromatic'),
-    ('4-morpholino-pyridin-2-yl', '[*]c1cc(N1CCOCC1)ccn1', 'aromatic'),
-    ('4-piperidino-pyridin-2-yl', '[*]c1cc(N1CCCCC1)ccn1', 'aromatic'),
-    ('4-pyrrolidino-pyridin-2-yl', '[*]c1cc(N1CCCC1)ccn1', 'aromatic'),
-    ('4-SMe-pyridin-2-yl', '[*]c1cc(SC)ccn1', 'aromatic'),
-    ('4-NHSO2Me-pyridin-2-yl', '[*]c1cc(NS(C)(=O)=O)ccn1', 'aromatic'),
-    ('3-SO2Me-pyridin-2-yl', '[*]c1cccc(S(C)(=O)=O)n1', 'aromatic'),
-    ('3-cyclopropyl-pyridin-2-yl', '[*]c1cccc(C1CC1)n1', 'aromatic'),
-    ('3-NHAc-pyridin-2-yl', '[*]c1cccc(NC(C)=O)n1', 'aromatic'),
-    ('3-morpholino-pyridin-2-yl', '[*]c1cccc(N1CCOCC1)n1', 'aromatic'),
-    ('3-piperidino-pyridin-2-yl', '[*]c1cccc(N1CCCCC1)n1', 'aromatic'),
-    ('3-pyrrolidino-pyridin-2-yl', '[*]c1cccc(N1CCCC1)n1', 'aromatic'),
-    ('3-SMe-pyridin-2-yl', '[*]c1cccc(SC)n1', 'aromatic'),
-    ('3-NHSO2Me-pyridin-2-yl', '[*]c1cccc(NS(C)(=O)=O)n1', 'aromatic'),
-    ('6-SO2Me-pyridin-3-yl', '[*]c1ccc(S(C)(=O)=O)nc1', 'aromatic'),
-    ('6-cyclopropyl-pyridin-3-yl', '[*]c1ccc(C1CC1)nc1', 'aromatic'),
-    ('6-NHAc-pyridin-3-yl', '[*]c1ccc(NC(C)=O)nc1', 'aromatic'),
-    ('6-morpholino-pyridin-3-yl', '[*]c1ccc(N1CCOCC1)nc1', 'aromatic'),
-    ('6-piperidino-pyridin-3-yl', '[*]c1ccc(N1CCCCC1)nc1', 'aromatic'),
-    ('6-pyrrolidino-pyridin-3-yl', '[*]c1ccc(N1CCCC1)nc1', 'aromatic'),
-    ('6-SMe-pyridin-3-yl', '[*]c1ccc(SC)nc1', 'aromatic'),
-    ('6-NHSO2Me-pyridin-3-yl', '[*]c1ccc(NS(C)(=O)=O)nc1', 'aromatic'),
-    ('5-SO2Me-pyridin-3-yl', '[*]c1cncc(S(C)(=O)=O)c1', 'aromatic'),
-    ('5-cyclopropyl-pyridin-3-yl', '[*]c1cncc(C1CC1)c1', 'aromatic'),
-    ('5-NHAc-pyridin-3-yl', '[*]c1cncc(NC(C)=O)c1', 'aromatic'),
-    ('5-morpholino-pyridin-3-yl', '[*]c1cncc(N1CCOCC1)c1', 'aromatic'),
-    ('5-piperidino-pyridin-3-yl', '[*]c1cncc(N1CCCCC1)c1', 'aromatic'),
-    ('5-pyrrolidino-pyridin-3-yl', '[*]c1cncc(N1CCCC1)c1', 'aromatic'),
-    ('5-SMe-pyridin-3-yl', '[*]c1cncc(SC)c1', 'aromatic'),
-    ('5-NHSO2Me-pyridin-3-yl', '[*]c1cncc(NS(C)(=O)=O)c1', 'aromatic'),
-    ('2-SO2Me-pyridin-4-yl', '[*]c1cc(S(C)(=O)=O)ncc1', 'aromatic'),
-    ('2-cyclopropyl-pyridin-4-yl', '[*]c1cc(C1CC1)ncc1', 'aromatic'),
-    ('2-NHAc-pyridin-4-yl', '[*]c1cc(NC(C)=O)ncc1', 'aromatic'),
-    ('2-morpholino-pyridin-4-yl', '[*]c1cc(N1CCOCC1)ncc1', 'aromatic'),
-    ('2-piperidino-pyridin-4-yl', '[*]c1cc(N1CCCCC1)ncc1', 'aromatic'),
-    ('2-pyrrolidino-pyridin-4-yl', '[*]c1cc(N1CCCC1)ncc1', 'aromatic'),
-    ('2-SMe-pyridin-4-yl', '[*]c1cc(SC)ncc1', 'aromatic'),
-    ('2-NHSO2Me-pyridin-4-yl', '[*]c1cc(NS(C)(=O)=O)ncc1', 'aromatic'),
-    ('3-cyclopropyl-pyridin-4-yl', '[*]c1ccnc(C1CC1)c1', 'aromatic'),
-    ('3-morpholino-pyridin-4-yl', '[*]c1ccnc(N1CCOCC1)c1', 'aromatic'),
-    ('3-piperidino-pyridin-4-yl', '[*]c1ccnc(N1CCCCC1)c1', 'aromatic'),
-    ('3-pyrrolidino-pyridin-4-yl', '[*]c1ccnc(N1CCCC1)c1', 'aromatic'),
-    ('4-F-pyrimidin-2-yl', '[*]c1nc(F)ccn1', 'aromatic'),
-    ('4-Cl-pyrimidin-2-yl', '[*]c1nc(Cl)ccn1', 'aromatic'),
-    ('4-Br-pyrimidin-2-yl', '[*]c1nc(Br)ccn1', 'aromatic'),
-    ('4-Me-pyrimidin-2-yl', '[*]c1nc(C)ccn1', 'aromatic'),
-    ('4-Et-pyrimidin-2-yl', '[*]c1nc(CC)ccn1', 'aromatic'),
-    ('4-iPr-pyrimidin-2-yl', '[*]c1nc(C(C)C)ccn1', 'aromatic'),
-    ('4-OEt-pyrimidin-2-yl', '[*]c1nc(OCC)ccn1', 'aromatic'),
-    ('4-OH-pyrimidin-2-yl', '[*]c1nc(O)ccn1', 'aromatic'),
-    ('4-CF3-pyrimidin-2-yl', '[*]c1nc(C(F)(F)F)ccn1', 'aromatic'),
-    ('4-CHF2-pyrimidin-2-yl', '[*]c1nc(C(F)F)ccn1', 'aromatic'),
-    ('4-CN-pyrimidin-2-yl', '[*]c1nc(C#N)ccn1', 'aromatic'),
-    ('4-NHMe-pyrimidin-2-yl', '[*]c1nc(NC)ccn1', 'aromatic'),
-    ('4-NMe2-pyrimidin-2-yl', '[*]c1nc(N(C)C)ccn1', 'aromatic'),
-    ('4-COOH-pyrimidin-2-yl', '[*]c1nc(C(=O)O)ccn1', 'aromatic'),
-    ('4-COOMe-pyrimidin-2-yl', '[*]c1nc(C(=O)OC)ccn1', 'aromatic'),
-    ('4-COMe-pyrimidin-2-yl', '[*]c1nc(C(C)=O)ccn1', 'aromatic'),
-    ('4-SO2Me-pyrimidin-2-yl', '[*]c1nc(S(C)(=O)=O)ccn1', 'aromatic'),
-    ('4-cyclopropyl-pyrimidin-2-yl', '[*]c1nc(C1CC1)ccn1', 'aromatic'),
-    ('4-NHAc-pyrimidin-2-yl', '[*]c1nc(NC(C)=O)ccn1', 'aromatic'),
-    ('4-morpholino-pyrimidin-2-yl', '[*]c1nc(N1CCOCC1)ccn1', 'aromatic'),
-    ('4-piperidino-pyrimidin-2-yl', '[*]c1nc(N1CCCCC1)ccn1', 'aromatic'),
-    ('4-pyrrolidino-pyrimidin-2-yl', '[*]c1nc(N1CCCC1)ccn1', 'aromatic'),
-    ('4-OCF3-pyrimidin-2-yl', '[*]c1nc(OC(F)(F)F)ccn1', 'aromatic'),
-    ('4-SMe-pyrimidin-2-yl', '[*]c1nc(SC)ccn1', 'aromatic'),
-    ('4-NHSO2Me-pyrimidin-2-yl', '[*]c1nc(NS(C)(=O)=O)ccn1', 'aromatic'),
-    ('5-F-pyrimidin-2-yl', '[*]c1ncc(F)cn1', 'aromatic'),
-    ('5-Cl-pyrimidin-2-yl', '[*]c1ncc(Cl)cn1', 'aromatic'),
-    ('5-Br-pyrimidin-2-yl', '[*]c1ncc(Br)cn1', 'aromatic'),
-    ('5-Et-pyrimidin-2-yl', '[*]c1ncc(CC)cn1', 'aromatic'),
-    ('5-iPr-pyrimidin-2-yl', '[*]c1ncc(C(C)C)cn1', 'aromatic'),
-    ('5-OMe-pyrimidin-2-yl', '[*]c1ncc(OC)cn1', 'aromatic'),
-    ('5-OEt-pyrimidin-2-yl', '[*]c1ncc(OCC)cn1', 'aromatic'),
-    ('5-OH-pyrimidin-2-yl', '[*]c1ncc(O)cn1', 'aromatic'),
-    ('5-CF3-pyrimidin-2-yl', '[*]c1ncc(C(F)(F)F)cn1', 'aromatic'),
-    ('5-CHF2-pyrimidin-2-yl', '[*]c1ncc(C(F)F)cn1', 'aromatic'),
-    ('5-CN-pyrimidin-2-yl', '[*]c1ncc(C#N)cn1', 'aromatic'),
-    ('5-NH2-pyrimidin-2-yl', '[*]c1ncc(N)cn1', 'aromatic'),
-    ('5-NHMe-pyrimidin-2-yl', '[*]c1ncc(NC)cn1', 'aromatic'),
-    ('5-NMe2-pyrimidin-2-yl', '[*]c1ncc(N(C)C)cn1', 'aromatic'),
-    ('5-COOH-pyrimidin-2-yl', '[*]c1ncc(C(=O)O)cn1', 'aromatic'),
-    ('5-COOMe-pyrimidin-2-yl', '[*]c1ncc(C(=O)OC)cn1', 'aromatic'),
-    ('5-COMe-pyrimidin-2-yl', '[*]c1ncc(C(C)=O)cn1', 'aromatic'),
-    ('5-SO2Me-pyrimidin-2-yl', '[*]c1ncc(S(C)(=O)=O)cn1', 'aromatic'),
-    ('5-cyclopropyl-pyrimidin-2-yl', '[*]c1ncc(C1CC1)cn1', 'aromatic'),
-    ('5-NHAc-pyrimidin-2-yl', '[*]c1ncc(NC(C)=O)cn1', 'aromatic'),
-    ('5-morpholino-pyrimidin-2-yl', '[*]c1ncc(N1CCOCC1)cn1', 'aromatic'),
-    ('5-piperidino-pyrimidin-2-yl', '[*]c1ncc(N1CCCCC1)cn1', 'aromatic'),
-    ('5-pyrrolidino-pyrimidin-2-yl', '[*]c1ncc(N1CCCC1)cn1', 'aromatic'),
-    ('5-OCF3-pyrimidin-2-yl', '[*]c1ncc(OC(F)(F)F)cn1', 'aromatic'),
-    ('5-SMe-pyrimidin-2-yl', '[*]c1ncc(SC)cn1', 'aromatic'),
-    ('5-NHSO2Me-pyrimidin-2-yl', '[*]c1ncc(NS(C)(=O)=O)cn1', 'aromatic'),
-    ('5-F-pyrimidin-4-yl', '[*]c1ncnc(F)c1', 'aromatic'),
-    ('5-Cl-pyrimidin-4-yl', '[*]c1ncnc(Cl)c1', 'aromatic'),
-    ('5-Br-pyrimidin-4-yl', '[*]c1ncnc(Br)c1', 'aromatic'),
-    ('5-Me-pyrimidin-4-yl', '[*]c1ncnc(C)c1', 'aromatic'),
-    ('5-Et-pyrimidin-4-yl', '[*]c1ncnc(CC)c1', 'aromatic'),
-    ('5-iPr-pyrimidin-4-yl', '[*]c1ncnc(C(C)C)c1', 'aromatic'),
-    ('5-OMe-pyrimidin-4-yl', '[*]c1ncnc(OC)c1', 'aromatic'),
-    ('5-OEt-pyrimidin-4-yl', '[*]c1ncnc(OCC)c1', 'aromatic'),
-    ('5-OH-pyrimidin-4-yl', '[*]c1ncnc(O)c1', 'aromatic'),
-    ('5-CF3-pyrimidin-4-yl', '[*]c1ncnc(C(F)(F)F)c1', 'aromatic'),
-    ('5-CHF2-pyrimidin-4-yl', '[*]c1ncnc(C(F)F)c1', 'aromatic'),
-    ('5-CN-pyrimidin-4-yl', '[*]c1ncnc(C#N)c1', 'aromatic'),
-    ('5-NH2-pyrimidin-4-yl', '[*]c1ncnc(N)c1', 'aromatic'),
-    ('5-NHMe-pyrimidin-4-yl', '[*]c1ncnc(NC)c1', 'aromatic'),
-    ('5-NMe2-pyrimidin-4-yl', '[*]c1ncnc(N(C)C)c1', 'aromatic'),
-    ('5-COOH-pyrimidin-4-yl', '[*]c1ncnc(C(=O)O)c1', 'aromatic'),
-    ('5-COOMe-pyrimidin-4-yl', '[*]c1ncnc(C(=O)OC)c1', 'aromatic'),
-    ('5-COMe-pyrimidin-4-yl', '[*]c1ncnc(C(C)=O)c1', 'aromatic'),
-    ('5-SO2Me-pyrimidin-4-yl', '[*]c1ncnc(S(C)(=O)=O)c1', 'aromatic'),
-    ('5-cyclopropyl-pyrimidin-4-yl', '[*]c1ncnc(C1CC1)c1', 'aromatic'),
-    ('5-NHAc-pyrimidin-4-yl', '[*]c1ncnc(NC(C)=O)c1', 'aromatic'),
-    ('5-morpholino-pyrimidin-4-yl', '[*]c1ncnc(N1CCOCC1)c1', 'aromatic'),
-    ('5-piperidino-pyrimidin-4-yl', '[*]c1ncnc(N1CCCCC1)c1', 'aromatic'),
-    ('5-pyrrolidino-pyrimidin-4-yl', '[*]c1ncnc(N1CCCC1)c1', 'aromatic'),
-    ('5-OCF3-pyrimidin-4-yl', '[*]c1ncnc(OC(F)(F)F)c1', 'aromatic'),
-    ('5-SMe-pyrimidin-4-yl', '[*]c1ncnc(SC)c1', 'aromatic'),
-    ('5-NHSO2Me-pyrimidin-4-yl', '[*]c1ncnc(NS(C)(=O)=O)c1', 'aromatic'),
-    ('3-F-pyrazin-2-yl', '[*]c1cncc(F)n1', 'aromatic'),
-    ('3-Cl-pyrazin-2-yl', '[*]c1cncc(Cl)n1', 'aromatic'),
-    ('3-Br-pyrazin-2-yl', '[*]c1cncc(Br)n1', 'aromatic'),
-    ('3-Me-pyrazin-2-yl', '[*]c1cncc(C)n1', 'aromatic'),
-    ('3-Et-pyrazin-2-yl', '[*]c1cncc(CC)n1', 'aromatic'),
-    ('3-iPr-pyrazin-2-yl', '[*]c1cncc(C(C)C)n1', 'aromatic'),
-    ('3-OMe-pyrazin-2-yl', '[*]c1cncc(OC)n1', 'aromatic'),
-    ('3-OEt-pyrazin-2-yl', '[*]c1cncc(OCC)n1', 'aromatic'),
-    ('3-OH-pyrazin-2-yl', '[*]c1cncc(O)n1', 'aromatic'),
-    ('3-CF3-pyrazin-2-yl', '[*]c1cncc(C(F)(F)F)n1', 'aromatic'),
-    ('3-CHF2-pyrazin-2-yl', '[*]c1cncc(C(F)F)n1', 'aromatic'),
-    ('3-CN-pyrazin-2-yl', '[*]c1cncc(C#N)n1', 'aromatic'),
-    ('3-NH2-pyrazin-2-yl', '[*]c1cncc(N)n1', 'aromatic'),
-    ('3-NHMe-pyrazin-2-yl', '[*]c1cncc(NC)n1', 'aromatic'),
-    ('3-NMe2-pyrazin-2-yl', '[*]c1cncc(N(C)C)n1', 'aromatic'),
-    ('3-COOH-pyrazin-2-yl', '[*]c1cncc(C(=O)O)n1', 'aromatic'),
-    ('3-COOMe-pyrazin-2-yl', '[*]c1cncc(C(=O)OC)n1', 'aromatic'),
-    ('3-COMe-pyrazin-2-yl', '[*]c1cncc(C(C)=O)n1', 'aromatic'),
-    ('3-SO2Me-pyrazin-2-yl', '[*]c1cncc(S(C)(=O)=O)n1', 'aromatic'),
-    ('3-cyclopropyl-pyrazin-2-yl', '[*]c1cncc(C1CC1)n1', 'aromatic'),
-    ('3-NHAc-pyrazin-2-yl', '[*]c1cncc(NC(C)=O)n1', 'aromatic'),
-    ('3-morpholino-pyrazin-2-yl', '[*]c1cncc(N1CCOCC1)n1', 'aromatic'),
-    ('3-piperidino-pyrazin-2-yl', '[*]c1cncc(N1CCCCC1)n1', 'aromatic'),
-    ('3-pyrrolidino-pyrazin-2-yl', '[*]c1cncc(N1CCCC1)n1', 'aromatic'),
-    ('3-OCF3-pyrazin-2-yl', '[*]c1cncc(OC(F)(F)F)n1', 'aromatic'),
-    ('3-SMe-pyrazin-2-yl', '[*]c1cncc(SC)n1', 'aromatic'),
-    ('3-NHSO2Me-pyrazin-2-yl', '[*]c1cncc(NS(C)(=O)=O)n1', 'aromatic'),
-    ('3-F-thiophen-2-yl', '[*]c1ccsc1F', 'aromatic'),
-    ('3-Cl-thiophen-2-yl', '[*]c1ccsc1Cl', 'aromatic'),
-    ('3-Br-thiophen-2-yl', '[*]c1ccsc1Br', 'aromatic'),
-    ('3-Et-thiophen-2-yl', '[*]c1ccsc1CC', 'aromatic'),
-    ('3-iPr-thiophen-2-yl', '[*]c1ccsc1C(C)C', 'aromatic'),
-    ('3-OMe-thiophen-2-yl', '[*]c1ccsc1OC', 'aromatic'),
-    ('3-OEt-thiophen-2-yl', '[*]c1ccsc1OCC', 'aromatic'),
-    ('3-OH-thiophen-2-yl', '[*]c1ccsc1O', 'aromatic'),
-    ('3-CF3-thiophen-2-yl', '[*]c1ccsc1C(F)(F)F', 'aromatic'),
-    ('3-CHF2-thiophen-2-yl', '[*]c1ccsc1C(F)F', 'aromatic'),
-    ('3-CN-thiophen-2-yl', '[*]c1ccsc1C#N', 'aromatic'),
-    ('3-NH2-thiophen-2-yl', '[*]c1ccsc1N', 'aromatic'),
-    ('3-NHMe-thiophen-2-yl', '[*]c1ccsc1NC', 'aromatic'),
-    ('3-NMe2-thiophen-2-yl', '[*]c1ccsc1N(C)C', 'aromatic'),
-    ('3-COOH-thiophen-2-yl', '[*]c1ccsc1C(=O)O', 'aromatic'),
-    ('3-COOMe-thiophen-2-yl', '[*]c1ccsc1C(=O)OC', 'aromatic'),
-    ('3-COMe-thiophen-2-yl', '[*]c1ccsc1C(C)=O', 'aromatic'),
-    ('3-SO2Me-thiophen-2-yl', '[*]c1ccsc1S(C)(=O)=O', 'aromatic'),
-    ('3-cyclopropyl-thiophen-2-yl', '[*]c1ccsc1C1CC1', 'aromatic'),
-    ('3-NHAc-thiophen-2-yl', '[*]c1ccsc1NC(C)=O', 'aromatic'),
-    ('3-morpholino-thiophen-2-yl', '[*]c1ccsc1N1CCOCC1', 'aromatic'),
-    ('3-piperidino-thiophen-2-yl', '[*]c1ccsc1N1CCCCC1', 'aromatic'),
-    ('3-pyrrolidino-thiophen-2-yl', '[*]c1ccsc1N1CCCC1', 'aromatic'),
-    ('3-OCF3-thiophen-2-yl', '[*]c1ccsc1OC(F)(F)F', 'aromatic'),
-    ('3-SMe-thiophen-2-yl', '[*]c1ccsc1SC', 'aromatic'),
-    ('3-NHSO2Me-thiophen-2-yl', '[*]c1ccsc1NS(C)(=O)=O', 'aromatic'),
-    ('4-F-thiophen-2-yl', '[*]c1cc(F)cs1', 'aromatic'),
-    ('4-Cl-thiophen-2-yl', '[*]c1cc(Cl)cs1', 'aromatic'),
-    ('4-Br-thiophen-2-yl', '[*]c1cc(Br)cs1', 'aromatic'),
-    ('4-Et-thiophen-2-yl', '[*]c1cc(CC)cs1', 'aromatic'),
-    ('4-iPr-thiophen-2-yl', '[*]c1cc(C(C)C)cs1', 'aromatic'),
-    ('4-OMe-thiophen-2-yl', '[*]c1cc(OC)cs1', 'aromatic'),
-    ('4-OEt-thiophen-2-yl', '[*]c1cc(OCC)cs1', 'aromatic'),
-    ('4-OH-thiophen-2-yl', '[*]c1cc(O)cs1', 'aromatic'),
-    ('4-CF3-thiophen-2-yl', '[*]c1cc(C(F)(F)F)cs1', 'aromatic'),
-    ('4-CHF2-thiophen-2-yl', '[*]c1cc(C(F)F)cs1', 'aromatic'),
-    ('4-CN-thiophen-2-yl', '[*]c1cc(C#N)cs1', 'aromatic'),
-    ('4-NH2-thiophen-2-yl', '[*]c1cc(N)cs1', 'aromatic'),
-    ('4-NHMe-thiophen-2-yl', '[*]c1cc(NC)cs1', 'aromatic'),
-    ('4-NMe2-thiophen-2-yl', '[*]c1cc(N(C)C)cs1', 'aromatic'),
-    ('4-COOH-thiophen-2-yl', '[*]c1cc(C(=O)O)cs1', 'aromatic'),
-    ('4-COOMe-thiophen-2-yl', '[*]c1cc(C(=O)OC)cs1', 'aromatic'),
-    ('4-COMe-thiophen-2-yl', '[*]c1cc(C(C)=O)cs1', 'aromatic'),
-    ('4-SO2Me-thiophen-2-yl', '[*]c1cc(S(C)(=O)=O)cs1', 'aromatic'),
-    ('4-cyclopropyl-thiophen-2-yl', '[*]c1cc(C1CC1)cs1', 'aromatic'),
-    ('4-NHAc-thiophen-2-yl', '[*]c1cc(NC(C)=O)cs1', 'aromatic'),
-    ('4-morpholino-thiophen-2-yl', '[*]c1cc(N1CCOCC1)cs1', 'aromatic'),
-    ('4-piperidino-thiophen-2-yl', '[*]c1cc(N1CCCCC1)cs1', 'aromatic'),
-    ('4-pyrrolidino-thiophen-2-yl', '[*]c1cc(N1CCCC1)cs1', 'aromatic'),
-    ('4-OCF3-thiophen-2-yl', '[*]c1cc(OC(F)(F)F)cs1', 'aromatic'),
-    ('4-SMe-thiophen-2-yl', '[*]c1cc(SC)cs1', 'aromatic'),
-    ('4-NHSO2Me-thiophen-2-yl', '[*]c1cc(NS(C)(=O)=O)cs1', 'aromatic'),
-    ('5-Cl-thiophen-2-yl', '[*]c1ccc(Cl)s1', 'aromatic'),
-    ('5-Br-thiophen-2-yl', '[*]c1ccc(Br)s1', 'aromatic'),
-    ('5-Et-thiophen-2-yl', '[*]c1ccc(CC)s1', 'aromatic'),
-    ('5-iPr-thiophen-2-yl', '[*]c1ccc(C(C)C)s1', 'aromatic'),
-    ('5-OMe-thiophen-2-yl', '[*]c1ccc(OC)s1', 'aromatic'),
-    ('5-OEt-thiophen-2-yl', '[*]c1ccc(OCC)s1', 'aromatic'),
-    ('5-OH-thiophen-2-yl', '[*]c1ccc(O)s1', 'aromatic'),
-    ('5-CF3-thiophen-2-yl', '[*]c1ccc(C(F)(F)F)s1', 'aromatic'),
-    ('5-CHF2-thiophen-2-yl', '[*]c1ccc(C(F)F)s1', 'aromatic'),
-    ('5-CN-thiophen-2-yl', '[*]c1ccc(C#N)s1', 'aromatic'),
-    ('5-NH2-thiophen-2-yl', '[*]c1ccc(N)s1', 'aromatic'),
-    ('5-NHMe-thiophen-2-yl', '[*]c1ccc(NC)s1', 'aromatic'),
-    ('5-NMe2-thiophen-2-yl', '[*]c1ccc(N(C)C)s1', 'aromatic'),
-    ('5-COOH-thiophen-2-yl', '[*]c1ccc(C(=O)O)s1', 'aromatic'),
-    ('5-COOMe-thiophen-2-yl', '[*]c1ccc(C(=O)OC)s1', 'aromatic'),
-    ('5-COMe-thiophen-2-yl', '[*]c1ccc(C(C)=O)s1', 'aromatic'),
-    ('5-SO2Me-thiophen-2-yl', '[*]c1ccc(S(C)(=O)=O)s1', 'aromatic'),
-    ('5-cyclopropyl-thiophen-2-yl', '[*]c1ccc(C1CC1)s1', 'aromatic'),
-    ('5-NHAc-thiophen-2-yl', '[*]c1ccc(NC(C)=O)s1', 'aromatic'),
-    ('5-morpholino-thiophen-2-yl', '[*]c1ccc(N1CCOCC1)s1', 'aromatic'),
-    ('5-piperidino-thiophen-2-yl', '[*]c1ccc(N1CCCCC1)s1', 'aromatic'),
-    ('5-pyrrolidino-thiophen-2-yl', '[*]c1ccc(N1CCCC1)s1', 'aromatic'),
-    ('5-OCF3-thiophen-2-yl', '[*]c1ccc(OC(F)(F)F)s1', 'aromatic'),
-    ('5-SMe-thiophen-2-yl', '[*]c1ccc(SC)s1', 'aromatic'),
-    ('5-NHSO2Me-thiophen-2-yl', '[*]c1ccc(NS(C)(=O)=O)s1', 'aromatic'),
-    ('2-F-thiophen-3-yl', '[*]c1cc(F)sc1', 'aromatic'),
-    ('2-Cl-thiophen-3-yl', '[*]c1cc(Cl)sc1', 'aromatic'),
-    ('2-Br-thiophen-3-yl', '[*]c1cc(Br)sc1', 'aromatic'),
-    ('2-Me-thiophen-3-yl', '[*]c1cc(C)sc1', 'aromatic'),
-    ('2-Et-thiophen-3-yl', '[*]c1cc(CC)sc1', 'aromatic'),
-    ('2-iPr-thiophen-3-yl', '[*]c1cc(C(C)C)sc1', 'aromatic'),
-    ('2-OMe-thiophen-3-yl', '[*]c1cc(OC)sc1', 'aromatic'),
-    ('2-OEt-thiophen-3-yl', '[*]c1cc(OCC)sc1', 'aromatic'),
-    ('2-OH-thiophen-3-yl', '[*]c1cc(O)sc1', 'aromatic'),
-    ('2-CF3-thiophen-3-yl', '[*]c1cc(C(F)(F)F)sc1', 'aromatic'),
-    ('2-CHF2-thiophen-3-yl', '[*]c1cc(C(F)F)sc1', 'aromatic'),
-    ('2-CN-thiophen-3-yl', '[*]c1cc(C#N)sc1', 'aromatic'),
-    ('2-NH2-thiophen-3-yl', '[*]c1cc(N)sc1', 'aromatic'),
-    ('2-NHMe-thiophen-3-yl', '[*]c1cc(NC)sc1', 'aromatic'),
-    ('2-NMe2-thiophen-3-yl', '[*]c1cc(N(C)C)sc1', 'aromatic'),
-    ('2-COOH-thiophen-3-yl', '[*]c1cc(C(=O)O)sc1', 'aromatic'),
-    ('2-COOMe-thiophen-3-yl', '[*]c1cc(C(=O)OC)sc1', 'aromatic'),
-    ('2-COMe-thiophen-3-yl', '[*]c1cc(C(C)=O)sc1', 'aromatic'),
-    ('2-SO2Me-thiophen-3-yl', '[*]c1cc(S(C)(=O)=O)sc1', 'aromatic'),
-    ('2-NHAc-thiophen-3-yl', '[*]c1cc(NC(C)=O)sc1', 'aromatic'),
-    ('2-OCF3-thiophen-3-yl', '[*]c1cc(OC(F)(F)F)sc1', 'aromatic'),
-    ('2-SMe-thiophen-3-yl', '[*]c1cc(SC)sc1', 'aromatic'),
-    ('2-NHSO2Me-thiophen-3-yl', '[*]c1cc(NS(C)(=O)=O)sc1', 'aromatic'),
-    ('3-F-furan-2-yl', '[*]c1ccoc1F', 'aromatic'),
-    ('3-Cl-furan-2-yl', '[*]c1ccoc1Cl', 'aromatic'),
-    ('3-Br-furan-2-yl', '[*]c1ccoc1Br', 'aromatic'),
-    ('3-Et-furan-2-yl', '[*]c1ccoc1CC', 'aromatic'),
-    ('3-iPr-furan-2-yl', '[*]c1ccoc1C(C)C', 'aromatic'),
-    ('3-OMe-furan-2-yl', '[*]c1ccoc1OC', 'aromatic'),
-    ('3-OEt-furan-2-yl', '[*]c1ccoc1OCC', 'aromatic'),
-    ('3-OH-furan-2-yl', '[*]c1ccoc1O', 'aromatic'),
-    ('3-CF3-furan-2-yl', '[*]c1ccoc1C(F)(F)F', 'aromatic'),
-    ('3-CHF2-furan-2-yl', '[*]c1ccoc1C(F)F', 'aromatic'),
-    ('3-CN-furan-2-yl', '[*]c1ccoc1C#N', 'aromatic'),
-    ('3-NH2-furan-2-yl', '[*]c1ccoc1N', 'aromatic'),
-    ('3-NHMe-furan-2-yl', '[*]c1ccoc1NC', 'aromatic'),
-    ('3-NMe2-furan-2-yl', '[*]c1ccoc1N(C)C', 'aromatic'),
-    ('3-COOH-furan-2-yl', '[*]c1ccoc1C(=O)O', 'aromatic'),
-    ('3-COOMe-furan-2-yl', '[*]c1ccoc1C(=O)OC', 'aromatic'),
-    ('3-COMe-furan-2-yl', '[*]c1ccoc1C(C)=O', 'aromatic'),
-    ('3-SO2Me-furan-2-yl', '[*]c1ccoc1S(C)(=O)=O', 'aromatic'),
-    ('3-cyclopropyl-furan-2-yl', '[*]c1ccoc1C1CC1', 'aromatic'),
-    ('3-NHAc-furan-2-yl', '[*]c1ccoc1NC(C)=O', 'aromatic'),
-    ('3-morpholino-furan-2-yl', '[*]c1ccoc1N1CCOCC1', 'aromatic'),
-    ('3-piperidino-furan-2-yl', '[*]c1ccoc1N1CCCCC1', 'aromatic'),
-    ('3-pyrrolidino-furan-2-yl', '[*]c1ccoc1N1CCCC1', 'aromatic'),
-    ('3-OCF3-furan-2-yl', '[*]c1ccoc1OC(F)(F)F', 'aromatic'),
-    ('3-SMe-furan-2-yl', '[*]c1ccoc1SC', 'aromatic'),
-    ('3-NHSO2Me-furan-2-yl', '[*]c1ccoc1NS(C)(=O)=O', 'aromatic'),
-    ('5-F-furan-2-yl', '[*]c1ccc(F)o1', 'aromatic'),
-    ('5-Cl-furan-2-yl', '[*]c1ccc(Cl)o1', 'aromatic'),
-    ('5-Br-furan-2-yl', '[*]c1ccc(Br)o1', 'aromatic'),
-    ('5-Et-furan-2-yl', '[*]c1ccc(CC)o1', 'aromatic'),
-    ('5-iPr-furan-2-yl', '[*]c1ccc(C(C)C)o1', 'aromatic'),
-    ('5-OMe-furan-2-yl', '[*]c1ccc(OC)o1', 'aromatic'),
-    ('5-OEt-furan-2-yl', '[*]c1ccc(OCC)o1', 'aromatic'),
-    ('5-OH-furan-2-yl', '[*]c1ccc(O)o1', 'aromatic'),
-    ('5-CF3-furan-2-yl', '[*]c1ccc(C(F)(F)F)o1', 'aromatic'),
-    ('5-CHF2-furan-2-yl', '[*]c1ccc(C(F)F)o1', 'aromatic'),
-    ('5-CN-furan-2-yl', '[*]c1ccc(C#N)o1', 'aromatic'),
-    ('5-NH2-furan-2-yl', '[*]c1ccc(N)o1', 'aromatic'),
-    ('5-NHMe-furan-2-yl', '[*]c1ccc(NC)o1', 'aromatic'),
-    ('5-NMe2-furan-2-yl', '[*]c1ccc(N(C)C)o1', 'aromatic'),
-    ('5-COOH-furan-2-yl', '[*]c1ccc(C(=O)O)o1', 'aromatic'),
-    ('5-COOMe-furan-2-yl', '[*]c1ccc(C(=O)OC)o1', 'aromatic'),
-    ('5-COMe-furan-2-yl', '[*]c1ccc(C(C)=O)o1', 'aromatic'),
-    ('5-SO2Me-furan-2-yl', '[*]c1ccc(S(C)(=O)=O)o1', 'aromatic'),
-    ('5-cyclopropyl-furan-2-yl', '[*]c1ccc(C1CC1)o1', 'aromatic'),
-    ('5-NHAc-furan-2-yl', '[*]c1ccc(NC(C)=O)o1', 'aromatic'),
-    ('5-morpholino-furan-2-yl', '[*]c1ccc(N1CCOCC1)o1', 'aromatic'),
-    ('5-piperidino-furan-2-yl', '[*]c1ccc(N1CCCCC1)o1', 'aromatic'),
-    ('5-pyrrolidino-furan-2-yl', '[*]c1ccc(N1CCCC1)o1', 'aromatic'),
-    ('5-OCF3-furan-2-yl', '[*]c1ccc(OC(F)(F)F)o1', 'aromatic'),
-    ('5-SMe-furan-2-yl', '[*]c1ccc(SC)o1', 'aromatic'),
-    ('5-NHSO2Me-furan-2-yl', '[*]c1ccc(NS(C)(=O)=O)o1', 'aromatic'),
-    ('3-F-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1F', 'aromatic'),
-    ('3-Cl-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1Cl', 'aromatic'),
-    ('3-Br-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1Br', 'aromatic'),
-    ('3-Me-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1C', 'aromatic'),
-    ('3-Et-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1CC', 'aromatic'),
-    ('3-iPr-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1C(C)C', 'aromatic'),
-    ('3-OMe-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1OC', 'aromatic'),
-    ('3-OEt-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1OCC', 'aromatic'),
-    ('3-OH-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1O', 'aromatic'),
-    ('3-CF3-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1C(F)(F)F', 'aromatic'),
-    ('3-CHF2-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1C(F)F', 'aromatic'),
-    ('3-CN-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1C#N', 'aromatic'),
-    ('3-NH2-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1N', 'aromatic'),
-    ('3-NHMe-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1NC', 'aromatic'),
-    ('3-NMe2-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1N(C)C', 'aromatic'),
-    ('3-COOH-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1C(=O)O', 'aromatic'),
-    ('3-COOMe-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1C(=O)OC', 'aromatic'),
-    ('3-COMe-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1C(C)=O', 'aromatic'),
-    ('3-SO2Me-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1S(C)(=O)=O', 'aromatic'),
-    ('3-cyclopropyl-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1C1CC1', 'aromatic'),
-    ('3-NHAc-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1NC(C)=O', 'aromatic'),
-    ('3-morpholino-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1N1CCOCC1', 'aromatic'),
-    ('3-piperidino-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1N1CCCCC1', 'aromatic'),
-    ('3-pyrrolidino-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1N1CCCC1', 'aromatic'),
-    ('3-OCF3-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1OC(F)(F)F', 'aromatic'),
-    ('3-SMe-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1SC', 'aromatic'),
-    ('3-NHSO2Me-1-Me-pyrazol-5-yl', '[*]c1cnn(C)c1NS(C)(=O)=O', 'aromatic'),
-    ('4-F-1-Me-pyrazol-3-yl', '[*]c1c(F)cn(C)n1', 'aromatic'),
-    ('4-Cl-1-Me-pyrazol-3-yl', '[*]c1c(Cl)cn(C)n1', 'aromatic'),
-    ('4-Br-1-Me-pyrazol-3-yl', '[*]c1c(Br)cn(C)n1', 'aromatic'),
-    ('4-Me-1-Me-pyrazol-3-yl', '[*]c1c(C)cn(C)n1', 'aromatic'),
-    ('4-Et-1-Me-pyrazol-3-yl', '[*]c1c(CC)cn(C)n1', 'aromatic'),
-    ('4-iPr-1-Me-pyrazol-3-yl', '[*]c1c(C(C)C)cn(C)n1', 'aromatic'),
-    ('4-OMe-1-Me-pyrazol-3-yl', '[*]c1c(OC)cn(C)n1', 'aromatic'),
-    ('4-OEt-1-Me-pyrazol-3-yl', '[*]c1c(OCC)cn(C)n1', 'aromatic'),
-    ('4-OH-1-Me-pyrazol-3-yl', '[*]c1c(O)cn(C)n1', 'aromatic'),
-    ('4-CF3-1-Me-pyrazol-3-yl', '[*]c1c(C(F)(F)F)cn(C)n1', 'aromatic'),
-    ('4-CHF2-1-Me-pyrazol-3-yl', '[*]c1c(C(F)F)cn(C)n1', 'aromatic'),
-    ('4-CN-1-Me-pyrazol-3-yl', '[*]c1c(C#N)cn(C)n1', 'aromatic'),
-    ('4-NH2-1-Me-pyrazol-3-yl', '[*]c1c(N)cn(C)n1', 'aromatic'),
-    ('4-NHMe-1-Me-pyrazol-3-yl', '[*]c1c(NC)cn(C)n1', 'aromatic'),
-    ('4-NMe2-1-Me-pyrazol-3-yl', '[*]c1c(N(C)C)cn(C)n1', 'aromatic'),
-    ('4-COOH-1-Me-pyrazol-3-yl', '[*]c1c(C(=O)O)cn(C)n1', 'aromatic'),
-    ('4-COOMe-1-Me-pyrazol-3-yl', '[*]c1c(C(=O)OC)cn(C)n1', 'aromatic'),
-    ('4-COMe-1-Me-pyrazol-3-yl', '[*]c1c(C(C)=O)cn(C)n1', 'aromatic'),
-    ('4-SO2Me-1-Me-pyrazol-3-yl', '[*]c1c(S(C)(=O)=O)cn(C)n1', 'aromatic'),
-    ('4-NHAc-1-Me-pyrazol-3-yl', '[*]c1c(NC(C)=O)cn(C)n1', 'aromatic'),
-    ('4-OCF3-1-Me-pyrazol-3-yl', '[*]c1c(OC(F)(F)F)cn(C)n1', 'aromatic'),
-    ('4-SMe-1-Me-pyrazol-3-yl', '[*]c1c(SC)cn(C)n1', 'aromatic'),
-    ('4-NHSO2Me-1-Me-pyrazol-3-yl', '[*]c1c(NS(C)(=O)=O)cn(C)n1', 'aromatic'),
-    ('4-F-1-Me-imidazol-2-yl', '[*]c1nc(F)cn1C', 'aromatic'),
-    ('4-Cl-1-Me-imidazol-2-yl', '[*]c1nc(Cl)cn1C', 'aromatic'),
-    ('4-Br-1-Me-imidazol-2-yl', '[*]c1nc(Br)cn1C', 'aromatic'),
-    ('4-Me-1-Me-imidazol-2-yl', '[*]c1nc(C)cn1C', 'aromatic'),
-    ('4-Et-1-Me-imidazol-2-yl', '[*]c1nc(CC)cn1C', 'aromatic'),
-    ('4-iPr-1-Me-imidazol-2-yl', '[*]c1nc(C(C)C)cn1C', 'aromatic'),
-    ('4-OMe-1-Me-imidazol-2-yl', '[*]c1nc(OC)cn1C', 'aromatic'),
-    ('4-OEt-1-Me-imidazol-2-yl', '[*]c1nc(OCC)cn1C', 'aromatic'),
-    ('4-OH-1-Me-imidazol-2-yl', '[*]c1nc(O)cn1C', 'aromatic'),
-    ('4-CF3-1-Me-imidazol-2-yl', '[*]c1nc(C(F)(F)F)cn1C', 'aromatic'),
-    ('4-CHF2-1-Me-imidazol-2-yl', '[*]c1nc(C(F)F)cn1C', 'aromatic'),
-    ('4-CN-1-Me-imidazol-2-yl', '[*]c1nc(C#N)cn1C', 'aromatic'),
-    ('4-NH2-1-Me-imidazol-2-yl', '[*]c1nc(N)cn1C', 'aromatic'),
-    ('4-NHMe-1-Me-imidazol-2-yl', '[*]c1nc(NC)cn1C', 'aromatic'),
-    ('4-NMe2-1-Me-imidazol-2-yl', '[*]c1nc(N(C)C)cn1C', 'aromatic'),
-    ('4-COOH-1-Me-imidazol-2-yl', '[*]c1nc(C(=O)O)cn1C', 'aromatic'),
-    ('4-COOMe-1-Me-imidazol-2-yl', '[*]c1nc(C(=O)OC)cn1C', 'aromatic'),
-    ('4-COMe-1-Me-imidazol-2-yl', '[*]c1nc(C(C)=O)cn1C', 'aromatic'),
-    ('4-SO2Me-1-Me-imidazol-2-yl', '[*]c1nc(S(C)(=O)=O)cn1C', 'aromatic'),
-    ('4-cyclopropyl-1-Me-imidazol-2-yl', '[*]c1nc(C1CC1)cn1C', 'aromatic'),
-    ('4-NHAc-1-Me-imidazol-2-yl', '[*]c1nc(NC(C)=O)cn1C', 'aromatic'),
-    ('4-morpholino-1-Me-imidazol-2-yl', '[*]c1nc(N1CCOCC1)cn1C', 'aromatic'),
-    ('4-piperidino-1-Me-imidazol-2-yl', '[*]c1nc(N1CCCCC1)cn1C', 'aromatic'),
-    ('4-pyrrolidino-1-Me-imidazol-2-yl', '[*]c1nc(N1CCCC1)cn1C', 'aromatic'),
-    ('4-OCF3-1-Me-imidazol-2-yl', '[*]c1nc(OC(F)(F)F)cn1C', 'aromatic'),
-    ('4-SMe-1-Me-imidazol-2-yl', '[*]c1nc(SC)cn1C', 'aromatic'),
-    ('4-NHSO2Me-1-Me-imidazol-2-yl', '[*]c1nc(NS(C)(=O)=O)cn1C', 'aromatic'),
-    ('4-F-oxazol-2-yl', '[*]c1nc(F)co1', 'aromatic'),
-    ('4-Cl-oxazol-2-yl', '[*]c1nc(Cl)co1', 'aromatic'),
-    ('4-Br-oxazol-2-yl', '[*]c1nc(Br)co1', 'aromatic'),
-    ('4-Et-oxazol-2-yl', '[*]c1nc(CC)co1', 'aromatic'),
-    ('4-iPr-oxazol-2-yl', '[*]c1nc(C(C)C)co1', 'aromatic'),
-    ('4-OMe-oxazol-2-yl', '[*]c1nc(OC)co1', 'aromatic'),
-    ('4-OEt-oxazol-2-yl', '[*]c1nc(OCC)co1', 'aromatic'),
-    ('4-OH-oxazol-2-yl', '[*]c1nc(O)co1', 'aromatic'),
-    ('4-CF3-oxazol-2-yl', '[*]c1nc(C(F)(F)F)co1', 'aromatic'),
-    ('4-CHF2-oxazol-2-yl', '[*]c1nc(C(F)F)co1', 'aromatic'),
-    ('4-CN-oxazol-2-yl', '[*]c1nc(C#N)co1', 'aromatic'),
-    ('4-NH2-oxazol-2-yl', '[*]c1nc(N)co1', 'aromatic'),
-    ('4-NHMe-oxazol-2-yl', '[*]c1nc(NC)co1', 'aromatic'),
-    ('4-NMe2-oxazol-2-yl', '[*]c1nc(N(C)C)co1', 'aromatic'),
-    ('4-COOH-oxazol-2-yl', '[*]c1nc(C(=O)O)co1', 'aromatic'),
-    ('4-COOMe-oxazol-2-yl', '[*]c1nc(C(=O)OC)co1', 'aromatic'),
-    ('4-COMe-oxazol-2-yl', '[*]c1nc(C(C)=O)co1', 'aromatic'),
-    ('4-SO2Me-oxazol-2-yl', '[*]c1nc(S(C)(=O)=O)co1', 'aromatic'),
-    ('4-cyclopropyl-oxazol-2-yl', '[*]c1nc(C1CC1)co1', 'aromatic'),
-    ('4-NHAc-oxazol-2-yl', '[*]c1nc(NC(C)=O)co1', 'aromatic'),
-    ('4-morpholino-oxazol-2-yl', '[*]c1nc(N1CCOCC1)co1', 'aromatic'),
-    ('4-piperidino-oxazol-2-yl', '[*]c1nc(N1CCCCC1)co1', 'aromatic'),
-    ('4-pyrrolidino-oxazol-2-yl', '[*]c1nc(N1CCCC1)co1', 'aromatic'),
-    ('4-OCF3-oxazol-2-yl', '[*]c1nc(OC(F)(F)F)co1', 'aromatic'),
-    ('4-SMe-oxazol-2-yl', '[*]c1nc(SC)co1', 'aromatic'),
-    ('4-NHSO2Me-oxazol-2-yl', '[*]c1nc(NS(C)(=O)=O)co1', 'aromatic'),
-    ('5-F-oxazol-2-yl', '[*]c1ncc(F)o1', 'aromatic'),
-    ('5-Cl-oxazol-2-yl', '[*]c1ncc(Cl)o1', 'aromatic'),
-    ('5-Br-oxazol-2-yl', '[*]c1ncc(Br)o1', 'aromatic'),
-    ('5-Et-oxazol-2-yl', '[*]c1ncc(CC)o1', 'aromatic'),
-    ('5-iPr-oxazol-2-yl', '[*]c1ncc(C(C)C)o1', 'aromatic'),
-    ('5-OMe-oxazol-2-yl', '[*]c1ncc(OC)o1', 'aromatic'),
-    ('5-OEt-oxazol-2-yl', '[*]c1ncc(OCC)o1', 'aromatic'),
-    ('5-OH-oxazol-2-yl', '[*]c1ncc(O)o1', 'aromatic'),
-    ('5-CF3-oxazol-2-yl', '[*]c1ncc(C(F)(F)F)o1', 'aromatic'),
-    ('5-CHF2-oxazol-2-yl', '[*]c1ncc(C(F)F)o1', 'aromatic'),
-    ('5-CN-oxazol-2-yl', '[*]c1ncc(C#N)o1', 'aromatic'),
-    ('5-NH2-oxazol-2-yl', '[*]c1ncc(N)o1', 'aromatic'),
-    ('5-NHMe-oxazol-2-yl', '[*]c1ncc(NC)o1', 'aromatic'),
-    ('5-NMe2-oxazol-2-yl', '[*]c1ncc(N(C)C)o1', 'aromatic'),
-    ('5-COOH-oxazol-2-yl', '[*]c1ncc(C(=O)O)o1', 'aromatic'),
-    ('5-COOMe-oxazol-2-yl', '[*]c1ncc(C(=O)OC)o1', 'aromatic'),
-    ('5-COMe-oxazol-2-yl', '[*]c1ncc(C(C)=O)o1', 'aromatic'),
-    ('5-SO2Me-oxazol-2-yl', '[*]c1ncc(S(C)(=O)=O)o1', 'aromatic'),
-    ('5-cyclopropyl-oxazol-2-yl', '[*]c1ncc(C1CC1)o1', 'aromatic'),
-    ('5-NHAc-oxazol-2-yl', '[*]c1ncc(NC(C)=O)o1', 'aromatic'),
-    ('5-morpholino-oxazol-2-yl', '[*]c1ncc(N1CCOCC1)o1', 'aromatic'),
-    ('5-piperidino-oxazol-2-yl', '[*]c1ncc(N1CCCCC1)o1', 'aromatic'),
-    ('5-pyrrolidino-oxazol-2-yl', '[*]c1ncc(N1CCCC1)o1', 'aromatic'),
-    ('5-OCF3-oxazol-2-yl', '[*]c1ncc(OC(F)(F)F)o1', 'aromatic'),
-    ('5-SMe-oxazol-2-yl', '[*]c1ncc(SC)o1', 'aromatic'),
-    ('5-NHSO2Me-oxazol-2-yl', '[*]c1ncc(NS(C)(=O)=O)o1', 'aromatic'),
-    ('4-F-thiazol-2-yl', '[*]c1nc(F)cs1', 'aromatic'),
-    ('4-Cl-thiazol-2-yl', '[*]c1nc(Cl)cs1', 'aromatic'),
-    ('4-Br-thiazol-2-yl', '[*]c1nc(Br)cs1', 'aromatic'),
-    ('4-Et-thiazol-2-yl', '[*]c1nc(CC)cs1', 'aromatic'),
-    ('4-iPr-thiazol-2-yl', '[*]c1nc(C(C)C)cs1', 'aromatic'),
-    ('4-OMe-thiazol-2-yl', '[*]c1nc(OC)cs1', 'aromatic'),
-    ('4-OEt-thiazol-2-yl', '[*]c1nc(OCC)cs1', 'aromatic'),
-    ('4-OH-thiazol-2-yl', '[*]c1nc(O)cs1', 'aromatic'),
-    ('4-CHF2-thiazol-2-yl', '[*]c1nc(C(F)F)cs1', 'aromatic'),
-    ('4-CN-thiazol-2-yl', '[*]c1nc(C#N)cs1', 'aromatic'),
-    ('4-NH2-thiazol-2-yl', '[*]c1nc(N)cs1', 'aromatic'),
-    ('4-NHMe-thiazol-2-yl', '[*]c1nc(NC)cs1', 'aromatic'),
-    ('4-NMe2-thiazol-2-yl', '[*]c1nc(N(C)C)cs1', 'aromatic'),
-    ('4-COOH-thiazol-2-yl', '[*]c1nc(C(=O)O)cs1', 'aromatic'),
-    ('4-COOMe-thiazol-2-yl', '[*]c1nc(C(=O)OC)cs1', 'aromatic'),
-    ('4-COMe-thiazol-2-yl', '[*]c1nc(C(C)=O)cs1', 'aromatic'),
-    ('4-SO2Me-thiazol-2-yl', '[*]c1nc(S(C)(=O)=O)cs1', 'aromatic'),
-    ('4-cyclopropyl-thiazol-2-yl', '[*]c1nc(C1CC1)cs1', 'aromatic'),
-    ('4-NHAc-thiazol-2-yl', '[*]c1nc(NC(C)=O)cs1', 'aromatic'),
-    ('4-morpholino-thiazol-2-yl', '[*]c1nc(N1CCOCC1)cs1', 'aromatic'),
-    ('4-piperidino-thiazol-2-yl', '[*]c1nc(N1CCCCC1)cs1', 'aromatic'),
-    ('4-pyrrolidino-thiazol-2-yl', '[*]c1nc(N1CCCC1)cs1', 'aromatic'),
-    ('4-OCF3-thiazol-2-yl', '[*]c1nc(OC(F)(F)F)cs1', 'aromatic'),
-    ('4-SMe-thiazol-2-yl', '[*]c1nc(SC)cs1', 'aromatic'),
-    ('4-NHSO2Me-thiazol-2-yl', '[*]c1nc(NS(C)(=O)=O)cs1', 'aromatic'),
-    ('5-F-thiazol-2-yl', '[*]c1sc(F)nc1', 'aromatic'),
-    ('5-Cl-thiazol-2-yl', '[*]c1sc(Cl)nc1', 'aromatic'),
-    ('5-Br-thiazol-2-yl', '[*]c1sc(Br)nc1', 'aromatic'),
-    ('5-Et-thiazol-2-yl', '[*]c1sc(CC)nc1', 'aromatic'),
-    ('5-iPr-thiazol-2-yl', '[*]c1sc(C(C)C)nc1', 'aromatic'),
-    ('5-OMe-thiazol-2-yl', '[*]c1sc(OC)nc1', 'aromatic'),
-    ('5-OEt-thiazol-2-yl', '[*]c1sc(OCC)nc1', 'aromatic'),
-    ('5-OH-thiazol-2-yl', '[*]c1sc(O)nc1', 'aromatic'),
-    ('5-CF3-thiazol-2-yl', '[*]c1sc(C(F)(F)F)nc1', 'aromatic'),
-    ('5-CHF2-thiazol-2-yl', '[*]c1sc(C(F)F)nc1', 'aromatic'),
-    ('5-CN-thiazol-2-yl', '[*]c1sc(C#N)nc1', 'aromatic'),
-    ('5-NH2-thiazol-2-yl', '[*]c1sc(N)nc1', 'aromatic'),
-    ('5-NHMe-thiazol-2-yl', '[*]c1sc(NC)nc1', 'aromatic'),
-    ('5-NMe2-thiazol-2-yl', '[*]c1sc(N(C)C)nc1', 'aromatic'),
-    ('5-COOH-thiazol-2-yl', '[*]c1sc(C(=O)O)nc1', 'aromatic'),
-    ('5-COOMe-thiazol-2-yl', '[*]c1sc(C(=O)OC)nc1', 'aromatic'),
-    ('5-COMe-thiazol-2-yl', '[*]c1sc(C(C)=O)nc1', 'aromatic'),
-    ('5-SO2Me-thiazol-2-yl', '[*]c1sc(S(C)(=O)=O)nc1', 'aromatic'),
-    ('5-NHAc-thiazol-2-yl', '[*]c1sc(NC(C)=O)nc1', 'aromatic'),
-    ('5-OCF3-thiazol-2-yl', '[*]c1sc(OC(F)(F)F)nc1', 'aromatic'),
-    ('5-SMe-thiazol-2-yl', '[*]c1sc(SC)nc1', 'aromatic'),
-    ('5-NHSO2Me-thiazol-2-yl', '[*]c1sc(NS(C)(=O)=O)nc1', 'aromatic'),
-    ('4-OH-piperidinyl', '[*]C1CCNCC1O', 'basic'),
-    ('4-OMe-piperidinyl', '[*]C1CCNCC1OC', 'basic'),
-    ('4-F-piperidinyl', '[*]C1CCNCC1F', 'basic'),
-    ('4-Me-piperidinyl', '[*]C1CCNCC1C', 'basic'),
-    ('4-Et-piperidinyl', '[*]C1CCNCC1CC', 'basic'),
-    ('4-NH2-piperidinyl', '[*]C1CCNCC1N', 'basic'),
-    ('4-NHMe-piperidinyl', '[*]C1CCNCC1NC', 'basic'),
-    ('4-NMe2-piperidinyl', '[*]C1CCNCC1N(C)C', 'basic'),
-    ('4-COOH-piperidinyl', '[*]C1CCNCC1C(=O)O', 'basic'),
-    ('4-COMe-piperidinyl', '[*]C1CCNCC1C(C)=O', 'basic'),
-    ('4-CN-piperidinyl', '[*]C1CCNCC1C#N', 'basic'),
-    ('4-CF3-piperidinyl', '[*]C1CCNCC1C(F)(F)F', 'basic'),
-    ('4-Cl-piperidinyl', '[*]C1CCNCC1Cl', 'basic'),
-    ('4-OH-1-Me-piperidinyl', '[*]C1CCN(C)CC1O', 'basic'),
-    ('4-OMe-1-Me-piperidinyl', '[*]C1CCN(C)CC1OC', 'basic'),
-    ('4-F-1-Me-piperidinyl', '[*]C1CCN(C)CC1F', 'basic'),
-    ('4-Me-1-Me-piperidinyl', '[*]C1CCN(C)CC1C', 'basic'),
-    ('4-Et-1-Me-piperidinyl', '[*]C1CCN(C)CC1CC', 'basic'),
-    ('4-NH2-1-Me-piperidinyl', '[*]C1CCN(C)CC1N', 'basic'),
-    ('4-NHMe-1-Me-piperidinyl', '[*]C1CCN(C)CC1NC', 'basic'),
-    ('4-NMe2-1-Me-piperidinyl', '[*]C1CCN(C)CC1N(C)C', 'basic'),
-    ('4-COOH-1-Me-piperidinyl', '[*]C1CCN(C)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-Me-piperidinyl', '[*]C1CCN(C)CC1C(C)=O', 'basic'),
-    ('4-CN-1-Me-piperidinyl', '[*]C1CCN(C)CC1C#N', 'basic'),
-    ('4-CF3-1-Me-piperidinyl', '[*]C1CCN(C)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-Me-piperidinyl', '[*]C1CCN(C)CC1Cl', 'basic'),
-    ('4-OH-1-Et-piperidinyl', '[*]C1CCN(CC)CC1O', 'basic'),
-    ('4-OMe-1-Et-piperidinyl', '[*]C1CCN(CC)CC1OC', 'basic'),
-    ('4-F-1-Et-piperidinyl', '[*]C1CCN(CC)CC1F', 'basic'),
-    ('4-Me-1-Et-piperidinyl', '[*]C1CCN(CC)CC1C', 'basic'),
-    ('4-Et-1-Et-piperidinyl', '[*]C1CCN(CC)CC1CC', 'basic'),
-    ('4-NH2-1-Et-piperidinyl', '[*]C1CCN(CC)CC1N', 'basic'),
-    ('4-NHMe-1-Et-piperidinyl', '[*]C1CCN(CC)CC1NC', 'basic'),
-    ('4-NMe2-1-Et-piperidinyl', '[*]C1CCN(CC)CC1N(C)C', 'basic'),
-    ('4-COOH-1-Et-piperidinyl', '[*]C1CCN(CC)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-Et-piperidinyl', '[*]C1CCN(CC)CC1C(C)=O', 'basic'),
-    ('4-CN-1-Et-piperidinyl', '[*]C1CCN(CC)CC1C#N', 'basic'),
-    ('4-CF3-1-Et-piperidinyl', '[*]C1CCN(CC)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-Et-piperidinyl', '[*]C1CCN(CC)CC1Cl', 'basic'),
-    ('4-OH-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1O', 'basic'),
-    ('4-OMe-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1OC', 'basic'),
-    ('4-F-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1F', 'basic'),
-    ('4-Me-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1C', 'basic'),
-    ('4-Et-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1CC', 'basic'),
-    ('4-NH2-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1N', 'basic'),
-    ('4-NHMe-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1NC', 'basic'),
-    ('4-NMe2-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1N(C)C', 'basic'),
-    ('4-COOH-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1C(C)=O', 'basic'),
-    ('4-CN-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1C#N', 'basic'),
-    ('4-CF3-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-iPr-piperidinyl', '[*]C1CCN(C(C)C)CC1Cl', 'basic'),
-    ('4-OH-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1O', 'basic'),
-    ('4-OMe-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1OC', 'basic'),
-    ('4-F-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1F', 'basic'),
-    ('4-Me-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1C', 'basic'),
-    ('4-Et-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1CC', 'basic'),
-    ('4-NH2-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1N', 'basic'),
-    ('4-NHMe-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1NC', 'basic'),
-    ('4-NMe2-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1N(C)C', 'basic'),
-    ('4-COOH-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1C(C)=O', 'basic'),
-    ('4-CN-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1C#N', 'basic'),
-    ('4-CF3-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-cPr-piperidinyl', '[*]C1CCN(C1CC1)CC1Cl', 'basic'),
-    ('4-OH-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1O', 'basic'),
-    ('4-OMe-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1OC', 'basic'),
-    ('4-F-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1F', 'basic'),
-    ('4-Me-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1C', 'basic'),
-    ('4-Et-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1CC', 'basic'),
-    ('4-NH2-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1N', 'basic'),
-    ('4-NHMe-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1NC', 'basic'),
-    ('4-NMe2-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1N(C)C', 'basic'),
-    ('4-COOH-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1C(C)=O', 'basic'),
-    ('4-CN-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1C#N', 'basic'),
-    ('4-CF3-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-Bn-piperidinyl', '[*]C1CCN(Cc1ccccc1)CC1Cl', 'basic'),
-    ('4-OH-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1O', 'basic'),
-    ('4-OMe-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1OC', 'basic'),
-    ('4-F-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1F', 'basic'),
-    ('4-Me-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1C', 'basic'),
-    ('4-Et-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1CC', 'basic'),
-    ('4-NH2-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1N', 'basic'),
-    ('4-NHMe-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1NC', 'basic'),
-    ('4-NMe2-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1N(C)C', 'basic'),
-    ('4-COOH-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1C(C)=O', 'basic'),
-    ('4-CN-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1C#N', 'basic'),
-    ('4-Cl-1-4-FBn-piperidinyl', '[*]C1CCN(Cc1ccc(F)cc1)CC1Cl', 'basic'),
-    ('4-OH-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1O', 'basic'),
-    ('4-OMe-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1OC', 'basic'),
-    ('4-F-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1F', 'basic'),
-    ('4-Me-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1C', 'basic'),
-    ('4-Et-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1CC', 'basic'),
-    ('4-NH2-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1N', 'basic'),
-    ('4-NHMe-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1NC', 'basic'),
-    ('4-NMe2-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1N(C)C', 'basic'),
-    ('4-COOH-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1C(C)=O', 'basic'),
-    ('4-CN-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1C#N', 'basic'),
-    ('4-CF3-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-Ac-piperidinyl', '[*]C1CCN(C(C)=O)CC1Cl', 'basic'),
-    ('4-OH-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1O', 'basic'),
-    ('4-OMe-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1OC', 'basic'),
-    ('4-F-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1F', 'basic'),
-    ('4-Me-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1C', 'basic'),
-    ('4-Et-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1CC', 'basic'),
-    ('4-NH2-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1N', 'basic'),
-    ('4-NHMe-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1NC', 'basic'),
-    ('4-NMe2-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1N(C)C', 'basic'),
-    ('4-COOH-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1C(C)=O', 'basic'),
-    ('4-CN-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1C#N', 'basic'),
-    ('4-CF3-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-MeSO2-piperidinyl', '[*]C1CCN(S(C)(=O)=O)CC1Cl', 'basic'),
-    ('4-OH-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1O', 'basic'),
-    ('4-OMe-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1OC', 'basic'),
-    ('4-F-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1F', 'basic'),
-    ('4-Me-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1C', 'basic'),
-    ('4-Et-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1CC', 'basic'),
-    ('4-NH2-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1N', 'basic'),
-    ('4-NHMe-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1NC', 'basic'),
-    ('4-NMe2-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1N(C)C', 'basic'),
-    ('4-COOH-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1C(C)=O', 'basic'),
-    ('4-CN-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1C#N', 'basic'),
-    ('4-CF3-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-CH2CN-piperidinyl', '[*]C1CCN(CC#N)CC1Cl', 'basic'),
-    ('4-OH-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1O', 'basic'),
-    ('4-OMe-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1OC', 'basic'),
-    ('4-F-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1F', 'basic'),
-    ('4-Me-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1C', 'basic'),
-    ('4-Et-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1CC', 'basic'),
-    ('4-NH2-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1N', 'basic'),
-    ('4-NHMe-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1NC', 'basic'),
-    ('4-NMe2-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1N(C)C', 'basic'),
-    ('4-COOH-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1C(C)=O', 'basic'),
-    ('4-CN-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1C#N', 'basic'),
-    ('4-CF3-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-CH2OH-piperidinyl', '[*]C1CCN(CO)CC1Cl', 'basic'),
-    ('4-OH-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1O', 'basic'),
-    ('4-OMe-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1OC', 'basic'),
-    ('4-F-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1F', 'basic'),
-    ('4-Me-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1C', 'basic'),
-    ('4-Et-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1CC', 'basic'),
-    ('4-NH2-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1N', 'basic'),
-    ('4-NHMe-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1NC', 'basic'),
-    ('4-NMe2-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1N(C)C', 'basic'),
-    ('4-COOH-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1C(C)=O', 'basic'),
-    ('4-CN-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1C#N', 'basic'),
-    ('4-CF3-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-CH2OMe-piperidinyl', '[*]C1CCN(COC)CC1Cl', 'basic'),
-    ('4-OH-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1O', 'basic'),
-    ('4-OMe-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1OC', 'basic'),
-    ('4-F-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1F', 'basic'),
-    ('4-Me-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1C', 'basic'),
-    ('4-Et-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1CC', 'basic'),
-    ('4-NH2-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1N', 'basic'),
-    ('4-NHMe-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1NC', 'basic'),
-    ('4-NMe2-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1N(C)C', 'basic'),
-    ('4-COOH-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1C(C)=O', 'basic'),
-    ('4-CN-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1C#N', 'basic'),
-    ('4-CF3-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-allyl-piperidinyl', '[*]C1CCN(CC=C)CC1Cl', 'basic'),
-    ('4-OH-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1O', 'basic'),
-    ('4-OMe-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1OC', 'basic'),
-    ('4-F-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1F', 'basic'),
-    ('4-Me-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1C', 'basic'),
-    ('4-Et-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1CC', 'basic'),
-    ('4-NH2-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1N', 'basic'),
-    ('4-NHMe-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1NC', 'basic'),
-    ('4-NMe2-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1N(C)C', 'basic'),
-    ('4-COOH-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1C(C)=O', 'basic'),
-    ('4-CN-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1C#N', 'basic'),
-    ('4-CF3-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-prop-2-yn-1-yl-piperidinyl', '[*]C1CCN(CC#C)CC1Cl', 'basic'),
-    ('4-OH-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1O', 'basic'),
-    ('4-OMe-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1OC', 'basic'),
-    ('4-F-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1F', 'basic'),
-    ('4-Me-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1C', 'basic'),
-    ('4-Et-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1CC', 'basic'),
-    ('4-NH2-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1N', 'basic'),
-    ('4-NHMe-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1NC', 'basic'),
-    ('4-NMe2-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1N(C)C', 'basic'),
-    ('4-COOH-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1C(C)=O', 'basic'),
-    ('4-CN-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1C#N', 'basic'),
-    ('4-CF3-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-2-hydroxyethyl-piperidinyl', '[*]C1CCN(CCO)CC1Cl', 'basic'),
-    ('4-OH-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1O', 'basic'),
-    ('4-OMe-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1OC', 'basic'),
-    ('4-F-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1F', 'basic'),
-    ('4-Me-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1C', 'basic'),
-    ('4-Et-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1CC', 'basic'),
-    ('4-NH2-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1N', 'basic'),
-    ('4-NHMe-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1NC', 'basic'),
-    ('4-NMe2-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1N(C)C', 'basic'),
-    ('4-COOH-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1C(C)=O', 'basic'),
-    ('4-CN-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1C#N', 'basic'),
-    ('4-CF3-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-3-hydroxypropyl-piperidinyl', '[*]C1CCN(CCCO)CC1Cl', 'basic'),
-    ('4-OH-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1O', 'basic'),
-    ('4-OMe-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1OC', 'basic'),
-    ('4-F-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1F', 'basic'),
-    ('4-Me-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1C', 'basic'),
-    ('4-Et-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1CC', 'basic'),
-    ('4-NH2-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1N', 'basic'),
-    ('4-NHMe-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1NC', 'basic'),
-    ('4-NMe2-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1N(C)C', 'basic'),
-    ('4-COOH-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1C(C)=O', 'basic'),
-    ('4-CN-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1C#N', 'basic'),
-    ('4-CF3-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-cyclobutyl-piperidinyl', '[*]C1CCN(C1CCC1)CC1Cl', 'basic'),
-    ('4-OH-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1O', 'basic'),
-    ('4-OMe-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1OC', 'basic'),
-    ('4-F-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1F', 'basic'),
-    ('4-Me-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1C', 'basic'),
-    ('4-Et-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1CC', 'basic'),
-    ('4-NH2-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1N', 'basic'),
-    ('4-NHMe-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1NC', 'basic'),
-    ('4-NMe2-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1N(C)C', 'basic'),
-    ('4-COOH-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1C(C)=O', 'basic'),
-    ('4-CN-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1C#N', 'basic'),
-    ('4-CF3-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-cyclopentyl-piperidinyl', '[*]C1CCN(C1CCCC1)CC1Cl', 'basic'),
-    ('4-OH-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1O', 'basic'),
-    ('4-OMe-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1OC', 'basic'),
-    ('4-F-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1F', 'basic'),
-    ('4-Me-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1C', 'basic'),
-    ('4-Et-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1CC', 'basic'),
-    ('4-NH2-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1N', 'basic'),
-    ('4-NHMe-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1NC', 'basic'),
-    ('4-NMe2-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1N(C)C', 'basic'),
-    ('4-COOH-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1C(=O)O', 'basic'),
-    ('4-COMe-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1C(C)=O', 'basic'),
-    ('4-CN-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1C#N', 'basic'),
-    ('4-CF3-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1C(F)(F)F', 'basic'),
-    ('4-Cl-1-tBu-piperidinyl', '[*]C1CCN(C(C)(C)C)CC1Cl', 'basic'),
-    ('3-OH-pyrrolidinyl', '[*]C1CNCC1O', 'basic'),
-    ('3-OMe-pyrrolidinyl', '[*]C1CNCC1OC', 'basic'),
-    ('3-F-pyrrolidinyl', '[*]C1CNCC1F', 'basic'),
-    ('3-Me-pyrrolidinyl', '[*]C1CNCC1C', 'basic'),
-    ('3-NH2-pyrrolidinyl', '[*]C1CNCC1N', 'basic'),
-    ('3-CN-pyrrolidinyl', '[*]C1CNCC1C#N', 'basic'),
-    ('3-OH-1-Me-pyrrolidinyl', '[*]C1CN(C)CC1O', 'basic'),
-    ('3-OMe-1-Me-pyrrolidinyl', '[*]C1CN(C)CC1OC', 'basic'),
-    ('3-F-1-Me-pyrrolidinyl', '[*]C1CN(C)CC1F', 'basic'),
-    ('3-Me-1-Me-pyrrolidinyl', '[*]C1CN(C)CC1C', 'basic'),
-    ('3-NH2-1-Me-pyrrolidinyl', '[*]C1CN(C)CC1N', 'basic'),
-    ('3-CN-1-Me-pyrrolidinyl', '[*]C1CN(C)CC1C#N', 'basic'),
-    ('3-OH-1-Et-pyrrolidinyl', '[*]C1CN(CC)CC1O', 'basic'),
-    ('3-OMe-1-Et-pyrrolidinyl', '[*]C1CN(CC)CC1OC', 'basic'),
-    ('3-F-1-Et-pyrrolidinyl', '[*]C1CN(CC)CC1F', 'basic'),
-    ('3-Me-1-Et-pyrrolidinyl', '[*]C1CN(CC)CC1C', 'basic'),
-    ('3-NH2-1-Et-pyrrolidinyl', '[*]C1CN(CC)CC1N', 'basic'),
-    ('3-CN-1-Et-pyrrolidinyl', '[*]C1CN(CC)CC1C#N', 'basic'),
-    ('3-OH-1-Ac-pyrrolidinyl', '[*]C1CN(C(C)=O)CC1O', 'basic'),
-    ('3-OMe-1-Ac-pyrrolidinyl', '[*]C1CN(C(C)=O)CC1OC', 'basic'),
-    ('3-F-1-Ac-pyrrolidinyl', '[*]C1CN(C(C)=O)CC1F', 'basic'),
-    ('3-Me-1-Ac-pyrrolidinyl', '[*]C1CN(C(C)=O)CC1C', 'basic'),
-    ('3-NH2-1-Ac-pyrrolidinyl', '[*]C1CN(C(C)=O)CC1N', 'basic'),
-    ('3-CN-1-Ac-pyrrolidinyl', '[*]C1CN(C(C)=O)CC1C#N', 'basic'),
-    ('3-OH-1-Bn-pyrrolidinyl', '[*]C1CN(Cc1ccccc1)CC1O', 'basic'),
-    ('3-OMe-1-Bn-pyrrolidinyl', '[*]C1CN(Cc1ccccc1)CC1OC', 'basic'),
-    ('3-F-1-Bn-pyrrolidinyl', '[*]C1CN(Cc1ccccc1)CC1F', 'basic'),
-    ('3-Me-1-Bn-pyrrolidinyl', '[*]C1CN(Cc1ccccc1)CC1C', 'basic'),
-    ('3-NH2-1-Bn-pyrrolidinyl', '[*]C1CN(Cc1ccccc1)CC1N', 'basic'),
-    ('3-CN-1-Bn-pyrrolidinyl', '[*]C1CN(Cc1ccccc1)CC1C#N', 'basic'),
-    ('3-OH-1-cPr-pyrrolidinyl', '[*]C1CN(C1CC1)CC1O', 'basic'),
-    ('3-OMe-1-cPr-pyrrolidinyl', '[*]C1CN(C1CC1)CC1OC', 'basic'),
-    ('3-F-1-cPr-pyrrolidinyl', '[*]C1CN(C1CC1)CC1F', 'basic'),
-    ('3-Me-1-cPr-pyrrolidinyl', '[*]C1CN(C1CC1)CC1C', 'basic'),
-    ('3-NH2-1-cPr-pyrrolidinyl', '[*]C1CN(C1CC1)CC1N', 'basic'),
-    ('3-CN-1-cPr-pyrrolidinyl', '[*]C1CN(C1CC1)CC1C#N', 'basic'),
-    ('C-OMe', '[*]COC', 'polar'),
-    ('C-OEt', '[*]COCC', 'polar'),
-    ('C-NH2', '[*]CN', 'basic'),
-    ('C-NHMe', '[*]CNC', 'basic'),
-    ('C-NMe2', '[*]CN(C)C', 'basic'),
-    ('C-CF3', '[*]CC(F)(F)F', 'halogen'),
-    ('C-COOMe', '[*]CC(=O)OC', 'polar'),
-    ('C-SO2Me', '[*]CS(=O)(=O)C', 'polar'),
-    ('C-SO2NH2', '[*]CS(=O)(=O)N', 'polar'),
-    ('C-pyrrolidino', '[*]CN1CCCC1', 'basic'),
-    ('C-azetidino', '[*]CN1CCC1', 'basic'),
-    ('C-imidazolyl', '[*]Cc1ccn[nH]1', 'basic'),
-    ('CC-OMe', '[*]CCOC', 'polar'),
-    ('CC-OEt', '[*]CCOCC', 'polar'),
-    ('CC-NH2', '[*]CCN', 'basic'),
-    ('CC-NHMe', '[*]CCNC', 'basic'),
-    ('CC-CF3', '[*]CCC(F)(F)F', 'halogen'),
-    ('CC-COOH', '[*]CCC(=O)O', 'acidic'),
-    ('CC-COOMe', '[*]CCC(=O)OC', 'polar'),
-    ('CC-SO2Me', '[*]CCS(=O)(=O)C', 'polar'),
-    ('CC-SO2NH2', '[*]CCS(=O)(=O)N', 'polar'),
-    ('CC-pyrrolidino', '[*]CCN1CCCC1', 'basic'),
-    ('CC-N-methylpiperazino', '[*]CCN1CCN(C)CC1', 'basic'),
-    ('CC-azetidino', '[*]CCN1CCC1', 'basic'),
-    ('CC-tetrazolyl', '[*]CCc1nnn[nH]1', 'acidic'),
-    ('CC-oxadiazolyl', '[*]CCc1nnco1', 'bioisostere'),
-    ('CC-imidazolyl', '[*]CCc1ccn[nH]1', 'basic'),
-    ('CC-oxetanyl', '[*]CCC1COC1', 'bioisostere'),
-    ('CCC-OMe', '[*]CCCOC', 'polar'),
-    ('CCC-OEt', '[*]CCCOCC', 'polar'),
-    ('CCC-Cl', '[*]CCCCl', 'halogen'),
-    ('CCC-Br', '[*]CCCBr', 'halogen'),
-    ('CCC-NHMe', '[*]CCCNC', 'basic'),
-    ('CCC-CF3', '[*]CCCC(F)(F)F', 'halogen'),
-    ('CCC-COOH', '[*]CCCC(=O)O', 'acidic'),
-    ('CCC-COOMe', '[*]CCCC(=O)OC', 'polar'),
-    ('CCC-SO2Me', '[*]CCCS(=O)(=O)C', 'polar'),
-    ('CCC-SO2NH2', '[*]CCCS(=O)(=O)N', 'polar'),
-    ('CCC-piperidino', '[*]CCCN1CCCCC1', 'basic'),
-    ('CCC-pyrrolidino', '[*]CCCN1CCCC1', 'basic'),
-    ('CCC-N-methylpiperazino', '[*]CCCN1CCN(C)CC1', 'basic'),
-    ('CCC-azetidino', '[*]CCCN1CCC1', 'basic'),
-    ('CCC-tetrazolyl', '[*]CCCc1nnn[nH]1', 'acidic'),
-    ('CCC-oxadiazolyl', '[*]CCCc1nnco1', 'bioisostere'),
-    ('CCC-imidazolyl', '[*]CCCc1ccn[nH]1', 'basic'),
-    ('CCC-oxetanyl', '[*]CCCC1COC1', 'bioisostere'),
-    ('CCCC-OMe', '[*]CCCCOC', 'polar'),
-    ('CCCC-OEt', '[*]CCCCOCC', 'polar'),
-    ('CCCC-F', '[*]CCCCF', 'halogen'),
-    ('CCCC-Cl', '[*]CCCCCl', 'halogen'),
-    ('CCCC-Br', '[*]CCCCBr', 'halogen'),
-    ('CCCC-NHMe', '[*]CCCCNC', 'basic'),
-    ('CCCC-NMe2', '[*]CCCCN(C)C', 'basic'),
-    ('CCCC-CN', '[*]CCCCC#N', 'halogen'),
-    ('CCCC-CF3', '[*]CCCCC(F)(F)F', 'halogen'),
-    ('CCCC-COOH', '[*]CCCCC(=O)O', 'acidic'),
-    ('CCCC-COOMe', '[*]CCCCC(=O)OC', 'polar'),
-    ('CCCC-SO2Me', '[*]CCCCS(=O)(=O)C', 'polar'),
-    ('CCCC-SO2NH2', '[*]CCCCS(=O)(=O)N', 'polar'),
-    ('CCCC-morpholino', '[*]CCCCN1CCOCC1', 'basic'),
-    ('CCCC-piperidino', '[*]CCCCN1CCCCC1', 'basic'),
-    ('CCCC-pyrrolidino', '[*]CCCCN1CCCC1', 'basic'),
-    ('CCCC-N-methylpiperazino', '[*]CCCCN1CCN(C)CC1', 'basic'),
-    ('CCCC-azetidino', '[*]CCCCN1CCC1', 'basic'),
-    ('CCCC-tetrazolyl', '[*]CCCCc1nnn[nH]1', 'acidic'),
-    ('CCCC-oxadiazolyl', '[*]CCCCc1nnco1', 'bioisostere'),
-    ('CCCC-imidazolyl', '[*]CCCCc1ccn[nH]1', 'basic'),
-    ('CCCC-oxetanyl', '[*]CCCCC1COC1', 'bioisostere'),
-    ('CO-OH', '[*]COO', 'polar'),
-    ('CO-OMe', '[*]COOC', 'polar'),
-    ('CO-OEt', '[*]COOCC', 'polar'),
-    ('CO-F', '[*]COF', 'halogen'),
-    ('CO-Cl', '[*]COCl', 'halogen'),
-    ('CO-Br', '[*]COBr', 'halogen'),
-    ('CO-NH2', '[*]CON', 'basic'),
-    ('CO-NHMe', '[*]CONC', 'basic'),
-    ('CO-NMe2', '[*]CON(C)C', 'basic'),
-    ('CO-CN', '[*]COC#N', 'halogen'),
-    ('CO-CF3', '[*]COC(F)(F)F', 'halogen'),
-    ('CO-COOH', '[*]COC(=O)O', 'acidic'),
-    ('CO-COOMe', '[*]COC(=O)OC', 'polar'),
-    ('CO-SO2Me', '[*]COS(=O)(=O)C', 'polar'),
-    ('CO-SO2NH2', '[*]COS(=O)(=O)N', 'polar'),
-    ('CO-morpholino', '[*]CON1CCOCC1', 'basic'),
-    ('CO-piperidino', '[*]CON1CCCCC1', 'basic'),
-    ('CO-pyrrolidino', '[*]CON1CCCC1', 'basic'),
-    ('CO-N-methylpiperazino', '[*]CON1CCN(C)CC1', 'basic'),
-    ('CO-azetidino', '[*]CON1CCC1', 'basic'),
-    ('CO-tetrazolyl', '[*]COc1nnn[nH]1', 'acidic'),
-    ('CO-oxadiazolyl', '[*]COc1nnco1', 'bioisostere'),
-    ('CO-imidazolyl', '[*]COc1ccn[nH]1', 'basic'),
-    ('CO-oxetanyl', '[*]COC1COC1', 'bioisostere'),
-    ('CCO-OH', '[*]CCOO', 'polar'),
-    ('CCO-OMe', '[*]CCOOC', 'polar'),
-    ('CCO-OEt', '[*]CCOOCC', 'polar'),
-    ('CCO-F', '[*]CCOF', 'halogen'),
-    ('CCO-Cl', '[*]CCOCl', 'halogen'),
-    ('CCO-Br', '[*]CCOBr', 'halogen'),
-    ('CCO-NH2', '[*]CCON', 'basic'),
-    ('CCO-NHMe', '[*]CCONC', 'basic'),
-    ('CCO-NMe2', '[*]CCON(C)C', 'basic'),
-    ('CCO-CN', '[*]CCOC#N', 'halogen'),
-    ('CCO-CF3', '[*]CCOC(F)(F)F', 'halogen'),
-    ('CCO-COOH', '[*]CCOC(=O)O', 'acidic'),
-    ('CCO-COOMe', '[*]CCOC(=O)OC', 'polar'),
-    ('CCO-SO2Me', '[*]CCOS(=O)(=O)C', 'polar'),
-    ('CCO-SO2NH2', '[*]CCOS(=O)(=O)N', 'polar'),
-    ('CCO-morpholino', '[*]CCON1CCOCC1', 'basic'),
-    ('CCO-piperidino', '[*]CCON1CCCCC1', 'basic'),
-    ('CCO-pyrrolidino', '[*]CCON1CCCC1', 'basic'),
-    ('CCO-N-methylpiperazino', '[*]CCON1CCN(C)CC1', 'basic'),
-    ('CCO-azetidino', '[*]CCON1CCC1', 'basic'),
-    ('CCO-tetrazolyl', '[*]CCOc1nnn[nH]1', 'acidic'),
-    ('CCO-oxadiazolyl', '[*]CCOc1nnco1', 'bioisostere'),
-    ('CCO-imidazolyl', '[*]CCOc1ccn[nH]1', 'basic'),
-    ('CCO-oxetanyl', '[*]CCOC1COC1', 'bioisostere'),
-    ('CCCO-OH', '[*]CCCOO', 'polar'),
-    ('CCCO-OMe', '[*]CCCOOC', 'polar'),
-    ('CCCO-OEt', '[*]CCCOOCC', 'polar'),
-    ('CCCO-F', '[*]CCCOF', 'halogen'),
-    ('CCCO-Cl', '[*]CCCOCl', 'halogen'),
-    ('CCCO-Br', '[*]CCCOBr', 'halogen'),
-    ('CCCO-NH2', '[*]CCCON', 'basic'),
-    ('CCCO-NHMe', '[*]CCCONC', 'basic'),
-    ('CCCO-NMe2', '[*]CCCON(C)C', 'basic'),
-    ('CCCO-CN', '[*]CCCOC#N', 'halogen'),
-    ('CCCO-CF3', '[*]CCCOC(F)(F)F', 'halogen'),
-    ('CCCO-COOH', '[*]CCCOC(=O)O', 'acidic'),
-    ('CCCO-COOMe', '[*]CCCOC(=O)OC', 'polar'),
-    ('CCCO-SO2Me', '[*]CCCOS(=O)(=O)C', 'polar'),
-    ('CCCO-SO2NH2', '[*]CCCOS(=O)(=O)N', 'polar'),
-    ('CCCO-morpholino', '[*]CCCON1CCOCC1', 'basic'),
-    ('CCCO-piperidino', '[*]CCCON1CCCCC1', 'basic'),
-    ('CCCO-pyrrolidino', '[*]CCCON1CCCC1', 'basic'),
-    ('CCCO-N-methylpiperazino', '[*]CCCON1CCN(C)CC1', 'basic'),
-    ('CCCO-azetidino', '[*]CCCON1CCC1', 'basic'),
-    ('CCCO-tetrazolyl', '[*]CCCOc1nnn[nH]1', 'acidic'),
-    ('CCCO-oxadiazolyl', '[*]CCCOc1nnco1', 'bioisostere'),
-    ('CCCO-imidazolyl', '[*]CCCOc1ccn[nH]1', 'basic'),
-    ('CCCO-oxetanyl', '[*]CCCOC1COC1', 'bioisostere'),
-    ('CN-OH', '[*]CNO', 'polar'),
-    ('CN-OMe', '[*]CNOC', 'polar'),
-    ('CN-OEt', '[*]CNOCC', 'polar'),
-    ('CN-F', '[*]CNF', 'halogen'),
-    ('CN-Cl', '[*]CNCl', 'halogen'),
-    ('CN-Br', '[*]CNBr', 'halogen'),
-    ('CN-NH2', '[*]CNN', 'basic'),
-    ('CN-NHMe', '[*]CNNC', 'basic'),
-    ('CN-NMe2', '[*]CNN(C)C', 'basic'),
-    ('CN-CN', '[*]CNC#N', 'halogen'),
-    ('CN-CF3', '[*]CNC(F)(F)F', 'halogen'),
-    ('CN-COOH', '[*]CNC(=O)O', 'acidic'),
-    ('CN-COOMe', '[*]CNC(=O)OC', 'polar'),
-    ('CN-SO2Me', '[*]CNS(=O)(=O)C', 'polar'),
-    ('CN-SO2NH2', '[*]CNS(=O)(=O)N', 'polar'),
-    ('CN-morpholino', '[*]CNN1CCOCC1', 'basic'),
-    ('CN-piperidino', '[*]CNN1CCCCC1', 'basic'),
-    ('CN-pyrrolidino', '[*]CNN1CCCC1', 'basic'),
-    ('CN-N-methylpiperazino', '[*]CNN1CCN(C)CC1', 'basic'),
-    ('CN-azetidino', '[*]CNN1CCC1', 'basic'),
-    ('CN-tetrazolyl', '[*]CNc1nnn[nH]1', 'acidic'),
-    ('CN-oxadiazolyl', '[*]CNc1nnco1', 'bioisostere'),
-    ('CN-imidazolyl', '[*]CNc1ccn[nH]1', 'basic'),
-    ('CN-oxetanyl', '[*]CNC1COC1', 'bioisostere'),
-    ('CCN-OH', '[*]CCNO', 'polar'),
-    ('CCN-OMe', '[*]CCNOC', 'polar'),
-    ('CCN-OEt', '[*]CCNOCC', 'polar'),
-    ('CCN-F', '[*]CCNF', 'halogen'),
-    ('CCN-Cl', '[*]CCNCl', 'halogen'),
-    ('CCN-Br', '[*]CCNBr', 'halogen'),
-    ('CCN-NH2', '[*]CCNN', 'basic'),
-    ('CCN-NHMe', '[*]CCNNC', 'basic'),
-    ('CCN-NMe2', '[*]CCNN(C)C', 'basic'),
-    ('CCN-CN', '[*]CCNC#N', 'halogen'),
-    ('CCN-CF3', '[*]CCNC(F)(F)F', 'halogen'),
-    ('CCN-COOH', '[*]CCNC(=O)O', 'acidic'),
-    ('CCN-COOMe', '[*]CCNC(=O)OC', 'polar'),
-    ('CCN-SO2Me', '[*]CCNS(=O)(=O)C', 'polar'),
-    ('CCN-SO2NH2', '[*]CCNS(=O)(=O)N', 'polar'),
-    ('CCN-morpholino', '[*]CCNN1CCOCC1', 'basic'),
-    ('CCN-piperidino', '[*]CCNN1CCCCC1', 'basic'),
-    ('CCN-pyrrolidino', '[*]CCNN1CCCC1', 'basic'),
-    ('CCN-N-methylpiperazino', '[*]CCNN1CCN(C)CC1', 'basic'),
-    ('CCN-azetidino', '[*]CCNN1CCC1', 'basic'),
-    ('CCN-tetrazolyl', '[*]CCNc1nnn[nH]1', 'acidic'),
-    ('CCN-oxadiazolyl', '[*]CCNc1nnco1', 'bioisostere'),
-    ('CCN-imidazolyl', '[*]CCNc1ccn[nH]1', 'basic'),
-    ('CCN-oxetanyl', '[*]CCNC1COC1', 'bioisostere'),
-    ('CCCN-OH', '[*]CCCNO', 'polar'),
-    ('CCCN-OMe', '[*]CCCNOC', 'polar'),
-    ('CCCN-OEt', '[*]CCCNOCC', 'polar'),
-    ('CCCN-F', '[*]CCCNF', 'halogen'),
-    ('CCCN-Cl', '[*]CCCNCl', 'halogen'),
-    ('CCCN-Br', '[*]CCCNBr', 'halogen'),
-    ('CCCN-NH2', '[*]CCCNN', 'basic'),
-    ('CCCN-NHMe', '[*]CCCNNC', 'basic'),
-    ('CCCN-NMe2', '[*]CCCNN(C)C', 'basic'),
-    ('CCCN-CN', '[*]CCCNC#N', 'halogen'),
-    ('CCCN-CF3', '[*]CCCNC(F)(F)F', 'halogen'),
-    ('CCCN-COOH', '[*]CCCNC(=O)O', 'acidic'),
-    ('CCCN-COOMe', '[*]CCCNC(=O)OC', 'polar'),
-    ('CCCN-SO2Me', '[*]CCCNS(=O)(=O)C', 'polar'),
-    ('CCCN-SO2NH2', '[*]CCCNS(=O)(=O)N', 'polar'),
-    ('CCCN-morpholino', '[*]CCCNN1CCOCC1', 'basic'),
-    ('CCCN-piperidino', '[*]CCCNN1CCCCC1', 'basic'),
-    ('CCCN-pyrrolidino', '[*]CCCNN1CCCC1', 'basic'),
-    ('CCCN-N-methylpiperazino', '[*]CCCNN1CCN(C)CC1', 'basic'),
-    ('CCCN-azetidino', '[*]CCCNN1CCC1', 'basic'),
-    ('CCCN-tetrazolyl', '[*]CCCNc1nnn[nH]1', 'acidic'),
-    ('CCCN-oxadiazolyl', '[*]CCCNc1nnco1', 'bioisostere'),
-    ('CCCN-imidazolyl', '[*]CCCNc1ccn[nH]1', 'basic'),
-    ('CCCN-oxetanyl', '[*]CCCNC1COC1', 'bioisostere'),
-    ('C=C-OH', '[*]C=CO', 'polar'),
-    ('C=C-OMe', '[*]C=COC', 'polar'),
-    ('C=C-OEt', '[*]C=COCC', 'polar'),
-    ('C=C-F', '[*]C=CF', 'halogen'),
-    ('C=C-Cl', '[*]C=CCl', 'halogen'),
-    ('C=C-Br', '[*]C=CBr', 'halogen'),
-    ('C=C-NH2', '[*]C=CN', 'basic'),
-    ('C=C-NHMe', '[*]C=CNC', 'basic'),
-    ('C=C-NMe2', '[*]C=CN(C)C', 'basic'),
-    ('C=C-CN', '[*]C=CC#N', 'halogen'),
-    ('C=C-CF3', '[*]C=CC(F)(F)F', 'halogen'),
-    ('C=C-COOH', '[*]C=CC(=O)O', 'acidic'),
-    ('C=C-COOMe', '[*]C=CC(=O)OC', 'polar'),
-    ('C=C-SO2Me', '[*]C=CS(=O)(=O)C', 'polar'),
-    ('C=C-SO2NH2', '[*]C=CS(=O)(=O)N', 'polar'),
-    ('C=C-morpholino', '[*]C=CN1CCOCC1', 'basic'),
-    ('C=C-piperidino', '[*]C=CN1CCCCC1', 'basic'),
-    ('C=C-pyrrolidino', '[*]C=CN1CCCC1', 'basic'),
-    ('C=C-N-methylpiperazino', '[*]C=CN1CCN(C)CC1', 'basic'),
-    ('C=C-azetidino', '[*]C=CN1CCC1', 'basic'),
-    ('C=C-tetrazolyl', '[*]C=Cc1nnn[nH]1', 'acidic'),
-    ('C=C-oxadiazolyl', '[*]C=Cc1nnco1', 'bioisostere'),
-    ('C=C-imidazolyl', '[*]C=Cc1ccn[nH]1', 'basic'),
-    ('C=C-oxetanyl', '[*]C=CC1COC1', 'bioisostere'),
-    ('C#C-OH', '[*]C#CO', 'polar'),
-    ('C#C-OMe', '[*]C#COC', 'polar'),
-    ('C#C-OEt', '[*]C#COCC', 'polar'),
-    ('C#C-F', '[*]C#CF', 'halogen'),
-    ('C#C-Cl', '[*]C#CCl', 'halogen'),
-    ('C#C-Br', '[*]C#CBr', 'halogen'),
-    ('C#C-NH2', '[*]C#CN', 'basic'),
-    ('C#C-NHMe', '[*]C#CNC', 'basic'),
-    ('C#C-NMe2', '[*]C#CN(C)C', 'basic'),
-    ('C#C-CN', '[*]C#CC#N', 'halogen'),
-    ('C#C-CF3', '[*]C#CC(F)(F)F', 'halogen'),
-    ('C#C-COOH', '[*]C#CC(=O)O', 'acidic'),
-    ('C#C-COOMe', '[*]C#CC(=O)OC', 'polar'),
-    ('C#C-SO2Me', '[*]C#CS(=O)(=O)C', 'polar'),
-    ('C#C-SO2NH2', '[*]C#CS(=O)(=O)N', 'polar'),
-    ('C#C-morpholino', '[*]C#CN1CCOCC1', 'basic'),
-    ('C#C-piperidino', '[*]C#CN1CCCCC1', 'basic'),
-    ('C#C-pyrrolidino', '[*]C#CN1CCCC1', 'basic'),
-    ('C#C-N-methylpiperazino', '[*]C#CN1CCN(C)CC1', 'basic'),
-    ('C#C-azetidino', '[*]C#CN1CCC1', 'basic'),
-    ('C#C-tetrazolyl', '[*]C#Cc1nnn[nH]1', 'acidic'),
-    ('C#C-oxadiazolyl', '[*]C#Cc1nnco1', 'bioisostere'),
-    ('C#C-imidazolyl', '[*]C#Cc1ccn[nH]1', 'basic'),
-    ('C#C-oxetanyl', '[*]C#CC1COC1', 'bioisostere'),
-    ('C(F)(F)-OH', '[*]C(F)(F)O', 'polar'),
-    ('C(F)(F)-OMe', '[*]C(F)(F)OC', 'polar'),
-    ('C(F)(F)-OEt', '[*]C(F)(F)OCC', 'polar'),
-    ('C(F)(F)-Cl', '[*]C(F)(F)Cl', 'halogen'),
-    ('C(F)(F)-Br', '[*]C(F)(F)Br', 'halogen'),
-    ('C(F)(F)-NH2', '[*]C(F)(F)N', 'basic'),
-    ('C(F)(F)-NHMe', '[*]C(F)(F)NC', 'basic'),
-    ('C(F)(F)-NMe2', '[*]C(F)(F)N(C)C', 'basic'),
-    ('C(F)(F)-CN', '[*]C(F)(F)C#N', 'halogen'),
-    ('C(F)(F)-CF3', '[*]C(F)(F)C(F)(F)F', 'halogen'),
-    ('C(F)(F)-COOH', '[*]C(F)(F)C(=O)O', 'acidic'),
-    ('C(F)(F)-COOMe', '[*]C(F)(F)C(=O)OC', 'polar'),
-    ('C(F)(F)-SO2Me', '[*]C(F)(F)S(=O)(=O)C', 'polar'),
-    ('C(F)(F)-SO2NH2', '[*]C(F)(F)S(=O)(=O)N', 'polar'),
-    ('C(F)(F)-morpholino', '[*]C(F)(F)N1CCOCC1', 'basic'),
-    ('C(F)(F)-piperidino', '[*]C(F)(F)N1CCCCC1', 'basic'),
-    ('C(F)(F)-pyrrolidino', '[*]C(F)(F)N1CCCC1', 'basic'),
-    ('C(F)(F)-N-methylpiperazino', '[*]C(F)(F)N1CCN(C)CC1', 'basic'),
-    ('C(F)(F)-azetidino', '[*]C(F)(F)N1CCC1', 'basic'),
-    ('C(F)(F)-tetrazolyl', '[*]C(F)(F)c1nnn[nH]1', 'acidic'),
-    ('C(F)(F)-oxadiazolyl', '[*]C(F)(F)c1nnco1', 'bioisostere'),
-    ('C(F)(F)-imidazolyl', '[*]C(F)(F)c1ccn[nH]1', 'basic'),
-    ('C(F)(F)-oxetanyl', '[*]C(F)(F)C1COC1', 'bioisostere'),
-    ('C(C)-OH', '[*]C(C)O', 'polar'),
-    ('C(C)-OMe', '[*]C(C)OC', 'polar'),
-    ('C(C)-OEt', '[*]C(C)OCC', 'polar'),
-    ('C(C)-F', '[*]C(C)F', 'halogen'),
-    ('C(C)-Cl', '[*]C(C)Cl', 'halogen'),
-    ('C(C)-Br', '[*]C(C)Br', 'halogen'),
-    ('C(C)-NH2', '[*]C(C)N', 'basic'),
-    ('C(C)-NHMe', '[*]C(C)NC', 'basic'),
-    ('C(C)-NMe2', '[*]C(C)N(C)C', 'basic'),
-    ('C(C)-CN', '[*]C(C)C#N', 'halogen'),
-    ('C(C)-CF3', '[*]C(C)C(F)(F)F', 'halogen'),
-    ('C(C)-COOH', '[*]C(C)C(=O)O', 'acidic'),
-    ('C(C)-COOMe', '[*]C(C)C(=O)OC', 'polar'),
-    ('C(C)-SO2Me', '[*]C(C)S(=O)(=O)C', 'polar'),
-    ('C(C)-SO2NH2', '[*]C(C)S(=O)(=O)N', 'polar'),
-    ('C(C)-morpholino', '[*]C(C)N1CCOCC1', 'basic'),
-    ('C(C)-piperidino', '[*]C(C)N1CCCCC1', 'basic'),
-    ('C(C)-pyrrolidino', '[*]C(C)N1CCCC1', 'basic'),
-    ('C(C)-N-methylpiperazino', '[*]C(C)N1CCN(C)CC1', 'basic'),
-    ('C(C)-azetidino', '[*]C(C)N1CCC1', 'basic'),
-    ('C(C)-tetrazolyl', '[*]C(C)c1nnn[nH]1', 'acidic'),
-    ('C(C)-oxadiazolyl', '[*]C(C)c1nnco1', 'bioisostere'),
-    ('C(C)-imidazolyl', '[*]C(C)c1ccn[nH]1', 'basic'),
-    ('C(C)-oxetanyl', '[*]C(C)C1COC1', 'bioisostere'),
-    ('C(C)(C)-OH', '[*]C(C)(C)O', 'polar'),
-    ('C(C)(C)-OMe', '[*]C(C)(C)OC', 'polar'),
-    ('C(C)(C)-OEt', '[*]C(C)(C)OCC', 'polar'),
-    ('C(C)(C)-F', '[*]C(C)(C)F', 'halogen'),
-    ('C(C)(C)-Cl', '[*]C(C)(C)Cl', 'halogen'),
-    ('C(C)(C)-Br', '[*]C(C)(C)Br', 'halogen'),
-    ('C(C)(C)-NH2', '[*]C(C)(C)N', 'basic'),
-    ('C(C)(C)-NHMe', '[*]C(C)(C)NC', 'basic'),
-    ('C(C)(C)-NMe2', '[*]C(C)(C)N(C)C', 'basic'),
-    ('C(C)(C)-CN', '[*]C(C)(C)C#N', 'halogen'),
-    ('C(C)(C)-CF3', '[*]C(C)(C)C(F)(F)F', 'halogen'),
-    ('C(C)(C)-COOH', '[*]C(C)(C)C(=O)O', 'acidic'),
-    ('C(C)(C)-COOMe', '[*]C(C)(C)C(=O)OC', 'polar'),
-    ('C(C)(C)-SO2Me', '[*]C(C)(C)S(=O)(=O)C', 'polar'),
-    ('C(C)(C)-SO2NH2', '[*]C(C)(C)S(=O)(=O)N', 'polar'),
-    ('C(C)(C)-morpholino', '[*]C(C)(C)N1CCOCC1', 'basic'),
-    ('C(C)(C)-piperidino', '[*]C(C)(C)N1CCCCC1', 'basic'),
-    ('C(C)(C)-pyrrolidino', '[*]C(C)(C)N1CCCC1', 'basic'),
-    ('C(C)(C)-N-methylpiperazino', '[*]C(C)(C)N1CCN(C)CC1', 'basic'),
-    ('C(C)(C)-azetidino', '[*]C(C)(C)N1CCC1', 'basic'),
-    ('C(C)(C)-tetrazolyl', '[*]C(C)(C)c1nnn[nH]1', 'acidic'),
-    ('C(C)(C)-oxadiazolyl', '[*]C(C)(C)c1nnco1', 'bioisostere'),
-    ('C(C)(C)-imidazolyl', '[*]C(C)(C)c1ccn[nH]1', 'basic'),
-    ('C(C)(C)-oxetanyl', '[*]C(C)(C)C1COC1', 'bioisostere'),
-    ('C1CC1-OH', '[*]C1CC1O', 'polar'),
-    ('C1CC1-OMe', '[*]C1CC1OC', 'polar'),
-    ('C1CC1-OEt', '[*]C1CC1OCC', 'polar'),
-    ('C1CC1-F', '[*]C1CC1F', 'halogen'),
-    ('C1CC1-Cl', '[*]C1CC1Cl', 'halogen'),
-    ('C1CC1-Br', '[*]C1CC1Br', 'halogen'),
-    ('C1CC1-NH2', '[*]C1CC1N', 'basic'),
-    ('C1CC1-NHMe', '[*]C1CC1NC', 'basic'),
-    ('C1CC1-NMe2', '[*]C1CC1N(C)C', 'basic'),
-    ('C1CC1-CN', '[*]C1CC1C#N', 'halogen'),
-    ('C1CC1-CF3', '[*]C1CC1C(F)(F)F', 'halogen'),
-    ('C1CC1-COOH', '[*]C1CC1C(=O)O', 'acidic'),
-    ('C1CC1-COOMe', '[*]C1CC1C(=O)OC', 'polar'),
-    ('C1CC1-SO2Me', '[*]C1CC1S(=O)(=O)C', 'polar'),
-    ('C1CC1-SO2NH2', '[*]C1CC1S(=O)(=O)N', 'polar'),
-    ('C1CC1-morpholino', '[*]C1CC1N1CCOCC1', 'basic'),
-    ('C1CC1-piperidino', '[*]C1CC1N1CCCCC1', 'basic'),
-    ('C1CC1-pyrrolidino', '[*]C1CC1N1CCCC1', 'basic'),
-    ('C1CC1-N-methylpiperazino', '[*]C1CC1N1CCN(C)CC1', 'basic'),
-    ('C1CC1-azetidino', '[*]C1CC1N1CCC1', 'basic'),
-    ('C1CC1-tetrazolyl', '[*]C1CC1c1nnn[nH]1', 'acidic'),
-    ('C1CC1-oxadiazolyl', '[*]C1CC1c1nnco1', 'bioisostere'),
-    ('C1CC1-imidazolyl', '[*]C1CC1c1ccn[nH]1', 'basic'),
-    ('C1CC1-oxetanyl', '[*]C1CC1C1COC1', 'bioisostere'),
-    ('C1CCC1-OH', '[*]C1CCC1O', 'polar'),
-    ('C1CCC1-OMe', '[*]C1CCC1OC', 'polar'),
-    ('C1CCC1-OEt', '[*]C1CCC1OCC', 'polar'),
-    ('C1CCC1-F', '[*]C1CCC1F', 'halogen'),
-    ('C1CCC1-Cl', '[*]C1CCC1Cl', 'halogen'),
-    ('C1CCC1-Br', '[*]C1CCC1Br', 'halogen'),
-    ('C1CCC1-NH2', '[*]C1CCC1N', 'basic'),
-    ('C1CCC1-NHMe', '[*]C1CCC1NC', 'basic'),
-    ('C1CCC1-NMe2', '[*]C1CCC1N(C)C', 'basic'),
-    ('C1CCC1-CN', '[*]C1CCC1C#N', 'halogen'),
-    ('C1CCC1-CF3', '[*]C1CCC1C(F)(F)F', 'halogen'),
-    ('C1CCC1-COOH', '[*]C1CCC1C(=O)O', 'acidic'),
-    ('C1CCC1-COOMe', '[*]C1CCC1C(=O)OC', 'polar'),
-    ('C1CCC1-SO2Me', '[*]C1CCC1S(=O)(=O)C', 'polar'),
-    ('C1CCC1-SO2NH2', '[*]C1CCC1S(=O)(=O)N', 'polar'),
-    ('C1CCC1-morpholino', '[*]C1CCC1N1CCOCC1', 'basic'),
-    ('C1CCC1-piperidino', '[*]C1CCC1N1CCCCC1', 'basic'),
-    ('C1CCC1-pyrrolidino', '[*]C1CCC1N1CCCC1', 'basic'),
-    ('C1CCC1-N-methylpiperazino', '[*]C1CCC1N1CCN(C)CC1', 'basic'),
-    ('C1CCC1-azetidino', '[*]C1CCC1N1CCC1', 'basic'),
-    ('C1CCC1-tetrazolyl', '[*]C1CCC1c1nnn[nH]1', 'acidic'),
-    ('C1CCC1-oxadiazolyl', '[*]C1CCC1c1nnco1', 'bioisostere'),
-    ('C1CCC1-imidazolyl', '[*]C1CCC1c1ccn[nH]1', 'basic'),
-    ('C1CCC1-oxetanyl', '[*]C1CCC1C1COC1', 'bioisostere'),
-    ('C(=O)-SO2Me', '[*]C(=O)S(=O)(=O)C', 'polar'),
-    ('C(=O)-SO2NH2', '[*]C(=O)S(=O)(=O)N', 'polar'),
-    ('S(=O)(=O)-OMe', '[*]S(=O)(=O)OC', 'polar'),
-    ('S(=O)(=O)-OEt', '[*]S(=O)(=O)OCC', 'polar'),
-    ('S(=O)(=O)-F', '[*]S(=O)(=O)F', 'halogen'),
-    ('S(=O)(=O)-Cl', '[*]S(=O)(=O)Cl', 'halogen'),
-    ('S(=O)(=O)-Br', '[*]S(=O)(=O)Br', 'halogen'),
-    ('S(=O)(=O)-CN', '[*]S(=O)(=O)C#N', 'halogen'),
-    ('S(=O)(=O)-CF3', '[*]S(=O)(=O)C(F)(F)F', 'halogen'),
-    ('S(=O)(=O)-COOH', '[*]S(=O)(=O)C(=O)O', 'acidic'),
-    ('S(=O)(=O)-COOMe', '[*]S(=O)(=O)C(=O)OC', 'polar'),
-    ('S(=O)(=O)-SO2Me', '[*]S(=O)(=O)S(=O)(=O)C', 'polar'),
-    ('S(=O)(=O)-SO2NH2', '[*]S(=O)(=O)S(=O)(=O)N', 'polar'),
-    ('S(=O)(=O)-pyrrolidino', '[*]S(=O)(=O)N1CCCC1', 'basic'),
-    ('S(=O)(=O)-N-methylpiperazino', '[*]S(=O)(=O)N1CCN(C)CC1', 'basic'),
-    ('S(=O)(=O)-azetidino', '[*]S(=O)(=O)N1CCC1', 'basic'),
-    ('S(=O)(=O)-tetrazolyl', '[*]S(=O)(=O)c1nnn[nH]1', 'acidic'),
-    ('S(=O)(=O)-oxadiazolyl', '[*]S(=O)(=O)c1nnco1', 'bioisostere'),
-    ('S(=O)(=O)-imidazolyl', '[*]S(=O)(=O)c1ccn[nH]1', 'basic'),
-    ('S(=O)(=O)-oxetanyl', '[*]S(=O)(=O)C1COC1', 'bioisostere'),
-    ('OC-OH', '[*]OCO', 'polar'),
-    ('OC-OMe', '[*]OCOC', 'polar'),
-    ('OC-OEt', '[*]OCOCC', 'polar'),
-    ('OC-F', '[*]OCF', 'halogen'),
-    ('OC-Cl', '[*]OCCl', 'halogen'),
-    ('OC-Br', '[*]OCBr', 'halogen'),
-    ('OC-NH2', '[*]OCN', 'basic'),
-    ('OC-NHMe', '[*]OCNC', 'basic'),
-    ('OC-NMe2', '[*]OCN(C)C', 'basic'),
-    ('OC-CN', '[*]OCC#N', 'halogen'),
-    ('OC-CF3', '[*]OCC(F)(F)F', 'halogen'),
-    ('OC-COOH', '[*]OCC(=O)O', 'acidic'),
-    ('OC-COOMe', '[*]OCC(=O)OC', 'polar'),
-    ('OC-SO2Me', '[*]OCS(=O)(=O)C', 'polar'),
-    ('OC-SO2NH2', '[*]OCS(=O)(=O)N', 'polar'),
-    ('OC-morpholino', '[*]OCN1CCOCC1', 'basic'),
-    ('OC-piperidino', '[*]OCN1CCCCC1', 'basic'),
-    ('OC-pyrrolidino', '[*]OCN1CCCC1', 'basic'),
-    ('OC-N-methylpiperazino', '[*]OCN1CCN(C)CC1', 'basic'),
-    ('OC-azetidino', '[*]OCN1CCC1', 'basic'),
-    ('OC-tetrazolyl', '[*]OCc1nnn[nH]1', 'acidic'),
-    ('OC-oxadiazolyl', '[*]OCc1nnco1', 'bioisostere'),
-    ('OC-imidazolyl', '[*]OCc1ccn[nH]1', 'basic'),
-    ('OC-oxetanyl', '[*]OCC1COC1', 'bioisostere'),
-    ('OCC-OEt', '[*]OCCOCC', 'polar'),
-    ('OCC-Cl', '[*]OCCCl', 'halogen'),
-    ('OCC-Br', '[*]OCCBr', 'halogen'),
-    ('OCC-NHMe', '[*]OCCNC', 'basic'),
-    ('OCC-NMe2', '[*]OCCN(C)C', 'basic'),
-    ('OCC-CN', '[*]OCCC#N', 'halogen'),
-    ('OCC-CF3', '[*]OCCC(F)(F)F', 'halogen'),
-    ('OCC-COOH', '[*]OCCC(=O)O', 'acidic'),
-    ('OCC-COOMe', '[*]OCCC(=O)OC', 'polar'),
-    ('OCC-SO2Me', '[*]OCCS(=O)(=O)C', 'polar'),
-    ('OCC-SO2NH2', '[*]OCCS(=O)(=O)N', 'polar'),
-    ('OCC-morpholino', '[*]OCCN1CCOCC1', 'basic'),
-    ('OCC-piperidino', '[*]OCCN1CCCCC1', 'basic'),
-    ('OCC-pyrrolidino', '[*]OCCN1CCCC1', 'basic'),
-    ('OCC-N-methylpiperazino', '[*]OCCN1CCN(C)CC1', 'basic'),
-    ('OCC-azetidino', '[*]OCCN1CCC1', 'basic'),
-    ('OCC-tetrazolyl', '[*]OCCc1nnn[nH]1', 'acidic'),
-    ('OCC-oxadiazolyl', '[*]OCCc1nnco1', 'bioisostere'),
-    ('OCC-imidazolyl', '[*]OCCc1ccn[nH]1', 'basic'),
-    ('OCC-oxetanyl', '[*]OCCC1COC1', 'bioisostere'),
-    ('OCCC-OH', '[*]OCCCO', 'polar'),
-    ('OCCC-OEt', '[*]OCCCOCC', 'polar'),
-    ('OCCC-Cl', '[*]OCCCCl', 'halogen'),
-    ('OCCC-Br', '[*]OCCCBr', 'halogen'),
-    ('OCCC-NH2', '[*]OCCCN', 'basic'),
-    ('OCCC-NHMe', '[*]OCCCNC', 'basic'),
-    ('OCCC-NMe2', '[*]OCCCN(C)C', 'basic'),
-    ('OCCC-CN', '[*]OCCCC#N', 'halogen'),
-    ('OCCC-CF3', '[*]OCCCC(F)(F)F', 'halogen'),
-    ('OCCC-COOH', '[*]OCCCC(=O)O', 'acidic'),
-    ('OCCC-COOMe', '[*]OCCCC(=O)OC', 'polar'),
-    ('OCCC-SO2Me', '[*]OCCCS(=O)(=O)C', 'polar'),
-    ('OCCC-SO2NH2', '[*]OCCCS(=O)(=O)N', 'polar'),
-    ('OCCC-morpholino', '[*]OCCCN1CCOCC1', 'basic'),
-    ('OCCC-piperidino', '[*]OCCCN1CCCCC1', 'basic'),
-    ('OCCC-pyrrolidino', '[*]OCCCN1CCCC1', 'basic'),
-    ('OCCC-N-methylpiperazino', '[*]OCCCN1CCN(C)CC1', 'basic'),
-    ('OCCC-azetidino', '[*]OCCCN1CCC1', 'basic'),
-    ('OCCC-tetrazolyl', '[*]OCCCc1nnn[nH]1', 'acidic'),
-    ('OCCC-oxadiazolyl', '[*]OCCCc1nnco1', 'bioisostere'),
-    ('OCCC-imidazolyl', '[*]OCCCc1ccn[nH]1', 'basic'),
-    ('OCCC-oxetanyl', '[*]OCCCC1COC1', 'bioisostere'),
-    ('NC-OH', '[*]NCO', 'polar'),
-    ('NC-OMe', '[*]NCOC', 'polar'),
-    ('NC-OEt', '[*]NCOCC', 'polar'),
-    ('NC-F', '[*]NCF', 'halogen'),
-    ('NC-Cl', '[*]NCCl', 'halogen'),
-    ('NC-Br', '[*]NCBr', 'halogen'),
-    ('NC-NH2', '[*]NCN', 'basic'),
-    ('NC-NHMe', '[*]NCNC', 'basic'),
-    ('NC-NMe2', '[*]NCN(C)C', 'basic'),
-    ('NC-CN', '[*]NCC#N', 'halogen'),
-    ('NC-CF3', '[*]NCC(F)(F)F', 'halogen'),
-    ('NC-COOH', '[*]NCC(=O)O', 'acidic'),
-    ('NC-COOMe', '[*]NCC(=O)OC', 'polar'),
-    ('NC-SO2Me', '[*]NCS(=O)(=O)C', 'polar'),
-    ('NC-SO2NH2', '[*]NCS(=O)(=O)N', 'polar'),
-    ('NC-morpholino', '[*]NCN1CCOCC1', 'basic'),
-    ('NC-piperidino', '[*]NCN1CCCCC1', 'basic'),
-    ('NC-pyrrolidino', '[*]NCN1CCCC1', 'basic'),
-    ('NC-N-methylpiperazino', '[*]NCN1CCN(C)CC1', 'basic'),
-    ('NC-azetidino', '[*]NCN1CCC1', 'basic'),
-    ('NC-tetrazolyl', '[*]NCc1nnn[nH]1', 'acidic'),
-    ('NC-oxadiazolyl', '[*]NCc1nnco1', 'bioisostere'),
-    ('NC-imidazolyl', '[*]NCc1ccn[nH]1', 'basic'),
-    ('NC-oxetanyl', '[*]NCC1COC1', 'bioisostere'),
-    ('NCC-OH', '[*]NCCO', 'polar'),
-    ('NCC-OMe', '[*]NCCOC', 'polar'),
-    ('NCC-OEt', '[*]NCCOCC', 'polar'),
-    ('NCC-F', '[*]NCCF', 'halogen'),
-    ('NCC-Cl', '[*]NCCCl', 'halogen'),
-    ('NCC-Br', '[*]NCCBr', 'halogen'),
-    ('NCC-NH2', '[*]NCCN', 'basic'),
-    ('NCC-NHMe', '[*]NCCNC', 'basic'),
-    ('NCC-NMe2', '[*]NCCN(C)C', 'basic'),
-    ('NCC-CN', '[*]NCCC#N', 'halogen'),
-    ('NCC-CF3', '[*]NCCC(F)(F)F', 'halogen'),
-    ('NCC-COOH', '[*]NCCC(=O)O', 'acidic'),
-    ('NCC-COOMe', '[*]NCCC(=O)OC', 'polar'),
-    ('NCC-SO2Me', '[*]NCCS(=O)(=O)C', 'polar'),
-    ('NCC-SO2NH2', '[*]NCCS(=O)(=O)N', 'polar'),
-    ('NCC-morpholino', '[*]NCCN1CCOCC1', 'basic'),
-    ('NCC-piperidino', '[*]NCCN1CCCCC1', 'basic'),
-    ('NCC-pyrrolidino', '[*]NCCN1CCCC1', 'basic'),
-    ('NCC-N-methylpiperazino', '[*]NCCN1CCN(C)CC1', 'basic'),
-    ('NCC-azetidino', '[*]NCCN1CCC1', 'basic'),
-    ('NCC-tetrazolyl', '[*]NCCc1nnn[nH]1', 'acidic'),
-    ('NCC-oxadiazolyl', '[*]NCCc1nnco1', 'bioisostere'),
-    ('NCC-imidazolyl', '[*]NCCc1ccn[nH]1', 'basic'),
-    ('NCC-oxetanyl', '[*]NCCC1COC1', 'bioisostere'),
-    ('N(C)C-OH', '[*]N(C)CO', 'polar'),
-    ('N(C)C-OMe', '[*]N(C)COC', 'polar'),
-    ('N(C)C-OEt', '[*]N(C)COCC', 'polar'),
-    ('N(C)C-F', '[*]N(C)CF', 'halogen'),
-    ('N(C)C-Cl', '[*]N(C)CCl', 'halogen'),
-    ('N(C)C-Br', '[*]N(C)CBr', 'halogen'),
-    ('N(C)C-NH2', '[*]N(C)CN', 'basic'),
-    ('N(C)C-NHMe', '[*]N(C)CNC', 'basic'),
-    ('N(C)C-NMe2', '[*]N(C)CN(C)C', 'basic'),
-    ('N(C)C-CN', '[*]N(C)CC#N', 'halogen'),
-    ('N(C)C-CF3', '[*]N(C)CC(F)(F)F', 'halogen'),
-    ('N(C)C-COOH', '[*]N(C)CC(=O)O', 'acidic'),
-    ('N(C)C-COOMe', '[*]N(C)CC(=O)OC', 'polar'),
-    ('N(C)C-SO2Me', '[*]N(C)CS(=O)(=O)C', 'polar'),
-    ('N(C)C-SO2NH2', '[*]N(C)CS(=O)(=O)N', 'polar'),
-    ('N(C)C-morpholino', '[*]N(C)CN1CCOCC1', 'basic'),
-    ('N(C)C-piperidino', '[*]N(C)CN1CCCCC1', 'basic'),
-    ('N(C)C-pyrrolidino', '[*]N(C)CN1CCCC1', 'basic'),
-    ('N(C)C-N-methylpiperazino', '[*]N(C)CN1CCN(C)CC1', 'basic'),
-    ('N(C)C-azetidino', '[*]N(C)CN1CCC1', 'basic'),
-    ('N(C)C-tetrazolyl', '[*]N(C)Cc1nnn[nH]1', 'acidic'),
-    ('N(C)C-oxadiazolyl', '[*]N(C)Cc1nnco1', 'bioisostere'),
-    ('N(C)C-imidazolyl', '[*]N(C)Cc1ccn[nH]1', 'basic'),
-    ('N(C)C-oxetanyl', '[*]N(C)CC1COC1', 'bioisostere'),
-    ('c1ccccc1-N-methylpiperazino', '[*]c1ccccc1N1CCN(C)CC1', 'basic'),
-    ('c1ccccc1-azetidino', '[*]c1ccccc1N1CCC1', 'basic'),
-    ('c1ccccc1-tetrazolyl', '[*]c1ccccc1c1nnn[nH]1', 'acidic'),
-    ('c1ccccc1-oxadiazolyl', '[*]c1ccccc1c1nnco1', 'bioisostere'),
-    ('c1ccccc1-imidazolyl', '[*]c1ccccc1c1ccn[nH]1', 'basic'),
-    ('c1ccccc1-oxetanyl', '[*]c1ccccc1C1COC1', 'bioisostere'),
-    ('c1cccnc1-OH', '[*]c1cccnc1O', 'polar'),
-    ('c1cccnc1-OMe', '[*]c1cccnc1OC', 'polar'),
-    ('c1cccnc1-OEt', '[*]c1cccnc1OCC', 'polar'),
-    ('c1cccnc1-F', '[*]c1cccnc1F', 'halogen'),
-    ('c1cccnc1-Cl', '[*]c1cccnc1Cl', 'halogen'),
-    ('c1cccnc1-Br', '[*]c1cccnc1Br', 'halogen'),
-    ('c1cccnc1-NH2', '[*]c1cccnc1N', 'basic'),
-    ('c1cccnc1-NHMe', '[*]c1cccnc1NC', 'basic'),
-    ('c1cccnc1-NMe2', '[*]c1cccnc1N(C)C', 'basic'),
-    ('c1cccnc1-CN', '[*]c1cccnc1C#N', 'halogen'),
-    ('c1cccnc1-CF3', '[*]c1cccnc1C(F)(F)F', 'halogen'),
-    ('c1cccnc1-COOH', '[*]c1cccnc1C(=O)O', 'acidic'),
-    ('c1cccnc1-COOMe', '[*]c1cccnc1C(=O)OC', 'polar'),
-    ('c1cccnc1-SO2Me', '[*]c1cccnc1S(=O)(=O)C', 'polar'),
-    ('c1cccnc1-SO2NH2', '[*]c1cccnc1S(=O)(=O)N', 'polar'),
-    ('c1cccnc1-morpholino', '[*]c1cccnc1N1CCOCC1', 'basic'),
-    ('c1cccnc1-piperidino', '[*]c1cccnc1N1CCCCC1', 'basic'),
-    ('c1cccnc1-pyrrolidino', '[*]c1cccnc1N1CCCC1', 'basic'),
-    ('c1cccnc1-N-methylpiperazino', '[*]c1cccnc1N1CCN(C)CC1', 'basic'),
-    ('c1cccnc1-azetidino', '[*]c1cccnc1N1CCC1', 'basic'),
-    ('c1cccnc1-tetrazolyl', '[*]c1cccnc1c1nnn[nH]1', 'acidic'),
-    ('c1cccnc1-oxadiazolyl', '[*]c1cccnc1c1nnco1', 'bioisostere'),
-    ('c1cccnc1-imidazolyl', '[*]c1cccnc1c1ccn[nH]1', 'basic'),
-    ('c1cccnc1-oxetanyl', '[*]c1cccnc1C1COC1', 'bioisostere'),
-    ('piperazine-ethyl', '[*]CCN1CCNCC1', 'basic'),
-    ('azepane-methyl', '[*]CN1CCCCCC1', 'basic'),
-    ('azepane-ethyl', '[*]CCN1CCCCCC1', 'basic'),
-    ('1,4-oxazepane-methyl', '[*]CN1CCOCCC1', 'basic'),
-    ('1,4-oxazepane-ethyl', '[*]CCN1CCOCCC1', 'basic'),
-    ('carbonyl-NHtBu_2', '[*]C(=O)NC(C)(C)C', 'polar'),
-    ('carbonyl-NHcPr_2', '[*]C(=O)NC1CC1', 'polar'),
-    ('carbonyl-NHcBu', '[*]C(=O)NC1CCC1', 'polar'),
-    ('carbonyl-NHcPent_2', '[*]C(=O)NC1CCCC1', 'polar'),
-    ('carbonyl-NHcHex_2', '[*]C(=O)NC1CCCCC1', 'polar'),
-    ('carbonyl-NMeEt', '[*]C(=O)N(C)CC', 'polar'),
-    ('carbonyl-NHBn_2', '[*]C(=O)NCc1ccccc1', 'polar'),
-    ('carbonyl-NH(4-FBn)', '[*]C(=O)NCc1ccc(F)cc1', 'polar'),
-    ('carbonyl-NH(4-ClBn)', '[*]C(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('carbonyl-NH(4-MeBn)', '[*]C(=O)NCc1ccc(C)cc1', 'polar'),
-    ('carbonyl-azepanyl', '[*]C(=O)N1CCCCCC1', 'polar'),
-    ('carbonyl-NHOMe', '[*]C(=O)NOC', 'polar'),
-    ('carbonyl-NHOEt', '[*]C(=O)NOCC', 'polar'),
-    ('carbonyl-NH(2-pyridyl)', '[*]C(=O)Nc1ccccn1', 'polar'),
-    ('carbonyl-NH(3-pyridyl)', '[*]C(=O)Nc1cccnc1', 'polar'),
-    ('carbonyl-NH(4-pyridyl)', '[*]C(=O)Nc1ccncc1', 'polar'),
-    ('carbonyl-NH(pyrimidinyl)', '[*]C(=O)Nc1ncccn1', 'polar'),
-    ('carbonyl-NH(thiazolyl)', '[*]C(=O)Nc1nccs1', 'polar'),
-    ('carbonyl-NHPh', '[*]C(=O)Nc1ccccc1', 'polar'),
-    ('carbonyl-NHMe-OH', '[*]C(=O)N(C)CCO', 'polar'),
-    ('carbonyl-N(Me)(Bn)', '[*]C(=O)N(C)Cc1ccccc1', 'polar'),
-    ('carbonyl-NH(2-HOEt)', '[*]C(=O)NCCO', 'polar'),
-    ('carbonyl-N(2-HOEt)2', '[*]C(=O)N(CCO)CCO', 'polar'),
-    ('carbonyl-3-hydroxypyrrolidinyl', '[*]C(=O)N1CCC(O)C1', 'polar'),
-    ('carbonyl-4-hydroxypiperidyl', '[*]C(=O)N1CCC(O)CC1', 'polar'),
-    ('carbonyl-3-fluoropyrrolidinyl', '[*]C(=O)N1CCC(F)C1', 'polar'),
-    ('carbonyl-3-methylpiperidyl', '[*]C(=O)N1CCCC(C)C1', 'polar'),
-    ('carbonyl-4-methylpiperidyl', '[*]C(=O)N1CCC(C)CC1', 'polar'),
-    ('C-carbonyl-NH2', '[*]CC(=O)N', 'polar'),
-    ('C-carbonyl-NHMe', '[*]CC(=O)NC', 'polar'),
-    ('C-carbonyl-NHEt', '[*]CC(=O)NCC', 'polar'),
-    ('C-carbonyl-NHiPr', '[*]CC(=O)NC(C)C', 'polar'),
-    ('C-carbonyl-NHtBu', '[*]CC(=O)NC(C)(C)C', 'polar'),
-    ('C-carbonyl-NHcPr', '[*]CC(=O)NC1CC1', 'polar'),
-    ('C-carbonyl-NHcBu', '[*]CC(=O)NC1CCC1', 'polar'),
-    ('C-carbonyl-NHcPent', '[*]CC(=O)NC1CCCC1', 'polar'),
-    ('C-carbonyl-NHcHex', '[*]CC(=O)NC1CCCCC1', 'polar'),
-    ('C-carbonyl-NMe2', '[*]CC(=O)N(C)C', 'polar'),
-    ('C-carbonyl-NEt2', '[*]CC(=O)N(CC)CC', 'polar'),
-    ('C-carbonyl-NMeEt', '[*]CC(=O)N(C)CC', 'polar'),
-    ('C-carbonyl-NHBn', '[*]CC(=O)NCc1ccccc1', 'polar'),
-    ('C-carbonyl-NH(4-FBn)', '[*]CC(=O)NCc1ccc(F)cc1', 'polar'),
-    ('C-carbonyl-NH(4-ClBn)', '[*]CC(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('C-carbonyl-NH(4-MeBn)', '[*]CC(=O)NCc1ccc(C)cc1', 'polar'),
-    ('C-carbonyl-piperidyl', '[*]CC(=O)N1CCCCC1', 'polar'),
-    ('C-carbonyl-pyrrolidyl', '[*]CC(=O)N1CCCC1', 'polar'),
-    ('C-carbonyl-morpholyl', '[*]CC(=O)N1CCOCC1', 'polar'),
-    ('C-carbonyl-azetidinyl', '[*]CC(=O)N1CCC1', 'polar'),
-    ('C-carbonyl-N-Me-piperazinyl', '[*]CC(=O)N1CCN(C)CC1', 'polar'),
-    ('C-carbonyl-azepanyl', '[*]CC(=O)N1CCCCCC1', 'polar'),
-    ('C-carbonyl-NHOMe', '[*]CC(=O)NOC', 'polar'),
-    ('C-carbonyl-NHOEt', '[*]CC(=O)NOCC', 'polar'),
-    ('C-carbonyl-NH(2-pyridyl)', '[*]CC(=O)Nc1ccccn1', 'polar'),
-    ('C-carbonyl-NH(3-pyridyl)', '[*]CC(=O)Nc1cccnc1', 'polar'),
-    ('C-carbonyl-NH(4-pyridyl)', '[*]CC(=O)Nc1ccncc1', 'polar'),
-    ('C-carbonyl-NH(pyrimidinyl)', '[*]CC(=O)Nc1ncccn1', 'polar'),
-    ('C-carbonyl-NH(thiazolyl)', '[*]CC(=O)Nc1nccs1', 'polar'),
-    ('C-carbonyl-NHPh', '[*]CC(=O)Nc1ccccc1', 'polar'),
-    ('C-carbonyl-NHMe-OH', '[*]CC(=O)N(C)CCO', 'polar'),
-    ('C-carbonyl-N(Me)(Bn)', '[*]CC(=O)N(C)Cc1ccccc1', 'polar'),
-    ('C-carbonyl-NH(2-HOEt)', '[*]CC(=O)NCCO', 'polar'),
-    ('C-carbonyl-N(2-HOEt)2', '[*]CC(=O)N(CCO)CCO', 'polar'),
-    ('C-carbonyl-3-hydroxypyrrolidinyl', '[*]CC(=O)N1CCC(O)C1', 'polar'),
-    ('C-carbonyl-4-hydroxypiperidyl', '[*]CC(=O)N1CCC(O)CC1', 'polar'),
-    ('C-carbonyl-3-fluoropyrrolidinyl', '[*]CC(=O)N1CCC(F)C1', 'polar'),
-    ('C-carbonyl-3-methylpiperidyl', '[*]CC(=O)N1CCCC(C)C1', 'polar'),
-    ('C-carbonyl-4-methylpiperidyl', '[*]CC(=O)N1CCC(C)CC1', 'polar'),
-    ('CC-carbonyl-NH2', '[*]CCC(=O)N', 'polar'),
-    ('CC-carbonyl-NHMe', '[*]CCC(=O)NC', 'polar'),
-    ('CC-carbonyl-NHEt', '[*]CCC(=O)NCC', 'polar'),
-    ('CC-carbonyl-NHiPr', '[*]CCC(=O)NC(C)C', 'polar'),
-    ('CC-carbonyl-NHtBu', '[*]CCC(=O)NC(C)(C)C', 'polar'),
-    ('CC-carbonyl-NHcPr', '[*]CCC(=O)NC1CC1', 'polar'),
-    ('CC-carbonyl-NHcBu', '[*]CCC(=O)NC1CCC1', 'polar'),
-    ('CC-carbonyl-NHcPent', '[*]CCC(=O)NC1CCCC1', 'polar'),
-    ('CC-carbonyl-NHcHex', '[*]CCC(=O)NC1CCCCC1', 'polar'),
-    ('CC-carbonyl-NMe2', '[*]CCC(=O)N(C)C', 'polar'),
-    ('CC-carbonyl-NEt2', '[*]CCC(=O)N(CC)CC', 'polar'),
-    ('CC-carbonyl-NMeEt', '[*]CCC(=O)N(C)CC', 'polar'),
-    ('CC-carbonyl-NHBn', '[*]CCC(=O)NCc1ccccc1', 'polar'),
-    ('CC-carbonyl-NH(4-FBn)', '[*]CCC(=O)NCc1ccc(F)cc1', 'polar'),
-    ('CC-carbonyl-NH(4-ClBn)', '[*]CCC(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('CC-carbonyl-NH(4-MeBn)', '[*]CCC(=O)NCc1ccc(C)cc1', 'polar'),
-    ('CC-carbonyl-piperidyl', '[*]CCC(=O)N1CCCCC1', 'polar'),
-    ('CC-carbonyl-pyrrolidyl', '[*]CCC(=O)N1CCCC1', 'polar'),
-    ('CC-carbonyl-morpholyl', '[*]CCC(=O)N1CCOCC1', 'polar'),
-    ('CC-carbonyl-azetidinyl', '[*]CCC(=O)N1CCC1', 'polar'),
-    ('CC-carbonyl-N-Me-piperazinyl', '[*]CCC(=O)N1CCN(C)CC1', 'polar'),
-    ('CC-carbonyl-azepanyl', '[*]CCC(=O)N1CCCCCC1', 'polar'),
-    ('CC-carbonyl-NHOMe', '[*]CCC(=O)NOC', 'polar'),
-    ('CC-carbonyl-NHOEt', '[*]CCC(=O)NOCC', 'polar'),
-    ('CC-carbonyl-NH(2-pyridyl)', '[*]CCC(=O)Nc1ccccn1', 'polar'),
-    ('CC-carbonyl-NH(3-pyridyl)', '[*]CCC(=O)Nc1cccnc1', 'polar'),
-    ('CC-carbonyl-NH(4-pyridyl)', '[*]CCC(=O)Nc1ccncc1', 'polar'),
-    ('CC-carbonyl-NH(pyrimidinyl)', '[*]CCC(=O)Nc1ncccn1', 'polar'),
-    ('CC-carbonyl-NH(thiazolyl)', '[*]CCC(=O)Nc1nccs1', 'polar'),
-    ('CC-carbonyl-NHPh', '[*]CCC(=O)Nc1ccccc1', 'polar'),
-    ('CC-carbonyl-NHMe-OH', '[*]CCC(=O)N(C)CCO', 'polar'),
-    ('CC-carbonyl-N(Me)(Bn)', '[*]CCC(=O)N(C)Cc1ccccc1', 'polar'),
-    ('CC-carbonyl-NH(2-HOEt)', '[*]CCC(=O)NCCO', 'polar'),
-    ('CC-carbonyl-N(2-HOEt)2', '[*]CCC(=O)N(CCO)CCO', 'polar'),
-    ('CC-carbonyl-3-hydroxypyrrolidinyl', '[*]CCC(=O)N1CCC(O)C1', 'polar'),
-    ('CC-carbonyl-4-hydroxypiperidyl', '[*]CCC(=O)N1CCC(O)CC1', 'polar'),
-    ('CC-carbonyl-3-fluoropyrrolidinyl', '[*]CCC(=O)N1CCC(F)C1', 'polar'),
-    ('CC-carbonyl-3-methylpiperidyl', '[*]CCC(=O)N1CCCC(C)C1', 'polar'),
-    ('CC-carbonyl-4-methylpiperidyl', '[*]CCC(=O)N1CCC(C)CC1', 'polar'),
-    ('CCC-carbonyl-NH2', '[*]CCCC(=O)N', 'polar'),
-    ('CCC-carbonyl-NHMe', '[*]CCCC(=O)NC', 'polar'),
-    ('CCC-carbonyl-NHEt', '[*]CCCC(=O)NCC', 'polar'),
-    ('CCC-carbonyl-NHiPr', '[*]CCCC(=O)NC(C)C', 'polar'),
-    ('CCC-carbonyl-NHtBu', '[*]CCCC(=O)NC(C)(C)C', 'polar'),
-    ('CCC-carbonyl-NHcPr', '[*]CCCC(=O)NC1CC1', 'polar'),
-    ('CCC-carbonyl-NHcBu', '[*]CCCC(=O)NC1CCC1', 'polar'),
-    ('CCC-carbonyl-NHcPent', '[*]CCCC(=O)NC1CCCC1', 'polar'),
-    ('CCC-carbonyl-NHcHex', '[*]CCCC(=O)NC1CCCCC1', 'polar'),
-    ('CCC-carbonyl-NMe2', '[*]CCCC(=O)N(C)C', 'polar'),
-    ('CCC-carbonyl-NEt2', '[*]CCCC(=O)N(CC)CC', 'polar'),
-    ('CCC-carbonyl-NMeEt', '[*]CCCC(=O)N(C)CC', 'polar'),
-    ('CCC-carbonyl-NHBn', '[*]CCCC(=O)NCc1ccccc1', 'polar'),
-    ('CCC-carbonyl-NH(4-FBn)', '[*]CCCC(=O)NCc1ccc(F)cc1', 'polar'),
-    ('CCC-carbonyl-NH(4-ClBn)', '[*]CCCC(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('CCC-carbonyl-NH(4-MeBn)', '[*]CCCC(=O)NCc1ccc(C)cc1', 'polar'),
-    ('CCC-carbonyl-piperidyl', '[*]CCCC(=O)N1CCCCC1', 'polar'),
-    ('CCC-carbonyl-pyrrolidyl', '[*]CCCC(=O)N1CCCC1', 'polar'),
-    ('CCC-carbonyl-morpholyl', '[*]CCCC(=O)N1CCOCC1', 'polar'),
-    ('CCC-carbonyl-azetidinyl', '[*]CCCC(=O)N1CCC1', 'polar'),
-    ('CCC-carbonyl-N-Me-piperazinyl', '[*]CCCC(=O)N1CCN(C)CC1', 'polar'),
-    ('CCC-carbonyl-azepanyl', '[*]CCCC(=O)N1CCCCCC1', 'polar'),
-    ('CCC-carbonyl-NHOMe', '[*]CCCC(=O)NOC', 'polar'),
-    ('CCC-carbonyl-NHOEt', '[*]CCCC(=O)NOCC', 'polar'),
-    ('CCC-carbonyl-NH(2-pyridyl)', '[*]CCCC(=O)Nc1ccccn1', 'polar'),
-    ('CCC-carbonyl-NH(3-pyridyl)', '[*]CCCC(=O)Nc1cccnc1', 'polar'),
-    ('CCC-carbonyl-NH(4-pyridyl)', '[*]CCCC(=O)Nc1ccncc1', 'polar'),
-    ('CCC-carbonyl-NH(pyrimidinyl)', '[*]CCCC(=O)Nc1ncccn1', 'polar'),
-    ('CCC-carbonyl-NH(thiazolyl)', '[*]CCCC(=O)Nc1nccs1', 'polar'),
-    ('CCC-carbonyl-NHPh', '[*]CCCC(=O)Nc1ccccc1', 'polar'),
-    ('CCC-carbonyl-NHMe-OH', '[*]CCCC(=O)N(C)CCO', 'polar'),
-    ('CCC-carbonyl-N(Me)(Bn)', '[*]CCCC(=O)N(C)Cc1ccccc1', 'polar'),
-    ('CCC-carbonyl-NH(2-HOEt)', '[*]CCCC(=O)NCCO', 'polar'),
-    ('CCC-carbonyl-N(2-HOEt)2', '[*]CCCC(=O)N(CCO)CCO', 'polar'),
-    ('CCC-carbonyl-3-hydroxypyrrolidinyl', '[*]CCCC(=O)N1CCC(O)C1', 'polar'),
-    ('CCC-carbonyl-4-hydroxypiperidyl', '[*]CCCC(=O)N1CCC(O)CC1', 'polar'),
-    ('CCC-carbonyl-3-fluoropyrrolidinyl', '[*]CCCC(=O)N1CCC(F)C1', 'polar'),
-    ('CCC-carbonyl-3-methylpiperidyl', '[*]CCCC(=O)N1CCCC(C)C1', 'polar'),
-    ('CCC-carbonyl-4-methylpiperidyl', '[*]CCCC(=O)N1CCC(C)CC1', 'polar'),
-    ('C1CC1-carbonyl-NH2', '[*]C1CC1C(=O)N', 'polar'),
-    ('C1CC1-carbonyl-NHMe', '[*]C1CC1C(=O)NC', 'polar'),
-    ('C1CC1-carbonyl-NHEt', '[*]C1CC1C(=O)NCC', 'polar'),
-    ('C1CC1-carbonyl-NHiPr', '[*]C1CC1C(=O)NC(C)C', 'polar'),
-    ('C1CC1-carbonyl-NHtBu', '[*]C1CC1C(=O)NC(C)(C)C', 'polar'),
-    ('C1CC1-carbonyl-NHcPr', '[*]C1CC1C(=O)NC1CC1', 'polar'),
-    ('C1CC1-carbonyl-NHcBu', '[*]C1CC1C(=O)NC1CCC1', 'polar'),
-    ('C1CC1-carbonyl-NHcPent', '[*]C1CC1C(=O)NC1CCCC1', 'polar'),
-    ('C1CC1-carbonyl-NHcHex', '[*]C1CC1C(=O)NC1CCCCC1', 'polar'),
-    ('C1CC1-carbonyl-NMe2', '[*]C1CC1C(=O)N(C)C', 'polar'),
-    ('C1CC1-carbonyl-NEt2', '[*]C1CC1C(=O)N(CC)CC', 'polar'),
-    ('C1CC1-carbonyl-NMeEt', '[*]C1CC1C(=O)N(C)CC', 'polar'),
-    ('C1CC1-carbonyl-NHBn', '[*]C1CC1C(=O)NCc1ccccc1', 'polar'),
-    ('C1CC1-carbonyl-NH(4-FBn)', '[*]C1CC1C(=O)NCc1ccc(F)cc1', 'polar'),
-    ('C1CC1-carbonyl-NH(4-ClBn)', '[*]C1CC1C(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('C1CC1-carbonyl-NH(4-MeBn)', '[*]C1CC1C(=O)NCc1ccc(C)cc1', 'polar'),
-    ('C1CC1-carbonyl-piperidyl', '[*]C1CC1C(=O)N1CCCCC1', 'polar'),
-    ('C1CC1-carbonyl-pyrrolidyl', '[*]C1CC1C(=O)N1CCCC1', 'polar'),
-    ('C1CC1-carbonyl-morpholyl', '[*]C1CC1C(=O)N1CCOCC1', 'polar'),
-    ('C1CC1-carbonyl-azetidinyl', '[*]C1CC1C(=O)N1CCC1', 'polar'),
-    ('C1CC1-carbonyl-N-Me-piperazinyl', '[*]C1CC1C(=O)N1CCN(C)CC1', 'polar'),
-    ('C1CC1-carbonyl-azepanyl', '[*]C1CC1C(=O)N1CCCCCC1', 'polar'),
-    ('C1CC1-carbonyl-NHOMe', '[*]C1CC1C(=O)NOC', 'polar'),
-    ('C1CC1-carbonyl-NHOEt', '[*]C1CC1C(=O)NOCC', 'polar'),
-    ('C1CC1-carbonyl-NH(2-pyridyl)', '[*]C1CC1C(=O)Nc1ccccn1', 'polar'),
-    ('C1CC1-carbonyl-NH(3-pyridyl)', '[*]C1CC1C(=O)Nc1cccnc1', 'polar'),
-    ('C1CC1-carbonyl-NH(4-pyridyl)', '[*]C1CC1C(=O)Nc1ccncc1', 'polar'),
-    ('C1CC1-carbonyl-NH(pyrimidinyl)', '[*]C1CC1C(=O)Nc1ncccn1', 'polar'),
-    ('C1CC1-carbonyl-NH(thiazolyl)', '[*]C1CC1C(=O)Nc1nccs1', 'polar'),
-    ('C1CC1-carbonyl-NHPh', '[*]C1CC1C(=O)Nc1ccccc1', 'polar'),
-    ('C1CC1-carbonyl-NHMe-OH', '[*]C1CC1C(=O)N(C)CCO', 'polar'),
-    ('C1CC1-carbonyl-N(Me)(Bn)', '[*]C1CC1C(=O)N(C)Cc1ccccc1', 'polar'),
-    ('C1CC1-carbonyl-NH(2-HOEt)', '[*]C1CC1C(=O)NCCO', 'polar'),
-    ('C1CC1-carbonyl-N(2-HOEt)2', '[*]C1CC1C(=O)N(CCO)CCO', 'polar'),
-    ('C1CC1-carbonyl-3-hydroxypyrrolidinyl', '[*]C1CC1C(=O)N1CCC(O)C1', 'polar'),
-    ('C1CC1-carbonyl-4-hydroxypiperidyl', '[*]C1CC1C(=O)N1CCC(O)CC1', 'polar'),
-    ('C1CC1-carbonyl-3-fluoropyrrolidinyl', '[*]C1CC1C(=O)N1CCC(F)C1', 'polar'),
-    ('C1CC1-carbonyl-3-methylpiperidyl', '[*]C1CC1C(=O)N1CCCC(C)C1', 'polar'),
-    ('C1CC1-carbonyl-4-methylpiperidyl', '[*]C1CC1C(=O)N1CCC(C)CC1', 'polar'),
-    ('C1CCC1-carbonyl-NH2', '[*]C1CCC1C(=O)N', 'polar'),
-    ('C1CCC1-carbonyl-NHMe', '[*]C1CCC1C(=O)NC', 'polar'),
-    ('C1CCC1-carbonyl-NHEt', '[*]C1CCC1C(=O)NCC', 'polar'),
-    ('C1CCC1-carbonyl-NHiPr', '[*]C1CCC1C(=O)NC(C)C', 'polar'),
-    ('C1CCC1-carbonyl-NHtBu', '[*]C1CCC1C(=O)NC(C)(C)C', 'polar'),
-    ('C1CCC1-carbonyl-NHcPr', '[*]C1CCC1C(=O)NC1CC1', 'polar'),
-    ('C1CCC1-carbonyl-NHcBu', '[*]C1CCC1C(=O)NC1CCC1', 'polar'),
-    ('C1CCC1-carbonyl-NHcPent', '[*]C1CCC1C(=O)NC1CCCC1', 'polar'),
-    ('C1CCC1-carbonyl-NHcHex', '[*]C1CCC1C(=O)NC1CCCCC1', 'polar'),
-    ('C1CCC1-carbonyl-NMe2', '[*]C1CCC1C(=O)N(C)C', 'polar'),
-    ('C1CCC1-carbonyl-NEt2', '[*]C1CCC1C(=O)N(CC)CC', 'polar'),
-    ('C1CCC1-carbonyl-NMeEt', '[*]C1CCC1C(=O)N(C)CC', 'polar'),
-    ('C1CCC1-carbonyl-NHBn', '[*]C1CCC1C(=O)NCc1ccccc1', 'polar'),
-    ('C1CCC1-carbonyl-NH(4-FBn)', '[*]C1CCC1C(=O)NCc1ccc(F)cc1', 'polar'),
-    ('C1CCC1-carbonyl-NH(4-ClBn)', '[*]C1CCC1C(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('C1CCC1-carbonyl-NH(4-MeBn)', '[*]C1CCC1C(=O)NCc1ccc(C)cc1', 'polar'),
-    ('C1CCC1-carbonyl-piperidyl', '[*]C1CCC1C(=O)N1CCCCC1', 'polar'),
-    ('C1CCC1-carbonyl-pyrrolidyl', '[*]C1CCC1C(=O)N1CCCC1', 'polar'),
-    ('C1CCC1-carbonyl-morpholyl', '[*]C1CCC1C(=O)N1CCOCC1', 'polar'),
-    ('C1CCC1-carbonyl-azetidinyl', '[*]C1CCC1C(=O)N1CCC1', 'polar'),
-    ('C1CCC1-carbonyl-N-Me-piperazinyl', '[*]C1CCC1C(=O)N1CCN(C)CC1', 'polar'),
-    ('C1CCC1-carbonyl-azepanyl', '[*]C1CCC1C(=O)N1CCCCCC1', 'polar'),
-    ('C1CCC1-carbonyl-NHOMe', '[*]C1CCC1C(=O)NOC', 'polar'),
-    ('C1CCC1-carbonyl-NHOEt', '[*]C1CCC1C(=O)NOCC', 'polar'),
-    ('C1CCC1-carbonyl-NH(2-pyridyl)', '[*]C1CCC1C(=O)Nc1ccccn1', 'polar'),
-    ('C1CCC1-carbonyl-NH(3-pyridyl)', '[*]C1CCC1C(=O)Nc1cccnc1', 'polar'),
-    ('C1CCC1-carbonyl-NH(4-pyridyl)', '[*]C1CCC1C(=O)Nc1ccncc1', 'polar'),
-    ('C1CCC1-carbonyl-NH(pyrimidinyl)', '[*]C1CCC1C(=O)Nc1ncccn1', 'polar'),
-    ('C1CCC1-carbonyl-NH(thiazolyl)', '[*]C1CCC1C(=O)Nc1nccs1', 'polar'),
-    ('C1CCC1-carbonyl-NHPh', '[*]C1CCC1C(=O)Nc1ccccc1', 'polar'),
-    ('C1CCC1-carbonyl-NHMe-OH', '[*]C1CCC1C(=O)N(C)CCO', 'polar'),
-    ('C1CCC1-carbonyl-N(Me)(Bn)', '[*]C1CCC1C(=O)N(C)Cc1ccccc1', 'polar'),
-    ('C1CCC1-carbonyl-NH(2-HOEt)', '[*]C1CCC1C(=O)NCCO', 'polar'),
-    ('C1CCC1-carbonyl-N(2-HOEt)2', '[*]C1CCC1C(=O)N(CCO)CCO', 'polar'),
-    ('C1CCC1-carbonyl-3-hydroxypyrrolidinyl', '[*]C1CCC1C(=O)N1CCC(O)C1', 'polar'),
-    ('C1CCC1-carbonyl-4-hydroxypiperidyl', '[*]C1CCC1C(=O)N1CCC(O)CC1', 'polar'),
-    ('C1CCC1-carbonyl-3-fluoropyrrolidinyl', '[*]C1CCC1C(=O)N1CCC(F)C1', 'polar'),
-    ('C1CCC1-carbonyl-3-methylpiperidyl', '[*]C1CCC1C(=O)N1CCCC(C)C1', 'polar'),
-    ('C1CCC1-carbonyl-4-methylpiperidyl', '[*]C1CCC1C(=O)N1CCC(C)CC1', 'polar'),
-    ('CO-carbonyl-NH2', '[*]COC(=O)N', 'polar'),
-    ('CO-carbonyl-NHMe', '[*]COC(=O)NC', 'polar'),
-    ('CO-carbonyl-NHEt', '[*]COC(=O)NCC', 'polar'),
-    ('CO-carbonyl-NHiPr', '[*]COC(=O)NC(C)C', 'polar'),
-    ('CO-carbonyl-NHtBu', '[*]COC(=O)NC(C)(C)C', 'polar'),
-    ('CO-carbonyl-NHcPr', '[*]COC(=O)NC1CC1', 'polar'),
-    ('CO-carbonyl-NHcBu', '[*]COC(=O)NC1CCC1', 'polar'),
-    ('CO-carbonyl-NHcPent', '[*]COC(=O)NC1CCCC1', 'polar'),
-    ('CO-carbonyl-NHcHex', '[*]COC(=O)NC1CCCCC1', 'polar'),
-    ('CO-carbonyl-NMe2', '[*]COC(=O)N(C)C', 'polar'),
-    ('CO-carbonyl-NEt2', '[*]COC(=O)N(CC)CC', 'polar'),
-    ('CO-carbonyl-NMeEt', '[*]COC(=O)N(C)CC', 'polar'),
-    ('CO-carbonyl-NHBn', '[*]COC(=O)NCc1ccccc1', 'polar'),
-    ('CO-carbonyl-NH(4-FBn)', '[*]COC(=O)NCc1ccc(F)cc1', 'polar'),
-    ('CO-carbonyl-NH(4-ClBn)', '[*]COC(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('CO-carbonyl-NH(4-MeBn)', '[*]COC(=O)NCc1ccc(C)cc1', 'polar'),
-    ('CO-carbonyl-piperidyl', '[*]COC(=O)N1CCCCC1', 'polar'),
-    ('CO-carbonyl-pyrrolidyl', '[*]COC(=O)N1CCCC1', 'polar'),
-    ('CO-carbonyl-morpholyl', '[*]COC(=O)N1CCOCC1', 'polar'),
-    ('CO-carbonyl-azetidinyl', '[*]COC(=O)N1CCC1', 'polar'),
-    ('CO-carbonyl-N-Me-piperazinyl', '[*]COC(=O)N1CCN(C)CC1', 'polar'),
-    ('CO-carbonyl-azepanyl', '[*]COC(=O)N1CCCCCC1', 'polar'),
-    ('CO-carbonyl-NHOMe', '[*]COC(=O)NOC', 'polar'),
-    ('CO-carbonyl-NHOEt', '[*]COC(=O)NOCC', 'polar'),
-    ('CO-carbonyl-NH(2-pyridyl)', '[*]COC(=O)Nc1ccccn1', 'polar'),
-    ('CO-carbonyl-NH(3-pyridyl)', '[*]COC(=O)Nc1cccnc1', 'polar'),
-    ('CO-carbonyl-NH(4-pyridyl)', '[*]COC(=O)Nc1ccncc1', 'polar'),
-    ('CO-carbonyl-NH(pyrimidinyl)', '[*]COC(=O)Nc1ncccn1', 'polar'),
-    ('CO-carbonyl-NH(thiazolyl)', '[*]COC(=O)Nc1nccs1', 'polar'),
-    ('CO-carbonyl-NHPh', '[*]COC(=O)Nc1ccccc1', 'polar'),
-    ('CO-carbonyl-NHMe-OH', '[*]COC(=O)N(C)CCO', 'polar'),
-    ('CO-carbonyl-N(Me)(Bn)', '[*]COC(=O)N(C)Cc1ccccc1', 'polar'),
-    ('CO-carbonyl-NH(2-HOEt)', '[*]COC(=O)NCCO', 'polar'),
-    ('CO-carbonyl-N(2-HOEt)2', '[*]COC(=O)N(CCO)CCO', 'polar'),
-    ('CO-carbonyl-3-hydroxypyrrolidinyl', '[*]COC(=O)N1CCC(O)C1', 'polar'),
-    ('CO-carbonyl-4-hydroxypiperidyl', '[*]COC(=O)N1CCC(O)CC1', 'polar'),
-    ('CO-carbonyl-3-fluoropyrrolidinyl', '[*]COC(=O)N1CCC(F)C1', 'polar'),
-    ('CO-carbonyl-3-methylpiperidyl', '[*]COC(=O)N1CCCC(C)C1', 'polar'),
-    ('CO-carbonyl-4-methylpiperidyl', '[*]COC(=O)N1CCC(C)CC1', 'polar'),
-    ('CCO-carbonyl-NH2', '[*]CCOC(=O)N', 'polar'),
-    ('CCO-carbonyl-NHMe', '[*]CCOC(=O)NC', 'polar'),
-    ('CCO-carbonyl-NHEt', '[*]CCOC(=O)NCC', 'polar'),
-    ('CCO-carbonyl-NHiPr', '[*]CCOC(=O)NC(C)C', 'polar'),
-    ('CCO-carbonyl-NHtBu', '[*]CCOC(=O)NC(C)(C)C', 'polar'),
-    ('CCO-carbonyl-NHcPr', '[*]CCOC(=O)NC1CC1', 'polar'),
-    ('CCO-carbonyl-NHcBu', '[*]CCOC(=O)NC1CCC1', 'polar'),
-    ('CCO-carbonyl-NHcPent', '[*]CCOC(=O)NC1CCCC1', 'polar'),
-    ('CCO-carbonyl-NHcHex', '[*]CCOC(=O)NC1CCCCC1', 'polar'),
-    ('CCO-carbonyl-NMe2', '[*]CCOC(=O)N(C)C', 'polar'),
-    ('CCO-carbonyl-NEt2', '[*]CCOC(=O)N(CC)CC', 'polar'),
-    ('CCO-carbonyl-NMeEt', '[*]CCOC(=O)N(C)CC', 'polar'),
-    ('CCO-carbonyl-NHBn', '[*]CCOC(=O)NCc1ccccc1', 'polar'),
-    ('CCO-carbonyl-NH(4-FBn)', '[*]CCOC(=O)NCc1ccc(F)cc1', 'polar'),
-    ('CCO-carbonyl-NH(4-ClBn)', '[*]CCOC(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('CCO-carbonyl-NH(4-MeBn)', '[*]CCOC(=O)NCc1ccc(C)cc1', 'polar'),
-    ('CCO-carbonyl-piperidyl', '[*]CCOC(=O)N1CCCCC1', 'polar'),
-    ('CCO-carbonyl-pyrrolidyl', '[*]CCOC(=O)N1CCCC1', 'polar'),
-    ('CCO-carbonyl-morpholyl', '[*]CCOC(=O)N1CCOCC1', 'polar'),
-    ('CCO-carbonyl-azetidinyl', '[*]CCOC(=O)N1CCC1', 'polar'),
-    ('CCO-carbonyl-N-Me-piperazinyl', '[*]CCOC(=O)N1CCN(C)CC1', 'polar'),
-    ('CCO-carbonyl-azepanyl', '[*]CCOC(=O)N1CCCCCC1', 'polar'),
-    ('CCO-carbonyl-NHOMe', '[*]CCOC(=O)NOC', 'polar'),
-    ('CCO-carbonyl-NHOEt', '[*]CCOC(=O)NOCC', 'polar'),
-    ('CCO-carbonyl-NH(2-pyridyl)', '[*]CCOC(=O)Nc1ccccn1', 'polar'),
-    ('CCO-carbonyl-NH(3-pyridyl)', '[*]CCOC(=O)Nc1cccnc1', 'polar'),
-    ('CCO-carbonyl-NH(4-pyridyl)', '[*]CCOC(=O)Nc1ccncc1', 'polar'),
-    ('CCO-carbonyl-NH(pyrimidinyl)', '[*]CCOC(=O)Nc1ncccn1', 'polar'),
-    ('CCO-carbonyl-NH(thiazolyl)', '[*]CCOC(=O)Nc1nccs1', 'polar'),
-    ('CCO-carbonyl-NHPh', '[*]CCOC(=O)Nc1ccccc1', 'polar'),
-    ('CCO-carbonyl-NHMe-OH', '[*]CCOC(=O)N(C)CCO', 'polar'),
-    ('CCO-carbonyl-N(Me)(Bn)', '[*]CCOC(=O)N(C)Cc1ccccc1', 'polar'),
-    ('CCO-carbonyl-NH(2-HOEt)', '[*]CCOC(=O)NCCO', 'polar'),
-    ('CCO-carbonyl-N(2-HOEt)2', '[*]CCOC(=O)N(CCO)CCO', 'polar'),
-    ('CCO-carbonyl-3-hydroxypyrrolidinyl', '[*]CCOC(=O)N1CCC(O)C1', 'polar'),
-    ('CCO-carbonyl-4-hydroxypiperidyl', '[*]CCOC(=O)N1CCC(O)CC1', 'polar'),
-    ('CCO-carbonyl-3-fluoropyrrolidinyl', '[*]CCOC(=O)N1CCC(F)C1', 'polar'),
-    ('CCO-carbonyl-3-methylpiperidyl', '[*]CCOC(=O)N1CCCC(C)C1', 'polar'),
-    ('CCO-carbonyl-4-methylpiperidyl', '[*]CCOC(=O)N1CCC(C)CC1', 'polar'),
-    ('C(C)-carbonyl-NH2', '[*]C(C)C(=O)N', 'polar'),
-    ('C(C)-carbonyl-NHMe', '[*]C(C)C(=O)NC', 'polar'),
-    ('C(C)-carbonyl-NHEt', '[*]C(C)C(=O)NCC', 'polar'),
-    ('C(C)-carbonyl-NHiPr', '[*]C(C)C(=O)NC(C)C', 'polar'),
-    ('C(C)-carbonyl-NHtBu', '[*]C(C)C(=O)NC(C)(C)C', 'polar'),
-    ('C(C)-carbonyl-NHcPr', '[*]C(C)C(=O)NC1CC1', 'polar'),
-    ('C(C)-carbonyl-NHcBu', '[*]C(C)C(=O)NC1CCC1', 'polar'),
-    ('C(C)-carbonyl-NHcPent', '[*]C(C)C(=O)NC1CCCC1', 'polar'),
-    ('C(C)-carbonyl-NHcHex', '[*]C(C)C(=O)NC1CCCCC1', 'polar'),
-    ('C(C)-carbonyl-NMe2', '[*]C(C)C(=O)N(C)C', 'polar'),
-    ('C(C)-carbonyl-NEt2', '[*]C(C)C(=O)N(CC)CC', 'polar'),
-    ('C(C)-carbonyl-NMeEt', '[*]C(C)C(=O)N(C)CC', 'polar'),
-    ('C(C)-carbonyl-NHBn', '[*]C(C)C(=O)NCc1ccccc1', 'polar'),
-    ('C(C)-carbonyl-NH(4-FBn)', '[*]C(C)C(=O)NCc1ccc(F)cc1', 'polar'),
-    ('C(C)-carbonyl-NH(4-ClBn)', '[*]C(C)C(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('C(C)-carbonyl-NH(4-MeBn)', '[*]C(C)C(=O)NCc1ccc(C)cc1', 'polar'),
-    ('C(C)-carbonyl-piperidyl', '[*]C(C)C(=O)N1CCCCC1', 'polar'),
-    ('C(C)-carbonyl-pyrrolidyl', '[*]C(C)C(=O)N1CCCC1', 'polar'),
-    ('C(C)-carbonyl-morpholyl', '[*]C(C)C(=O)N1CCOCC1', 'polar'),
-    ('C(C)-carbonyl-azetidinyl', '[*]C(C)C(=O)N1CCC1', 'polar'),
-    ('C(C)-carbonyl-N-Me-piperazinyl', '[*]C(C)C(=O)N1CCN(C)CC1', 'polar'),
-    ('C(C)-carbonyl-azepanyl', '[*]C(C)C(=O)N1CCCCCC1', 'polar'),
-    ('C(C)-carbonyl-NHOMe', '[*]C(C)C(=O)NOC', 'polar'),
-    ('C(C)-carbonyl-NHOEt', '[*]C(C)C(=O)NOCC', 'polar'),
-    ('C(C)-carbonyl-NH(2-pyridyl)', '[*]C(C)C(=O)Nc1ccccn1', 'polar'),
-    ('C(C)-carbonyl-NH(3-pyridyl)', '[*]C(C)C(=O)Nc1cccnc1', 'polar'),
-    ('C(C)-carbonyl-NH(4-pyridyl)', '[*]C(C)C(=O)Nc1ccncc1', 'polar'),
-    ('C(C)-carbonyl-NH(pyrimidinyl)', '[*]C(C)C(=O)Nc1ncccn1', 'polar'),
-    ('C(C)-carbonyl-NH(thiazolyl)', '[*]C(C)C(=O)Nc1nccs1', 'polar'),
-    ('C(C)-carbonyl-NHPh', '[*]C(C)C(=O)Nc1ccccc1', 'polar'),
-    ('C(C)-carbonyl-NHMe-OH', '[*]C(C)C(=O)N(C)CCO', 'polar'),
-    ('C(C)-carbonyl-N(Me)(Bn)', '[*]C(C)C(=O)N(C)Cc1ccccc1', 'polar'),
-    ('C(C)-carbonyl-NH(2-HOEt)', '[*]C(C)C(=O)NCCO', 'polar'),
-    ('C(C)-carbonyl-N(2-HOEt)2', '[*]C(C)C(=O)N(CCO)CCO', 'polar'),
-    ('C(C)-carbonyl-3-hydroxypyrrolidinyl', '[*]C(C)C(=O)N1CCC(O)C1', 'polar'),
-    ('C(C)-carbonyl-4-hydroxypiperidyl', '[*]C(C)C(=O)N1CCC(O)CC1', 'polar'),
-    ('C(C)-carbonyl-3-fluoropyrrolidinyl', '[*]C(C)C(=O)N1CCC(F)C1', 'polar'),
-    ('C(C)-carbonyl-3-methylpiperidyl', '[*]C(C)C(=O)N1CCCC(C)C1', 'polar'),
-    ('C(C)-carbonyl-4-methylpiperidyl', '[*]C(C)C(=O)N1CCC(C)CC1', 'polar'),
-    ('c1ccccc1-carbonyl-NH2', '[*]c1ccccc1C(=O)N', 'polar'),
-    ('c1ccccc1-carbonyl-NHMe', '[*]c1ccccc1C(=O)NC', 'polar'),
-    ('c1ccccc1-carbonyl-NHEt', '[*]c1ccccc1C(=O)NCC', 'polar'),
-    ('c1ccccc1-carbonyl-NHiPr', '[*]c1ccccc1C(=O)NC(C)C', 'polar'),
-    ('c1ccccc1-carbonyl-NHtBu', '[*]c1ccccc1C(=O)NC(C)(C)C', 'polar'),
-    ('c1ccccc1-carbonyl-NHcPr', '[*]c1ccccc1C(=O)NC1CC1', 'polar'),
-    ('c1ccccc1-carbonyl-NHcBu', '[*]c1ccccc1C(=O)NC1CCC1', 'polar'),
-    ('c1ccccc1-carbonyl-NHcPent', '[*]c1ccccc1C(=O)NC1CCCC1', 'polar'),
-    ('c1ccccc1-carbonyl-NHcHex', '[*]c1ccccc1C(=O)NC1CCCCC1', 'polar'),
-    ('c1ccccc1-carbonyl-NMe2', '[*]c1ccccc1C(=O)N(C)C', 'polar'),
-    ('c1ccccc1-carbonyl-NEt2', '[*]c1ccccc1C(=O)N(CC)CC', 'polar'),
-    ('c1ccccc1-carbonyl-NMeEt', '[*]c1ccccc1C(=O)N(C)CC', 'polar'),
-    ('c1ccccc1-carbonyl-NHBn', '[*]c1ccccc1C(=O)NCc1ccccc1', 'polar'),
-    ('c1ccccc1-carbonyl-NH(4-FBn)', '[*]c1ccccc1C(=O)NCc1ccc(F)cc1', 'polar'),
-    ('c1ccccc1-carbonyl-NH(4-ClBn)', '[*]c1ccccc1C(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('c1ccccc1-carbonyl-NH(4-MeBn)', '[*]c1ccccc1C(=O)NCc1ccc(C)cc1', 'polar'),
-    ('c1ccccc1-carbonyl-piperidyl', '[*]c1ccccc1C(=O)N1CCCCC1', 'polar'),
-    ('c1ccccc1-carbonyl-pyrrolidyl', '[*]c1ccccc1C(=O)N1CCCC1', 'polar'),
-    ('c1ccccc1-carbonyl-morpholyl', '[*]c1ccccc1C(=O)N1CCOCC1', 'polar'),
-    ('c1ccccc1-carbonyl-azetidinyl', '[*]c1ccccc1C(=O)N1CCC1', 'polar'),
-    ('c1ccccc1-carbonyl-N-Me-piperazinyl', '[*]c1ccccc1C(=O)N1CCN(C)CC1', 'polar'),
-    ('c1ccccc1-carbonyl-azepanyl', '[*]c1ccccc1C(=O)N1CCCCCC1', 'polar'),
-    ('c1ccccc1-carbonyl-NHOMe', '[*]c1ccccc1C(=O)NOC', 'polar'),
-    ('c1ccccc1-carbonyl-NHOEt', '[*]c1ccccc1C(=O)NOCC', 'polar'),
-    ('c1ccccc1-carbonyl-NH(2-pyridyl)', '[*]c1ccccc1C(=O)Nc1ccccn1', 'polar'),
-    ('c1ccccc1-carbonyl-NH(3-pyridyl)', '[*]c1ccccc1C(=O)Nc1cccnc1', 'polar'),
-    ('c1ccccc1-carbonyl-NH(4-pyridyl)', '[*]c1ccccc1C(=O)Nc1ccncc1', 'polar'),
-    ('c1ccccc1-carbonyl-NH(pyrimidinyl)', '[*]c1ccccc1C(=O)Nc1ncccn1', 'polar'),
-    ('c1ccccc1-carbonyl-NH(thiazolyl)', '[*]c1ccccc1C(=O)Nc1nccs1', 'polar'),
-    ('c1ccccc1-carbonyl-NHPh', '[*]c1ccccc1C(=O)Nc1ccccc1', 'polar'),
-    ('c1ccccc1-carbonyl-NHMe-OH', '[*]c1ccccc1C(=O)N(C)CCO', 'polar'),
-    ('c1ccccc1-carbonyl-N(Me)(Bn)', '[*]c1ccccc1C(=O)N(C)Cc1ccccc1', 'polar'),
-    ('c1ccccc1-carbonyl-NH(2-HOEt)', '[*]c1ccccc1C(=O)NCCO', 'polar'),
-    ('c1ccccc1-carbonyl-N(2-HOEt)2', '[*]c1ccccc1C(=O)N(CCO)CCO', 'polar'),
-    ('c1ccccc1-carbonyl-3-hydroxypyrrolidinyl', '[*]c1ccccc1C(=O)N1CCC(O)C1', 'polar'),
-    ('c1ccccc1-carbonyl-4-hydroxypiperidyl', '[*]c1ccccc1C(=O)N1CCC(O)CC1', 'polar'),
-    ('c1ccccc1-carbonyl-3-fluoropyrrolidinyl', '[*]c1ccccc1C(=O)N1CCC(F)C1', 'polar'),
-    ('c1ccccc1-carbonyl-3-methylpiperidyl', '[*]c1ccccc1C(=O)N1CCCC(C)C1', 'polar'),
-    ('c1ccccc1-carbonyl-4-methylpiperidyl', '[*]c1ccccc1C(=O)N1CCC(C)CC1', 'polar'),
-    ('C=C-carbonyl-NH2', '[*]C=CC(=O)N', 'polar'),
-    ('C=C-carbonyl-NHMe', '[*]C=CC(=O)NC', 'polar'),
-    ('C=C-carbonyl-NHEt', '[*]C=CC(=O)NCC', 'polar'),
-    ('C=C-carbonyl-NHiPr', '[*]C=CC(=O)NC(C)C', 'polar'),
-    ('C=C-carbonyl-NHtBu', '[*]C=CC(=O)NC(C)(C)C', 'polar'),
-    ('C=C-carbonyl-NHcPr', '[*]C=CC(=O)NC1CC1', 'polar'),
-    ('C=C-carbonyl-NHcBu', '[*]C=CC(=O)NC1CCC1', 'polar'),
-    ('C=C-carbonyl-NHcPent', '[*]C=CC(=O)NC1CCCC1', 'polar'),
-    ('C=C-carbonyl-NHcHex', '[*]C=CC(=O)NC1CCCCC1', 'polar'),
-    ('C=C-carbonyl-NMe2', '[*]C=CC(=O)N(C)C', 'polar'),
-    ('C=C-carbonyl-NEt2', '[*]C=CC(=O)N(CC)CC', 'polar'),
-    ('C=C-carbonyl-NMeEt', '[*]C=CC(=O)N(C)CC', 'polar'),
-    ('C=C-carbonyl-NHBn', '[*]C=CC(=O)NCc1ccccc1', 'polar'),
-    ('C=C-carbonyl-NH(4-FBn)', '[*]C=CC(=O)NCc1ccc(F)cc1', 'polar'),
-    ('C=C-carbonyl-NH(4-ClBn)', '[*]C=CC(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('C=C-carbonyl-NH(4-MeBn)', '[*]C=CC(=O)NCc1ccc(C)cc1', 'polar'),
-    ('C=C-carbonyl-piperidyl', '[*]C=CC(=O)N1CCCCC1', 'polar'),
-    ('C=C-carbonyl-pyrrolidyl', '[*]C=CC(=O)N1CCCC1', 'polar'),
-    ('C=C-carbonyl-morpholyl', '[*]C=CC(=O)N1CCOCC1', 'polar'),
-    ('C=C-carbonyl-azetidinyl', '[*]C=CC(=O)N1CCC1', 'polar'),
-    ('C=C-carbonyl-N-Me-piperazinyl', '[*]C=CC(=O)N1CCN(C)CC1', 'polar'),
-    ('C=C-carbonyl-azepanyl', '[*]C=CC(=O)N1CCCCCC1', 'polar'),
-    ('C=C-carbonyl-NHOMe', '[*]C=CC(=O)NOC', 'polar'),
-    ('C=C-carbonyl-NHOEt', '[*]C=CC(=O)NOCC', 'polar'),
-    ('C=C-carbonyl-NH(2-pyridyl)', '[*]C=CC(=O)Nc1ccccn1', 'polar'),
-    ('C=C-carbonyl-NH(3-pyridyl)', '[*]C=CC(=O)Nc1cccnc1', 'polar'),
-    ('C=C-carbonyl-NH(4-pyridyl)', '[*]C=CC(=O)Nc1ccncc1', 'polar'),
-    ('C=C-carbonyl-NH(pyrimidinyl)', '[*]C=CC(=O)Nc1ncccn1', 'polar'),
-    ('C=C-carbonyl-NH(thiazolyl)', '[*]C=CC(=O)Nc1nccs1', 'polar'),
-    ('C=C-carbonyl-NHPh', '[*]C=CC(=O)Nc1ccccc1', 'polar'),
-    ('C=C-carbonyl-NHMe-OH', '[*]C=CC(=O)N(C)CCO', 'polar'),
-    ('C=C-carbonyl-N(Me)(Bn)', '[*]C=CC(=O)N(C)Cc1ccccc1', 'polar'),
-    ('C=C-carbonyl-NH(2-HOEt)', '[*]C=CC(=O)NCCO', 'polar'),
-    ('C=C-carbonyl-N(2-HOEt)2', '[*]C=CC(=O)N(CCO)CCO', 'polar'),
-    ('C=C-carbonyl-3-hydroxypyrrolidinyl', '[*]C=CC(=O)N1CCC(O)C1', 'polar'),
-    ('C=C-carbonyl-4-hydroxypiperidyl', '[*]C=CC(=O)N1CCC(O)CC1', 'polar'),
-    ('C=C-carbonyl-3-fluoropyrrolidinyl', '[*]C=CC(=O)N1CCC(F)C1', 'polar'),
-    ('C=C-carbonyl-3-methylpiperidyl', '[*]C=CC(=O)N1CCCC(C)C1', 'polar'),
-    ('C=C-carbonyl-4-methylpiperidyl', '[*]C=CC(=O)N1CCC(C)CC1', 'polar'),
-    ('C(F)(F)-carbonyl-NH2', '[*]C(F)(F)C(=O)N', 'polar'),
-    ('C(F)(F)-carbonyl-NHMe', '[*]C(F)(F)C(=O)NC', 'polar'),
-    ('C(F)(F)-carbonyl-NHEt', '[*]C(F)(F)C(=O)NCC', 'polar'),
-    ('C(F)(F)-carbonyl-NHiPr', '[*]C(F)(F)C(=O)NC(C)C', 'polar'),
-    ('C(F)(F)-carbonyl-NHtBu', '[*]C(F)(F)C(=O)NC(C)(C)C', 'polar'),
-    ('C(F)(F)-carbonyl-NHcPr', '[*]C(F)(F)C(=O)NC1CC1', 'polar'),
-    ('C(F)(F)-carbonyl-NHcBu', '[*]C(F)(F)C(=O)NC1CCC1', 'polar'),
-    ('C(F)(F)-carbonyl-NHcPent', '[*]C(F)(F)C(=O)NC1CCCC1', 'polar'),
-    ('C(F)(F)-carbonyl-NHcHex', '[*]C(F)(F)C(=O)NC1CCCCC1', 'polar'),
-    ('C(F)(F)-carbonyl-NMe2', '[*]C(F)(F)C(=O)N(C)C', 'polar'),
-    ('C(F)(F)-carbonyl-NEt2', '[*]C(F)(F)C(=O)N(CC)CC', 'polar'),
-    ('C(F)(F)-carbonyl-NMeEt', '[*]C(F)(F)C(=O)N(C)CC', 'polar'),
-    ('C(F)(F)-carbonyl-NHBn', '[*]C(F)(F)C(=O)NCc1ccccc1', 'polar'),
-    ('C(F)(F)-carbonyl-NH(4-FBn)', '[*]C(F)(F)C(=O)NCc1ccc(F)cc1', 'polar'),
-    ('C(F)(F)-carbonyl-NH(4-ClBn)', '[*]C(F)(F)C(=O)NCc1ccc(Cl)cc1', 'polar'),
-    ('C(F)(F)-carbonyl-NH(4-MeBn)', '[*]C(F)(F)C(=O)NCc1ccc(C)cc1', 'polar'),
-    ('C(F)(F)-carbonyl-piperidyl', '[*]C(F)(F)C(=O)N1CCCCC1', 'polar'),
-    ('C(F)(F)-carbonyl-pyrrolidyl', '[*]C(F)(F)C(=O)N1CCCC1', 'polar'),
-    ('C(F)(F)-carbonyl-morpholyl', '[*]C(F)(F)C(=O)N1CCOCC1', 'polar'),
-    ('C(F)(F)-carbonyl-azetidinyl', '[*]C(F)(F)C(=O)N1CCC1', 'polar'),
-    ('C(F)(F)-carbonyl-N-Me-piperazinyl', '[*]C(F)(F)C(=O)N1CCN(C)CC1', 'polar'),
-    ('C(F)(F)-carbonyl-azepanyl', '[*]C(F)(F)C(=O)N1CCCCCC1', 'polar'),
-    ('C(F)(F)-carbonyl-NHOMe', '[*]C(F)(F)C(=O)NOC', 'polar'),
-    ('C(F)(F)-carbonyl-NHOEt', '[*]C(F)(F)C(=O)NOCC', 'polar'),
-    ('C(F)(F)-carbonyl-NH(2-pyridyl)', '[*]C(F)(F)C(=O)Nc1ccccn1', 'polar'),
-    ('C(F)(F)-carbonyl-NH(3-pyridyl)', '[*]C(F)(F)C(=O)Nc1cccnc1', 'polar'),
-    ('C(F)(F)-carbonyl-NH(4-pyridyl)', '[*]C(F)(F)C(=O)Nc1ccncc1', 'polar'),
-    ('C(F)(F)-carbonyl-NH(pyrimidinyl)', '[*]C(F)(F)C(=O)Nc1ncccn1', 'polar'),
-    ('C(F)(F)-carbonyl-NH(thiazolyl)', '[*]C(F)(F)C(=O)Nc1nccs1', 'polar'),
-    ('C(F)(F)-carbonyl-NHPh', '[*]C(F)(F)C(=O)Nc1ccccc1', 'polar'),
-    ('C(F)(F)-carbonyl-NHMe-OH', '[*]C(F)(F)C(=O)N(C)CCO', 'polar'),
-    ('C(F)(F)-carbonyl-N(Me)(Bn)', '[*]C(F)(F)C(=O)N(C)Cc1ccccc1', 'polar'),
-    ('C(F)(F)-carbonyl-NH(2-HOEt)', '[*]C(F)(F)C(=O)NCCO', 'polar'),
-    ('C(F)(F)-carbonyl-N(2-HOEt)2', '[*]C(F)(F)C(=O)N(CCO)CCO', 'polar'),
-    ('C(F)(F)-carbonyl-3-hydroxypyrrolidinyl', '[*]C(F)(F)C(=O)N1CCC(O)C1', 'polar'),
-    ('C(F)(F)-carbonyl-4-hydroxypiperidyl', '[*]C(F)(F)C(=O)N1CCC(O)CC1', 'polar'),
-    ('C(F)(F)-carbonyl-3-fluoropyrrolidinyl', '[*]C(F)(F)C(=O)N1CCC(F)C1', 'polar'),
-    ('C(F)(F)-carbonyl-3-methylpiperidyl', '[*]C(F)(F)C(=O)N1CCCC(C)C1', 'polar'),
-    ('C(F)(F)-carbonyl-4-methylpiperidyl', '[*]C(F)(F)C(=O)N1CCC(C)CC1', 'polar'),
-    ('sulfonyl-Et', '[*]S(=O)(=O)CC', 'polar'),
-    ('sulfonyl-iPr', '[*]S(=O)(=O)C(C)C', 'polar'),
-    ('sulfonyl-cPr', '[*]S(=O)(=O)C1CC1', 'polar'),
-    ('sulfonyl-tBu', '[*]S(=O)(=O)C(C)(C)C', 'polar'),
-    ('sulfonyl-Ph', '[*]S(=O)(=O)c1ccccc1', 'polar'),
-    ('sulfonyl-4-FPh', '[*]S(=O)(=O)c1ccc(F)cc1', 'polar'),
-    ('sulfonyl-Bn', '[*]S(=O)(=O)Cc1ccccc1', 'polar'),
-    ('sulfonyl-CH2CF3', '[*]S(=O)(=O)CC(F)(F)F', 'polar'),
-    ('sulfonyl-NHcPr', '[*]S(=O)(=O)NC1CC1', 'polar'),
-    ('sulfonyl-NHiPr', '[*]S(=O)(=O)NC(C)C', 'polar'),
-    ('C-sulfonyl-Et', '[*]CS(=O)(=O)CC', 'polar'),
-    ('C-sulfonyl-iPr', '[*]CS(=O)(=O)C(C)C', 'polar'),
-    ('C-sulfonyl-cPr', '[*]CS(=O)(=O)C1CC1', 'polar'),
-    ('C-sulfonyl-tBu', '[*]CS(=O)(=O)C(C)(C)C', 'polar'),
-    ('C-sulfonyl-Ph', '[*]CS(=O)(=O)c1ccccc1', 'polar'),
-    ('C-sulfonyl-4-FPh', '[*]CS(=O)(=O)c1ccc(F)cc1', 'polar'),
-    ('C-sulfonyl-Bn', '[*]CS(=O)(=O)Cc1ccccc1', 'polar'),
-    ('C-sulfonyl-CF3', '[*]CS(=O)(=O)C(F)(F)F', 'polar'),
-    ('C-sulfonyl-CH2CF3', '[*]CS(=O)(=O)CC(F)(F)F', 'polar'),
-    ('C-sulfonyl-NHMe', '[*]CS(=O)(=O)NC', 'polar'),
-    ('C-sulfonyl-NMe2', '[*]CS(=O)(=O)N(C)C', 'polar'),
-    ('C-sulfonyl-NHEt', '[*]CS(=O)(=O)NCC', 'polar'),
-    ('C-sulfonyl-NHcPr', '[*]CS(=O)(=O)NC1CC1', 'polar'),
-    ('C-sulfonyl-NHiPr', '[*]CS(=O)(=O)NC(C)C', 'polar'),
-    ('C-sulfonyl-piperidyl', '[*]CS(=O)(=O)N1CCCCC1', 'polar'),
-    ('C-sulfonyl-morpholyl', '[*]CS(=O)(=O)N1CCOCC1', 'polar'),
-    ('C-sulfonyl-pyrrolidyl', '[*]CS(=O)(=O)N1CCCC1', 'polar'),
-    ('C-sulfonyl-azetidinyl', '[*]CS(=O)(=O)N1CCC1', 'polar'),
-    ('CC-sulfonyl-Et', '[*]CCS(=O)(=O)CC', 'polar'),
-    ('CC-sulfonyl-iPr', '[*]CCS(=O)(=O)C(C)C', 'polar'),
-    ('CC-sulfonyl-cPr', '[*]CCS(=O)(=O)C1CC1', 'polar'),
-    ('CC-sulfonyl-tBu', '[*]CCS(=O)(=O)C(C)(C)C', 'polar'),
-    ('CC-sulfonyl-Ph', '[*]CCS(=O)(=O)c1ccccc1', 'polar'),
-    ('CC-sulfonyl-4-FPh', '[*]CCS(=O)(=O)c1ccc(F)cc1', 'polar'),
-    ('CC-sulfonyl-Bn', '[*]CCS(=O)(=O)Cc1ccccc1', 'polar'),
-    ('CC-sulfonyl-CF3', '[*]CCS(=O)(=O)C(F)(F)F', 'polar'),
-    ('CC-sulfonyl-CH2CF3', '[*]CCS(=O)(=O)CC(F)(F)F', 'polar'),
-    ('CC-sulfonyl-NHMe', '[*]CCS(=O)(=O)NC', 'polar'),
-    ('CC-sulfonyl-NMe2', '[*]CCS(=O)(=O)N(C)C', 'polar'),
-    ('CC-sulfonyl-NHEt', '[*]CCS(=O)(=O)NCC', 'polar'),
-    ('CC-sulfonyl-NHcPr', '[*]CCS(=O)(=O)NC1CC1', 'polar'),
-    ('CC-sulfonyl-NHiPr', '[*]CCS(=O)(=O)NC(C)C', 'polar'),
-    ('CC-sulfonyl-piperidyl', '[*]CCS(=O)(=O)N1CCCCC1', 'polar'),
-    ('CC-sulfonyl-morpholyl', '[*]CCS(=O)(=O)N1CCOCC1', 'polar'),
-    ('CC-sulfonyl-pyrrolidyl', '[*]CCS(=O)(=O)N1CCCC1', 'polar'),
-    ('CC-sulfonyl-azetidinyl', '[*]CCS(=O)(=O)N1CCC1', 'polar'),
-    ('c1ccccc1-sulfonyl-Et', '[*]c1ccccc1S(=O)(=O)CC', 'polar'),
-    ('c1ccccc1-sulfonyl-iPr', '[*]c1ccccc1S(=O)(=O)C(C)C', 'polar'),
-    ('c1ccccc1-sulfonyl-cPr', '[*]c1ccccc1S(=O)(=O)C1CC1', 'polar'),
-    ('c1ccccc1-sulfonyl-tBu', '[*]c1ccccc1S(=O)(=O)C(C)(C)C', 'polar'),
-    ('c1ccccc1-sulfonyl-Ph', '[*]c1ccccc1S(=O)(=O)c1ccccc1', 'polar'),
-    ('c1ccccc1-sulfonyl-4-FPh', '[*]c1ccccc1S(=O)(=O)c1ccc(F)cc1', 'polar'),
-    ('c1ccccc1-sulfonyl-Bn', '[*]c1ccccc1S(=O)(=O)Cc1ccccc1', 'polar'),
-    ('c1ccccc1-sulfonyl-CF3', '[*]c1ccccc1S(=O)(=O)C(F)(F)F', 'polar'),
-    ('c1ccccc1-sulfonyl-CH2CF3', '[*]c1ccccc1S(=O)(=O)CC(F)(F)F', 'polar'),
-    ('c1ccccc1-sulfonyl-NHMe', '[*]c1ccccc1S(=O)(=O)NC', 'polar'),
-    ('c1ccccc1-sulfonyl-NMe2', '[*]c1ccccc1S(=O)(=O)N(C)C', 'polar'),
-    ('c1ccccc1-sulfonyl-NHEt', '[*]c1ccccc1S(=O)(=O)NCC', 'polar'),
-    ('c1ccccc1-sulfonyl-NHcPr', '[*]c1ccccc1S(=O)(=O)NC1CC1', 'polar'),
-    ('c1ccccc1-sulfonyl-NHiPr', '[*]c1ccccc1S(=O)(=O)NC(C)C', 'polar'),
-    ('c1ccccc1-sulfonyl-piperidyl', '[*]c1ccccc1S(=O)(=O)N1CCCCC1', 'polar'),
-    ('c1ccccc1-sulfonyl-morpholyl', '[*]c1ccccc1S(=O)(=O)N1CCOCC1', 'polar'),
-    ('c1ccccc1-sulfonyl-pyrrolidyl', '[*]c1ccccc1S(=O)(=O)N1CCCC1', 'polar'),
-    ('c1ccccc1-sulfonyl-azetidinyl', '[*]c1ccccc1S(=O)(=O)N1CCC1', 'polar'),
-    ('C1CC1-sulfonyl-Et', '[*]C1CC1S(=O)(=O)CC', 'polar'),
-    ('C1CC1-sulfonyl-iPr', '[*]C1CC1S(=O)(=O)C(C)C', 'polar'),
-    ('C1CC1-sulfonyl-cPr', '[*]C1CC1S(=O)(=O)C1CC1', 'polar'),
-    ('C1CC1-sulfonyl-tBu', '[*]C1CC1S(=O)(=O)C(C)(C)C', 'polar'),
-    ('C1CC1-sulfonyl-Ph', '[*]C1CC1S(=O)(=O)c1ccccc1', 'polar'),
-    ('C1CC1-sulfonyl-4-FPh', '[*]C1CC1S(=O)(=O)c1ccc(F)cc1', 'polar'),
-    ('C1CC1-sulfonyl-Bn', '[*]C1CC1S(=O)(=O)Cc1ccccc1', 'polar'),
-    ('C1CC1-sulfonyl-CF3', '[*]C1CC1S(=O)(=O)C(F)(F)F', 'polar'),
-    ('C1CC1-sulfonyl-CH2CF3', '[*]C1CC1S(=O)(=O)CC(F)(F)F', 'polar'),
-    ('C1CC1-sulfonyl-NHMe', '[*]C1CC1S(=O)(=O)NC', 'polar'),
-    ('C1CC1-sulfonyl-NMe2', '[*]C1CC1S(=O)(=O)N(C)C', 'polar'),
-    ('C1CC1-sulfonyl-NHEt', '[*]C1CC1S(=O)(=O)NCC', 'polar'),
-    ('C1CC1-sulfonyl-NHcPr', '[*]C1CC1S(=O)(=O)NC1CC1', 'polar'),
-    ('C1CC1-sulfonyl-NHiPr', '[*]C1CC1S(=O)(=O)NC(C)C', 'polar'),
-    ('C1CC1-sulfonyl-piperidyl', '[*]C1CC1S(=O)(=O)N1CCCCC1', 'polar'),
-    ('C1CC1-sulfonyl-morpholyl', '[*]C1CC1S(=O)(=O)N1CCOCC1', 'polar'),
-    ('C1CC1-sulfonyl-pyrrolidyl', '[*]C1CC1S(=O)(=O)N1CCCC1', 'polar'),
-    ('C1CC1-sulfonyl-azetidinyl', '[*]C1CC1S(=O)(=O)N1CCC1', 'polar'),
-    ('phenyl-phenyl', '[*]c1ccccc1c1ccccc1', 'aromatic'),
-    ('phenyl-4-F-phenyl', '[*]c1ccccc1c1ccc(F)cc1', 'aromatic'),
-    ('phenyl-4-Cl-phenyl', '[*]c1ccccc1c1ccc(Cl)cc1', 'aromatic'),
-    ('phenyl-4-Me-phenyl', '[*]c1ccccc1c1ccc(C)cc1', 'aromatic'),
-    ('phenyl-4-OMe-phenyl', '[*]c1ccccc1c1ccc(OC)cc1', 'aromatic'),
-    ('phenyl-4-CF3-phenyl', '[*]c1ccccc1c1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('phenyl-pyridin-2-yl', '[*]c1ccccc1c1ccccn1', 'aromatic'),
-    ('phenyl-pyridin-3-yl', '[*]c1ccccc1c1cccnc1', 'aromatic'),
-    ('phenyl-pyridin-4-yl', '[*]c1ccccc1c1ccncc1', 'aromatic'),
-    ('phenyl-pyrimidin-2-yl', '[*]c1ccccc1c1ncccn1', 'aromatic'),
-    ('phenyl-thiophen-2-yl', '[*]c1ccccc1c1cccs1', 'aromatic'),
-    ('phenyl-furan-2-yl', '[*]c1ccccc1c1ccco1', 'aromatic'),
-    ('phenyl-thiazol-2-yl', '[*]c1ccccc1c1nccs1', 'aromatic'),
-    ('phenyl-1-Me-pyrazol-4-yl', '[*]c1ccccc1c1cn(C)nc1', 'aromatic'),
-    ('pyridin-3-yl-phenyl', '[*]c1cccnc1c1ccccc1', 'aromatic'),
-    ('pyridin-3-yl-4-F-phenyl', '[*]c1cccnc1c1ccc(F)cc1', 'aromatic'),
-    ('pyridin-3-yl-4-Cl-phenyl', '[*]c1cccnc1c1ccc(Cl)cc1', 'aromatic'),
-    ('pyridin-3-yl-4-Me-phenyl', '[*]c1cccnc1c1ccc(C)cc1', 'aromatic'),
-    ('pyridin-3-yl-4-OMe-phenyl', '[*]c1cccnc1c1ccc(OC)cc1', 'aromatic'),
-    ('pyridin-3-yl-4-CF3-phenyl', '[*]c1cccnc1c1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('pyridin-3-yl-pyridin-2-yl', '[*]c1cccnc1c1ccccn1', 'aromatic'),
-    ('pyridin-3-yl-pyridin-3-yl', '[*]c1cccnc1c1cccnc1', 'aromatic'),
-    ('pyridin-3-yl-pyridin-4-yl', '[*]c1cccnc1c1ccncc1', 'aromatic'),
-    ('pyridin-3-yl-pyrimidin-2-yl', '[*]c1cccnc1c1ncccn1', 'aromatic'),
-    ('pyridin-3-yl-thiophen-2-yl', '[*]c1cccnc1c1cccs1', 'aromatic'),
-    ('pyridin-3-yl-furan-2-yl', '[*]c1cccnc1c1ccco1', 'aromatic'),
-    ('pyridin-3-yl-thiazol-2-yl', '[*]c1cccnc1c1nccs1', 'aromatic'),
-    ('pyridin-3-yl-1-Me-pyrazol-4-yl', '[*]c1cccnc1c1cn(C)nc1', 'aromatic'),
-    ('pyridin-4-yl-phenyl', '[*]c1ccncc1c1ccccc1', 'aromatic'),
-    ('pyridin-4-yl-4-F-phenyl', '[*]c1ccncc1c1ccc(F)cc1', 'aromatic'),
-    ('pyridin-4-yl-4-Cl-phenyl', '[*]c1ccncc1c1ccc(Cl)cc1', 'aromatic'),
-    ('pyridin-4-yl-4-Me-phenyl', '[*]c1ccncc1c1ccc(C)cc1', 'aromatic'),
-    ('pyridin-4-yl-4-OMe-phenyl', '[*]c1ccncc1c1ccc(OC)cc1', 'aromatic'),
-    ('pyridin-4-yl-4-CF3-phenyl', '[*]c1ccncc1c1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('pyridin-4-yl-pyridin-2-yl', '[*]c1ccncc1c1ccccn1', 'aromatic'),
-    ('pyridin-4-yl-pyridin-3-yl', '[*]c1ccncc1c1cccnc1', 'aromatic'),
-    ('pyridin-4-yl-pyridin-4-yl', '[*]c1ccncc1c1ccncc1', 'aromatic'),
-    ('pyridin-4-yl-pyrimidin-2-yl', '[*]c1ccncc1c1ncccn1', 'aromatic'),
-    ('pyridin-4-yl-thiophen-2-yl', '[*]c1ccncc1c1cccs1', 'aromatic'),
-    ('pyridin-4-yl-furan-2-yl', '[*]c1ccncc1c1ccco1', 'aromatic'),
-    ('pyridin-4-yl-thiazol-2-yl', '[*]c1ccncc1c1nccs1', 'aromatic'),
-    ('pyridin-4-yl-1-Me-pyrazol-4-yl', '[*]c1ccncc1c1cn(C)nc1', 'aromatic'),
-    ('pyrimidin-5-yl-phenyl', '[*]c1cncnc1c1ccccc1', 'aromatic'),
-    ('pyrimidin-5-yl-4-F-phenyl', '[*]c1cncnc1c1ccc(F)cc1', 'aromatic'),
-    ('pyrimidin-5-yl-4-Cl-phenyl', '[*]c1cncnc1c1ccc(Cl)cc1', 'aromatic'),
-    ('pyrimidin-5-yl-4-Me-phenyl', '[*]c1cncnc1c1ccc(C)cc1', 'aromatic'),
-    ('pyrimidin-5-yl-4-OMe-phenyl', '[*]c1cncnc1c1ccc(OC)cc1', 'aromatic'),
-    ('pyrimidin-5-yl-4-CF3-phenyl', '[*]c1cncnc1c1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('pyrimidin-5-yl-pyridin-2-yl', '[*]c1cncnc1c1ccccn1', 'aromatic'),
-    ('pyrimidin-5-yl-pyridin-3-yl', '[*]c1cncnc1c1cccnc1', 'aromatic'),
-    ('pyrimidin-5-yl-pyridin-4-yl', '[*]c1cncnc1c1ccncc1', 'aromatic'),
-    ('pyrimidin-5-yl-pyrimidin-2-yl', '[*]c1cncnc1c1ncccn1', 'aromatic'),
-    ('pyrimidin-5-yl-thiophen-2-yl', '[*]c1cncnc1c1cccs1', 'aromatic'),
-    ('pyrimidin-5-yl-furan-2-yl', '[*]c1cncnc1c1ccco1', 'aromatic'),
-    ('pyrimidin-5-yl-thiazol-2-yl', '[*]c1cncnc1c1nccs1', 'aromatic'),
-    ('pyrimidin-5-yl-1-Me-pyrazol-4-yl', '[*]c1cncnc1c1cn(C)nc1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-phenyl', '[*]c1cn(C)nc1c1ccccc1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-4-F-phenyl', '[*]c1cn(C)nc1c1ccc(F)cc1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-4-Cl-phenyl', '[*]c1cn(C)nc1c1ccc(Cl)cc1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-4-Me-phenyl', '[*]c1cn(C)nc1c1ccc(C)cc1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-4-OMe-phenyl', '[*]c1cn(C)nc1c1ccc(OC)cc1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-4-CF3-phenyl', '[*]c1cn(C)nc1c1ccc(C(F)(F)F)cc1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-pyridin-2-yl', '[*]c1cn(C)nc1c1ccccn1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-pyridin-3-yl', '[*]c1cn(C)nc1c1cccnc1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-pyridin-4-yl', '[*]c1cn(C)nc1c1ccncc1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-pyrimidin-2-yl', '[*]c1cn(C)nc1c1ncccn1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-thiophen-2-yl', '[*]c1cn(C)nc1c1cccs1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-furan-2-yl', '[*]c1cn(C)nc1c1ccco1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-thiazol-2-yl', '[*]c1cn(C)nc1c1nccs1', 'aromatic'),
-    ('1-Me-pyrazol-4-yl-1-Me-pyrazol-4-yl', '[*]c1cn(C)nc1c1cn(C)nc1', 'aromatic'),
-    ('oxy-CC-cyclopropyl', '[*]OCCC1CC1', 'polar'),
-    ('oxy-CCC-cyclopropyl', '[*]OCCCC1CC1', 'polar'),
-    ('oxy-C(C)-F', '[*]OC(C)F', 'polar'),
-    ('oxy-C(C)-Cl', '[*]OC(C)Cl', 'polar'),
-    ('oxy-C(C)-Br', '[*]OC(C)Br', 'polar'),
-    ('oxy-C(C)-OH', '[*]OC(C)O', 'polar'),
-    ('oxy-C(C)-OMe', '[*]OC(C)OC', 'polar'),
-    ('oxy-C(C)-NH2', '[*]OC(C)N', 'polar'),
-    ('oxy-C(C)-CN', '[*]OC(C)C#N', 'polar'),
-    ('oxy-C(C)-CF3', '[*]OC(C)C(F)(F)F', 'polar'),
-    ('oxy-C(C)-cyclopropyl', '[*]OC(C)C1CC1', 'polar'),
-    ('oxy-C(C)-morpholino', '[*]OC(C)N1CCOCC1', 'polar'),
-    ('oxy-C(C)-piperidino', '[*]OC(C)N1CCCCC1', 'polar'),
-    ('oxy-C(C)-F2', '[*]OC(C)(F)F', 'polar'),
-    ('oxy-C(C)C-F', '[*]OC(C)CF', 'polar'),
-    ('oxy-C(C)C-Cl', '[*]OC(C)CCl', 'polar'),
-    ('oxy-C(C)C-Br', '[*]OC(C)CBr', 'polar'),
-    ('oxy-C(C)C-OH', '[*]OC(C)CO', 'polar'),
-    ('oxy-C(C)C-OMe', '[*]OC(C)COC', 'polar'),
-    ('oxy-C(C)C-NH2', '[*]OC(C)CN', 'polar'),
-    ('oxy-C(C)C-CN', '[*]OC(C)CC#N', 'polar'),
-    ('oxy-C(C)C-CF3', '[*]OC(C)CC(F)(F)F', 'polar'),
-    ('oxy-C(C)C-Me', '[*]OC(C)CC', 'polar'),
-    ('oxy-C(C)C-cyclopropyl', '[*]OC(C)CC1CC1', 'polar'),
-    ('oxy-C(C)C-morpholino', '[*]OC(C)CN1CCOCC1', 'polar'),
-    ('oxy-C(C)C-piperidino', '[*]OC(C)CN1CCCCC1', 'polar'),
-    ('oxy-C(C)C-F2', '[*]OC(C)C(F)F', 'polar'),
-    ('oxy-C1CC1-H', '[*]OC1CC1', 'polar'),
-    ('oxy-C1CC1-F', '[*]OC1CC1F', 'polar'),
-    ('oxy-C1CC1-Cl', '[*]OC1CC1Cl', 'polar'),
-    ('oxy-C1CC1-Br', '[*]OC1CC1Br', 'polar'),
-    ('oxy-C1CC1-OH', '[*]OC1CC1O', 'polar'),
-    ('oxy-C1CC1-OMe', '[*]OC1CC1OC', 'polar'),
-    ('oxy-C1CC1-NH2', '[*]OC1CC1N', 'polar'),
-    ('oxy-C1CC1-CN', '[*]OC1CC1C#N', 'polar'),
-    ('oxy-C1CC1-CF3', '[*]OC1CC1C(F)(F)F', 'polar'),
-    ('oxy-C1CC1-Me', '[*]OC1CC1C', 'polar'),
-    ('oxy-C1CC1-cyclopropyl', '[*]OC1CC1C1CC1', 'polar'),
-    ('oxy-C1CC1-morpholino', '[*]OC1CC1N1CCOCC1', 'polar'),
-    ('oxy-C1CC1-piperidino', '[*]OC1CC1N1CCCCC1', 'polar'),
-    ('oxy-C1CC1-F2', '[*]OC1CC1(F)F', 'polar'),
-    ('oxy-C1CCC1-H', '[*]OC1CCC1', 'polar'),
-    ('oxy-C1CCC1-F', '[*]OC1CCC1F', 'polar'),
-    ('oxy-C1CCC1-Cl', '[*]OC1CCC1Cl', 'polar'),
-    ('oxy-C1CCC1-Br', '[*]OC1CCC1Br', 'polar'),
-    ('oxy-C1CCC1-OH', '[*]OC1CCC1O', 'polar'),
-    ('oxy-C1CCC1-OMe', '[*]OC1CCC1OC', 'polar'),
-    ('oxy-C1CCC1-NH2', '[*]OC1CCC1N', 'polar'),
-    ('oxy-C1CCC1-CN', '[*]OC1CCC1C#N', 'polar'),
-    ('oxy-C1CCC1-CF3', '[*]OC1CCC1C(F)(F)F', 'polar'),
-    ('oxy-C1CCC1-Me', '[*]OC1CCC1C', 'polar'),
-    ('oxy-C1CCC1-cyclopropyl', '[*]OC1CCC1C1CC1', 'polar'),
-    ('oxy-C1CCC1-morpholino', '[*]OC1CCC1N1CCOCC1', 'polar'),
-    ('oxy-C1CCC1-piperidino', '[*]OC1CCC1N1CCCCC1', 'polar'),
-    ('oxy-C1CCC1-F2', '[*]OC1CCC1(F)F', 'polar'),
-    ('oxy-C(F)(F)-Cl', '[*]OC(F)(F)Cl', 'polar'),
-    ('oxy-C(F)(F)-Br', '[*]OC(F)(F)Br', 'polar'),
-    ('oxy-C(F)(F)-OH', '[*]OC(F)(F)O', 'polar'),
-    ('oxy-C(F)(F)-OMe', '[*]OC(F)(F)OC', 'polar'),
-    ('oxy-C(F)(F)-NH2', '[*]OC(F)(F)N', 'polar'),
-    ('oxy-C(F)(F)-CN', '[*]OC(F)(F)C#N', 'polar'),
-    ('oxy-C(F)(F)-CF3', '[*]OC(F)(F)C(F)(F)F', 'polar'),
-    ('oxy-C(F)(F)-cyclopropyl', '[*]OC(F)(F)C1CC1', 'polar'),
-    ('oxy-C(F)(F)-morpholino', '[*]OC(F)(F)N1CCOCC1', 'polar'),
-    ('oxy-C(F)(F)-piperidino', '[*]OC(F)(F)N1CCCCC1', 'polar'),
-    ('oxy-C=C-H', '[*]OC=C', 'polar'),
-    ('oxy-C=C-F', '[*]OC=CF', 'polar'),
-    ('oxy-C=C-Cl', '[*]OC=CCl', 'polar'),
-    ('oxy-C=C-Br', '[*]OC=CBr', 'polar'),
-    ('oxy-C=C-OH', '[*]OC=CO', 'polar'),
-    ('oxy-C=C-OMe', '[*]OC=COC', 'polar'),
-    ('oxy-C=C-NH2', '[*]OC=CN', 'polar'),
-    ('oxy-C=C-CN', '[*]OC=CC#N', 'polar'),
-    ('oxy-C=C-CF3', '[*]OC=CC(F)(F)F', 'polar'),
-    ('oxy-C=C-Me', '[*]OC=CC', 'polar'),
-    ('oxy-C=C-cyclopropyl', '[*]OC=CC1CC1', 'polar'),
-    ('oxy-C=C-morpholino', '[*]OC=CN1CCOCC1', 'polar'),
-    ('oxy-C=C-piperidino', '[*]OC=CN1CCCCC1', 'polar'),
-    ('oxy-C=C-F2', '[*]OC=C(F)F', 'polar'),
-    ('oxy-C#C-H', '[*]OC#C', 'polar'),
-    ('oxy-C#C-F', '[*]OC#CF', 'polar'),
-    ('oxy-C#C-Cl', '[*]OC#CCl', 'polar'),
-    ('oxy-C#C-Br', '[*]OC#CBr', 'polar'),
-    ('oxy-C#C-OH', '[*]OC#CO', 'polar'),
-    ('oxy-C#C-OMe', '[*]OC#COC', 'polar'),
-    ('oxy-C#C-NH2', '[*]OC#CN', 'polar'),
-    ('oxy-C#C-CN', '[*]OC#CC#N', 'polar'),
-    ('oxy-C#C-CF3', '[*]OC#CC(F)(F)F', 'polar'),
-    ('oxy-C#C-Me', '[*]OC#CC', 'polar'),
-    ('oxy-C#C-cyclopropyl', '[*]OC#CC1CC1', 'polar'),
-    ('oxy-C#C-morpholino', '[*]OC#CN1CCOCC1', 'polar'),
-    ('oxy-C#C-piperidino', '[*]OC#CN1CCCCC1', 'polar'),
-    ('amino-C-cyclopropyl', '[*]NCC1CC1', 'polar'),
-    ('amino-C-F2', '[*]NC(F)F', 'polar'),
-    ('amino-CC-cyclopropyl', '[*]NCCC1CC1', 'polar'),
-    ('amino-CC-F2', '[*]NCC(F)F', 'polar'),
-    ('amino-CCC-F', '[*]NCCCF', 'polar'),
-    ('amino-CCC-Cl', '[*]NCCCCl', 'polar'),
-    ('amino-CCC-Br', '[*]NCCCBr', 'polar'),
-    ('amino-CCC-OH', '[*]NCCCO', 'polar'),
-    ('amino-CCC-OMe', '[*]NCCCOC', 'polar'),
-    ('amino-CCC-NH2', '[*]NCCCN', 'polar'),
-    ('amino-CCC-CN', '[*]NCCCC#N', 'polar'),
-    ('amino-CCC-CF3', '[*]NCCCC(F)(F)F', 'polar'),
-    ('amino-CCC-cyclopropyl', '[*]NCCCC1CC1', 'polar'),
-    ('amino-CCC-morpholino', '[*]NCCCN1CCOCC1', 'polar'),
-    ('amino-CCC-piperidino', '[*]NCCCN1CCCCC1', 'polar'),
-    ('amino-CCC-F2', '[*]NCCC(F)F', 'polar'),
-    ('amino-C(C)-F', '[*]NC(C)F', 'polar'),
-    ('amino-C(C)-Cl', '[*]NC(C)Cl', 'polar'),
-    ('amino-C(C)-Br', '[*]NC(C)Br', 'polar'),
-    ('amino-C(C)-OH', '[*]NC(C)O', 'polar'),
-    ('amino-C(C)-OMe', '[*]NC(C)OC', 'polar'),
-    ('amino-C(C)-NH2', '[*]NC(C)N', 'polar'),
-    ('amino-C(C)-CN', '[*]NC(C)C#N', 'polar'),
-    ('amino-C(C)-CF3', '[*]NC(C)C(F)(F)F', 'polar'),
-    ('amino-C(C)-cyclopropyl', '[*]NC(C)C1CC1', 'polar'),
-    ('amino-C(C)-morpholino', '[*]NC(C)N1CCOCC1', 'polar'),
-    ('amino-C(C)-piperidino', '[*]NC(C)N1CCCCC1', 'polar'),
-    ('amino-C(C)-F2', '[*]NC(C)(F)F', 'polar'),
-    ('amino-C(C)C-F', '[*]NC(C)CF', 'polar'),
-    ('amino-C(C)C-Cl', '[*]NC(C)CCl', 'polar'),
-    ('amino-C(C)C-Br', '[*]NC(C)CBr', 'polar'),
-    ('amino-C(C)C-OH', '[*]NC(C)CO', 'polar'),
-    ('amino-C(C)C-OMe', '[*]NC(C)COC', 'polar'),
-    ('amino-C(C)C-NH2', '[*]NC(C)CN', 'polar'),
-    ('amino-C(C)C-CN', '[*]NC(C)CC#N', 'polar'),
-    ('amino-C(C)C-CF3', '[*]NC(C)CC(F)(F)F', 'polar'),
-    ('amino-C(C)C-Me', '[*]NC(C)CC', 'polar'),
-    ('amino-C(C)C-cyclopropyl', '[*]NC(C)CC1CC1', 'polar'),
-    ('amino-C(C)C-morpholino', '[*]NC(C)CN1CCOCC1', 'polar'),
-    ('amino-C(C)C-piperidino', '[*]NC(C)CN1CCCCC1', 'polar'),
-    ('amino-C(C)C-F2', '[*]NC(C)C(F)F', 'polar'),
-    ('amino-C1CC1-F', '[*]NC1CC1F', 'polar'),
-    ('amino-C1CC1-Cl', '[*]NC1CC1Cl', 'polar'),
-    ('amino-C1CC1-Br', '[*]NC1CC1Br', 'polar'),
-    ('amino-C1CC1-OH', '[*]NC1CC1O', 'polar'),
-    ('amino-C1CC1-OMe', '[*]NC1CC1OC', 'polar'),
-    ('amino-C1CC1-NH2', '[*]NC1CC1N', 'polar'),
-    ('amino-C1CC1-CN', '[*]NC1CC1C#N', 'polar'),
-    ('amino-C1CC1-CF3', '[*]NC1CC1C(F)(F)F', 'polar'),
-    ('amino-C1CC1-Me', '[*]NC1CC1C', 'polar'),
-    ('amino-C1CC1-cyclopropyl', '[*]NC1CC1C1CC1', 'polar'),
-    ('amino-C1CC1-morpholino', '[*]NC1CC1N1CCOCC1', 'polar'),
-    ('amino-C1CC1-piperidino', '[*]NC1CC1N1CCCCC1', 'polar'),
-    ('amino-C1CC1-F2', '[*]NC1CC1(F)F', 'polar'),
-    ('amino-C1CCC1-F', '[*]NC1CCC1F', 'polar'),
-    ('amino-C1CCC1-Cl', '[*]NC1CCC1Cl', 'polar'),
-    ('amino-C1CCC1-Br', '[*]NC1CCC1Br', 'polar'),
-    ('amino-C1CCC1-OH', '[*]NC1CCC1O', 'polar'),
-    ('amino-C1CCC1-OMe', '[*]NC1CCC1OC', 'polar'),
-    ('amino-C1CCC1-NH2', '[*]NC1CCC1N', 'polar'),
-    ('amino-C1CCC1-CN', '[*]NC1CCC1C#N', 'polar'),
-    ('amino-C1CCC1-CF3', '[*]NC1CCC1C(F)(F)F', 'polar'),
-    ('amino-C1CCC1-Me', '[*]NC1CCC1C', 'polar'),
-    ('amino-C1CCC1-cyclopropyl', '[*]NC1CCC1C1CC1', 'polar'),
-    ('amino-C1CCC1-morpholino', '[*]NC1CCC1N1CCOCC1', 'polar'),
-    ('amino-C1CCC1-piperidino', '[*]NC1CCC1N1CCCCC1', 'polar'),
-    ('amino-C1CCC1-F2', '[*]NC1CCC1(F)F', 'polar'),
-    ('amino-C(F)(F)-F', '[*]NC(F)(F)F', 'polar'),
-    ('amino-C(F)(F)-Cl', '[*]NC(F)(F)Cl', 'polar'),
-    ('amino-C(F)(F)-Br', '[*]NC(F)(F)Br', 'polar'),
-    ('amino-C(F)(F)-OH', '[*]NC(F)(F)O', 'polar'),
-    ('amino-C(F)(F)-OMe', '[*]NC(F)(F)OC', 'polar'),
-    ('amino-C(F)(F)-NH2', '[*]NC(F)(F)N', 'polar'),
-    ('amino-C(F)(F)-CN', '[*]NC(F)(F)C#N', 'polar'),
-    ('amino-C(F)(F)-CF3', '[*]NC(F)(F)C(F)(F)F', 'polar'),
-    ('amino-C(F)(F)-cyclopropyl', '[*]NC(F)(F)C1CC1', 'polar'),
-    ('amino-C(F)(F)-morpholino', '[*]NC(F)(F)N1CCOCC1', 'polar'),
-    ('amino-C(F)(F)-piperidino', '[*]NC(F)(F)N1CCCCC1', 'polar'),
-    ('amino-C=C-H', '[*]NC=C', 'polar'),
-    ('amino-C=C-F', '[*]NC=CF', 'polar'),
-    ('amino-C=C-Cl', '[*]NC=CCl', 'polar'),
-    ('amino-C=C-Br', '[*]NC=CBr', 'polar'),
-    ('amino-C=C-OH', '[*]NC=CO', 'polar'),
-    ('amino-C=C-OMe', '[*]NC=COC', 'polar'),
-    ('amino-C=C-NH2', '[*]NC=CN', 'polar'),
-    ('amino-C=C-CN', '[*]NC=CC#N', 'polar'),
-    ('amino-C=C-CF3', '[*]NC=CC(F)(F)F', 'polar'),
-    ('amino-C=C-Me', '[*]NC=CC', 'polar'),
-    ('amino-C=C-cyclopropyl', '[*]NC=CC1CC1', 'polar'),
-    ('amino-C=C-morpholino', '[*]NC=CN1CCOCC1', 'polar'),
-    ('amino-C=C-piperidino', '[*]NC=CN1CCCCC1', 'polar'),
-    ('amino-C=C-F2', '[*]NC=C(F)F', 'polar'),
-    ('amino-C#C-H', '[*]NC#C', 'polar'),
-    ('amino-C#C-F', '[*]NC#CF', 'polar'),
-    ('amino-C#C-Cl', '[*]NC#CCl', 'polar'),
-    ('amino-C#C-Br', '[*]NC#CBr', 'polar'),
-    ('amino-C#C-OH', '[*]NC#CO', 'polar'),
-    ('amino-C#C-OMe', '[*]NC#COC', 'polar'),
-    ('amino-C#C-NH2', '[*]NC#CN', 'polar'),
-    ('amino-C#C-CN', '[*]NC#CC#N', 'polar'),
-    ('amino-C#C-CF3', '[*]NC#CC(F)(F)F', 'polar'),
-    ('amino-C#C-Me', '[*]NC#CC', 'polar'),
-    ('amino-C#C-cyclopropyl', '[*]NC#CC1CC1', 'polar'),
-    ('amino-C#C-morpholino', '[*]NC#CN1CCOCC1', 'polar'),
-    ('amino-C#C-piperidino', '[*]NC#CN1CCCCC1', 'polar'),
-    ('thio-C-F', '[*]SCF', 'polar'),
-    ('thio-C-Cl', '[*]SCCl', 'polar'),
-    ('thio-C-Br', '[*]SCBr', 'polar'),
-    ('thio-C-OH', '[*]SCO', 'polar'),
-    ('thio-C-OMe', '[*]SCOC', 'polar'),
-    ('thio-C-NH2', '[*]SCN', 'polar'),
-    ('thio-C-CN', '[*]SCC#N', 'polar'),
-    ('thio-C-CF3', '[*]SCC(F)(F)F', 'polar'),
-    ('thio-C-cyclopropyl', '[*]SCC1CC1', 'polar'),
-    ('thio-C-morpholino', '[*]SCN1CCOCC1', 'polar'),
-    ('thio-C-piperidino', '[*]SCN1CCCCC1', 'polar'),
-    ('thio-C-F2', '[*]SC(F)F', 'polar'),
-    ('thio-CC-F', '[*]SCCF', 'polar'),
-    ('thio-CC-Cl', '[*]SCCCl', 'polar'),
-    ('thio-CC-Br', '[*]SCCBr', 'polar'),
-    ('thio-CC-OH', '[*]SCCO', 'polar'),
-    ('thio-CC-OMe', '[*]SCCOC', 'polar'),
-    ('thio-CC-NH2', '[*]SCCN', 'polar'),
-    ('thio-CC-CN', '[*]SCCC#N', 'polar'),
-    ('thio-CC-CF3', '[*]SCCC(F)(F)F', 'polar'),
-    ('thio-CC-Me', '[*]SCCC', 'polar'),
-    ('thio-CC-cyclopropyl', '[*]SCCC1CC1', 'polar'),
-    ('thio-CC-morpholino', '[*]SCCN1CCOCC1', 'polar'),
-    ('thio-CC-piperidino', '[*]SCCN1CCCCC1', 'polar'),
-    ('thio-CC-F2', '[*]SCC(F)F', 'polar'),
-    ('thio-CCC-F', '[*]SCCCF', 'polar'),
-    ('thio-CCC-Cl', '[*]SCCCCl', 'polar'),
-    ('thio-CCC-Br', '[*]SCCCBr', 'polar'),
-    ('thio-CCC-OH', '[*]SCCCO', 'polar'),
-    ('thio-CCC-OMe', '[*]SCCCOC', 'polar'),
-    ('thio-CCC-NH2', '[*]SCCCN', 'polar'),
-    ('thio-CCC-CN', '[*]SCCCC#N', 'polar'),
-    ('thio-CCC-CF3', '[*]SCCCC(F)(F)F', 'polar'),
-    ('thio-CCC-Me', '[*]SCCCC', 'polar'),
-    ('thio-CCC-cyclopropyl', '[*]SCCCC1CC1', 'polar'),
-    ('thio-CCC-morpholino', '[*]SCCCN1CCOCC1', 'polar'),
-    ('thio-CCC-piperidino', '[*]SCCCN1CCCCC1', 'polar'),
-    ('thio-CCC-F2', '[*]SCCC(F)F', 'polar'),
-    ('thio-C(C)-F', '[*]SC(C)F', 'polar'),
-    ('thio-C(C)-Cl', '[*]SC(C)Cl', 'polar'),
-    ('thio-C(C)-Br', '[*]SC(C)Br', 'polar'),
-    ('thio-C(C)-OH', '[*]SC(C)O', 'polar'),
-    ('thio-C(C)-OMe', '[*]SC(C)OC', 'polar'),
-    ('thio-C(C)-NH2', '[*]SC(C)N', 'polar'),
-    ('thio-C(C)-CN', '[*]SC(C)C#N', 'polar'),
-    ('thio-C(C)-CF3', '[*]SC(C)C(F)(F)F', 'polar'),
-    ('thio-C(C)-Me', '[*]SC(C)C', 'polar'),
-    ('thio-C(C)-cyclopropyl', '[*]SC(C)C1CC1', 'polar'),
-    ('thio-C(C)-morpholino', '[*]SC(C)N1CCOCC1', 'polar'),
-    ('thio-C(C)-piperidino', '[*]SC(C)N1CCCCC1', 'polar'),
-    ('thio-C(C)-F2', '[*]SC(C)(F)F', 'polar'),
-    ('thio-C(C)C-F', '[*]SC(C)CF', 'polar'),
-    ('thio-C(C)C-Cl', '[*]SC(C)CCl', 'polar'),
-    ('thio-C(C)C-Br', '[*]SC(C)CBr', 'polar'),
-    ('thio-C(C)C-OH', '[*]SC(C)CO', 'polar'),
-    ('thio-C(C)C-OMe', '[*]SC(C)COC', 'polar'),
-    ('thio-C(C)C-NH2', '[*]SC(C)CN', 'polar'),
-    ('thio-C(C)C-CN', '[*]SC(C)CC#N', 'polar'),
-    ('thio-C(C)C-CF3', '[*]SC(C)CC(F)(F)F', 'polar'),
-    ('thio-C(C)C-Me', '[*]SC(C)CC', 'polar'),
-    ('thio-C(C)C-cyclopropyl', '[*]SC(C)CC1CC1', 'polar'),
-    ('thio-C(C)C-morpholino', '[*]SC(C)CN1CCOCC1', 'polar'),
-    ('thio-C(C)C-piperidino', '[*]SC(C)CN1CCCCC1', 'polar'),
-    ('thio-C(C)C-F2', '[*]SC(C)C(F)F', 'polar'),
-    ('thio-C1CC1-H', '[*]SC1CC1', 'polar'),
-    ('thio-C1CC1-F', '[*]SC1CC1F', 'polar'),
-    ('thio-C1CC1-Cl', '[*]SC1CC1Cl', 'polar'),
-    ('thio-C1CC1-Br', '[*]SC1CC1Br', 'polar'),
-    ('thio-C1CC1-OH', '[*]SC1CC1O', 'polar'),
-    ('thio-C1CC1-OMe', '[*]SC1CC1OC', 'polar'),
-    ('thio-C1CC1-NH2', '[*]SC1CC1N', 'polar'),
-    ('thio-C1CC1-CN', '[*]SC1CC1C#N', 'polar'),
-    ('thio-C1CC1-CF3', '[*]SC1CC1C(F)(F)F', 'polar'),
-    ('thio-C1CC1-Me', '[*]SC1CC1C', 'polar'),
-    ('thio-C1CC1-cyclopropyl', '[*]SC1CC1C1CC1', 'polar'),
-    ('thio-C1CC1-morpholino', '[*]SC1CC1N1CCOCC1', 'polar'),
-    ('thio-C1CC1-piperidino', '[*]SC1CC1N1CCCCC1', 'polar'),
-    ('thio-C1CC1-F2', '[*]SC1CC1(F)F', 'polar'),
-    ('thio-C1CCC1-H', '[*]SC1CCC1', 'polar'),
-    ('thio-C1CCC1-F', '[*]SC1CCC1F', 'polar'),
-    ('thio-C1CCC1-Cl', '[*]SC1CCC1Cl', 'polar'),
-    ('thio-C1CCC1-Br', '[*]SC1CCC1Br', 'polar'),
-    ('thio-C1CCC1-OH', '[*]SC1CCC1O', 'polar'),
-    ('thio-C1CCC1-OMe', '[*]SC1CCC1OC', 'polar'),
-    ('thio-C1CCC1-NH2', '[*]SC1CCC1N', 'polar'),
-    ('thio-C1CCC1-CN', '[*]SC1CCC1C#N', 'polar'),
-    ('thio-C1CCC1-CF3', '[*]SC1CCC1C(F)(F)F', 'polar'),
-    ('thio-C1CCC1-Me', '[*]SC1CCC1C', 'polar'),
-    ('thio-C1CCC1-cyclopropyl', '[*]SC1CCC1C1CC1', 'polar'),
-    ('thio-C1CCC1-morpholino', '[*]SC1CCC1N1CCOCC1', 'polar'),
-    ('thio-C1CCC1-piperidino', '[*]SC1CCC1N1CCCCC1', 'polar'),
-    ('thio-C1CCC1-F2', '[*]SC1CCC1(F)F', 'polar'),
-    ('thio-C(F)(F)-F', '[*]SC(F)(F)F', 'polar'),
-    ('thio-C(F)(F)-Cl', '[*]SC(F)(F)Cl', 'polar'),
-    ('thio-C(F)(F)-Br', '[*]SC(F)(F)Br', 'polar'),
-    ('thio-C(F)(F)-OH', '[*]SC(F)(F)O', 'polar'),
-    ('thio-C(F)(F)-OMe', '[*]SC(F)(F)OC', 'polar'),
-    ('thio-C(F)(F)-NH2', '[*]SC(F)(F)N', 'polar'),
-    ('thio-C(F)(F)-CN', '[*]SC(F)(F)C#N', 'polar'),
-    ('thio-C(F)(F)-CF3', '[*]SC(F)(F)C(F)(F)F', 'polar'),
-    ('thio-C(F)(F)-cyclopropyl', '[*]SC(F)(F)C1CC1', 'polar'),
-    ('thio-C(F)(F)-morpholino', '[*]SC(F)(F)N1CCOCC1', 'polar'),
-    ('thio-C(F)(F)-piperidino', '[*]SC(F)(F)N1CCCCC1', 'polar'),
-    ('thio-C=C-H', '[*]SC=C', 'polar'),
-    ('thio-C=C-F', '[*]SC=CF', 'polar'),
-    ('thio-C=C-Cl', '[*]SC=CCl', 'polar'),
-    ('thio-C=C-Br', '[*]SC=CBr', 'polar'),
-    ('thio-C=C-OH', '[*]SC=CO', 'polar'),
-    ('thio-C=C-OMe', '[*]SC=COC', 'polar'),
-    ('thio-C=C-NH2', '[*]SC=CN', 'polar'),
-    ('thio-C=C-CN', '[*]SC=CC#N', 'polar'),
-    ('thio-C=C-CF3', '[*]SC=CC(F)(F)F', 'polar'),
-    ('thio-C=C-Me', '[*]SC=CC', 'polar'),
-    ('thio-C=C-cyclopropyl', '[*]SC=CC1CC1', 'polar'),
-    ('thio-C=C-morpholino', '[*]SC=CN1CCOCC1', 'polar'),
-    ('thio-C=C-piperidino', '[*]SC=CN1CCCCC1', 'polar'),
-    ('thio-C=C-F2', '[*]SC=C(F)F', 'polar'),
-    ('thio-C#C-H', '[*]SC#C', 'polar'),
-    ('thio-C#C-F', '[*]SC#CF', 'polar'),
-    ('thio-C#C-Cl', '[*]SC#CCl', 'polar'),
-    ('thio-C#C-Br', '[*]SC#CBr', 'polar'),
-    ('thio-C#C-OH', '[*]SC#CO', 'polar'),
-    ('thio-C#C-OMe', '[*]SC#COC', 'polar'),
-    ('thio-C#C-NH2', '[*]SC#CN', 'polar'),
-    ('thio-C#C-CN', '[*]SC#CC#N', 'polar'),
-    ('thio-C#C-CF3', '[*]SC#CC(F)(F)F', 'polar'),
-    ('thio-C#C-Me', '[*]SC#CC', 'polar'),
-    ('thio-C#C-cyclopropyl', '[*]SC#CC1CC1', 'polar'),
-    ('thio-C#C-morpholino', '[*]SC#CN1CCOCC1', 'polar'),
-    ('thio-C#C-piperidino', '[*]SC#CN1CCCCC1', 'polar'),
-    ('acyloxy-C-F', '[*]C(=O)OCF', 'polar'),
-    ('acyloxy-C-Cl', '[*]C(=O)OCCl', 'polar'),
-    ('acyloxy-C-Br', '[*]C(=O)OCBr', 'polar'),
-    ('acyloxy-C-OH', '[*]C(=O)OCO', 'polar'),
-    ('acyloxy-C-OMe', '[*]C(=O)OCOC', 'polar'),
-    ('acyloxy-C-NH2', '[*]C(=O)OCN', 'polar'),
-    ('acyloxy-C-CN', '[*]C(=O)OCC#N', 'polar'),
-    ('acyloxy-C-CF3', '[*]C(=O)OCC(F)(F)F', 'polar'),
-    ('acyloxy-C-cyclopropyl', '[*]C(=O)OCC1CC1', 'polar'),
-    ('acyloxy-C-morpholino', '[*]C(=O)OCN1CCOCC1', 'polar'),
-    ('acyloxy-C-piperidino', '[*]C(=O)OCN1CCCCC1', 'polar'),
-    ('acyloxy-C-F2', '[*]C(=O)OC(F)F', 'polar'),
-    ('acyloxy-CC-F', '[*]C(=O)OCCF', 'polar'),
-    ('acyloxy-CC-Cl', '[*]C(=O)OCCCl', 'polar'),
-    ('acyloxy-CC-Br', '[*]C(=O)OCCBr', 'polar'),
-    ('acyloxy-CC-OH', '[*]C(=O)OCCO', 'polar'),
-    ('acyloxy-CC-OMe', '[*]C(=O)OCCOC', 'polar'),
-    ('acyloxy-CC-NH2', '[*]C(=O)OCCN', 'polar'),
-    ('acyloxy-CC-CN', '[*]C(=O)OCCC#N', 'polar'),
-    ('acyloxy-CC-CF3', '[*]C(=O)OCCC(F)(F)F', 'polar'),
-    ('acyloxy-CC-Me', '[*]C(=O)OCCC', 'polar'),
-    ('acyloxy-CC-cyclopropyl', '[*]C(=O)OCCC1CC1', 'polar'),
-    ('acyloxy-CC-morpholino', '[*]C(=O)OCCN1CCOCC1', 'polar'),
-    ('acyloxy-CC-piperidino', '[*]C(=O)OCCN1CCCCC1', 'polar'),
-    ('acyloxy-CC-F2', '[*]C(=O)OCC(F)F', 'polar'),
-    ('acyloxy-CCC-F', '[*]C(=O)OCCCF', 'polar'),
-    ('acyloxy-CCC-Cl', '[*]C(=O)OCCCCl', 'polar'),
-    ('acyloxy-CCC-Br', '[*]C(=O)OCCCBr', 'polar'),
-    ('acyloxy-CCC-OH', '[*]C(=O)OCCCO', 'polar'),
-    ('acyloxy-CCC-OMe', '[*]C(=O)OCCCOC', 'polar'),
-    ('acyloxy-CCC-NH2', '[*]C(=O)OCCCN', 'polar'),
-    ('acyloxy-CCC-CN', '[*]C(=O)OCCCC#N', 'polar'),
-    ('acyloxy-CCC-CF3', '[*]C(=O)OCCCC(F)(F)F', 'polar'),
-    ('acyloxy-CCC-Me', '[*]C(=O)OCCCC', 'polar'),
-    ('acyloxy-CCC-cyclopropyl', '[*]C(=O)OCCCC1CC1', 'polar'),
-    ('acyloxy-CCC-morpholino', '[*]C(=O)OCCCN1CCOCC1', 'polar'),
-    ('acyloxy-CCC-piperidino', '[*]C(=O)OCCCN1CCCCC1', 'polar'),
-    ('acyloxy-CCC-F2', '[*]C(=O)OCCC(F)F', 'polar'),
-    ('acyloxy-C(C)-F', '[*]C(=O)OC(C)F', 'polar'),
-    ('acyloxy-C(C)-Cl', '[*]C(=O)OC(C)Cl', 'polar'),
-    ('acyloxy-C(C)-Br', '[*]C(=O)OC(C)Br', 'polar'),
-    ('acyloxy-C(C)-OH', '[*]C(=O)OC(C)O', 'polar'),
-    ('acyloxy-C(C)-OMe', '[*]C(=O)OC(C)OC', 'polar'),
-    ('acyloxy-C(C)-NH2', '[*]C(=O)OC(C)N', 'polar'),
-    ('acyloxy-C(C)-CN', '[*]C(=O)OC(C)C#N', 'polar'),
-    ('acyloxy-C(C)-CF3', '[*]C(=O)OC(C)C(F)(F)F', 'polar'),
-    ('acyloxy-C(C)-Me', '[*]C(=O)OC(C)C', 'polar'),
-    ('acyloxy-C(C)-cyclopropyl', '[*]C(=O)OC(C)C1CC1', 'polar'),
-    ('acyloxy-C(C)-morpholino', '[*]C(=O)OC(C)N1CCOCC1', 'polar'),
-    ('acyloxy-C(C)-piperidino', '[*]C(=O)OC(C)N1CCCCC1', 'polar'),
-    ('acyloxy-C(C)-F2', '[*]C(=O)OC(C)(F)F', 'polar'),
-    ('acyloxy-C(C)C-F', '[*]C(=O)OC(C)CF', 'polar'),
-    ('acyloxy-C(C)C-Cl', '[*]C(=O)OC(C)CCl', 'polar'),
-    ('acyloxy-C(C)C-Br', '[*]C(=O)OC(C)CBr', 'polar'),
-    ('acyloxy-C(C)C-OH', '[*]C(=O)OC(C)CO', 'polar'),
-    ('acyloxy-C(C)C-OMe', '[*]C(=O)OC(C)COC', 'polar'),
-    ('acyloxy-C(C)C-NH2', '[*]C(=O)OC(C)CN', 'polar'),
-    ('acyloxy-C(C)C-CN', '[*]C(=O)OC(C)CC#N', 'polar'),
-    ('acyloxy-C(C)C-CF3', '[*]C(=O)OC(C)CC(F)(F)F', 'polar'),
-    ('acyloxy-C(C)C-Me', '[*]C(=O)OC(C)CC', 'polar'),
-    ('acyloxy-C(C)C-cyclopropyl', '[*]C(=O)OC(C)CC1CC1', 'polar'),
-    ('acyloxy-C(C)C-morpholino', '[*]C(=O)OC(C)CN1CCOCC1', 'polar'),
-    ('acyloxy-C(C)C-piperidino', '[*]C(=O)OC(C)CN1CCCCC1', 'polar'),
-    ('acyloxy-C(C)C-F2', '[*]C(=O)OC(C)C(F)F', 'polar'),
-    ('acyloxy-C1CC1-H', '[*]C(=O)OC1CC1', 'polar'),
-    ('acyloxy-C1CC1-F', '[*]C(=O)OC1CC1F', 'polar'),
-    ('acyloxy-C1CC1-Cl', '[*]C(=O)OC1CC1Cl', 'polar'),
-    ('acyloxy-C1CC1-Br', '[*]C(=O)OC1CC1Br', 'polar'),
-    ('acyloxy-C1CC1-OH', '[*]C(=O)OC1CC1O', 'polar'),
-    ('acyloxy-C1CC1-OMe', '[*]C(=O)OC1CC1OC', 'polar'),
-    ('acyloxy-C1CC1-NH2', '[*]C(=O)OC1CC1N', 'polar'),
-    ('acyloxy-C1CC1-CN', '[*]C(=O)OC1CC1C#N', 'polar'),
-    ('acyloxy-C1CC1-CF3', '[*]C(=O)OC1CC1C(F)(F)F', 'polar'),
-    ('acyloxy-C1CC1-Me', '[*]C(=O)OC1CC1C', 'polar'),
-    ('acyloxy-C1CC1-cyclopropyl', '[*]C(=O)OC1CC1C1CC1', 'polar'),
-    ('acyloxy-C1CC1-morpholino', '[*]C(=O)OC1CC1N1CCOCC1', 'polar'),
-    ('acyloxy-C1CC1-piperidino', '[*]C(=O)OC1CC1N1CCCCC1', 'polar'),
-    ('acyloxy-C1CC1-F2', '[*]C(=O)OC1CC1(F)F', 'polar'),
-    ('acyloxy-C1CCC1-H', '[*]C(=O)OC1CCC1', 'polar'),
-    ('acyloxy-C1CCC1-F', '[*]C(=O)OC1CCC1F', 'polar'),
-    ('acyloxy-C1CCC1-Cl', '[*]C(=O)OC1CCC1Cl', 'polar'),
-    ('acyloxy-C1CCC1-Br', '[*]C(=O)OC1CCC1Br', 'polar'),
-    ('acyloxy-C1CCC1-OH', '[*]C(=O)OC1CCC1O', 'polar'),
-    ('acyloxy-C1CCC1-OMe', '[*]C(=O)OC1CCC1OC', 'polar'),
-    ('acyloxy-C1CCC1-NH2', '[*]C(=O)OC1CCC1N', 'polar'),
-    ('acyloxy-C1CCC1-CN', '[*]C(=O)OC1CCC1C#N', 'polar'),
-    ('acyloxy-C1CCC1-CF3', '[*]C(=O)OC1CCC1C(F)(F)F', 'polar'),
-    ('acyloxy-C1CCC1-Me', '[*]C(=O)OC1CCC1C', 'polar'),
-    ('acyloxy-C1CCC1-cyclopropyl', '[*]C(=O)OC1CCC1C1CC1', 'polar'),
-    ('acyloxy-C1CCC1-morpholino', '[*]C(=O)OC1CCC1N1CCOCC1', 'polar'),
-    ('acyloxy-C1CCC1-piperidino', '[*]C(=O)OC1CCC1N1CCCCC1', 'polar'),
-    ('acyloxy-C1CCC1-F2', '[*]C(=O)OC1CCC1(F)F', 'polar'),
-    ('acyloxy-C(F)(F)-F', '[*]C(=O)OC(F)(F)F', 'polar'),
-    ('acyloxy-C(F)(F)-Cl', '[*]C(=O)OC(F)(F)Cl', 'polar'),
-    ('acyloxy-C(F)(F)-Br', '[*]C(=O)OC(F)(F)Br', 'polar'),
-    ('acyloxy-C(F)(F)-OH', '[*]C(=O)OC(F)(F)O', 'polar'),
-    ('acyloxy-C(F)(F)-OMe', '[*]C(=O)OC(F)(F)OC', 'polar'),
-    ('acyloxy-C(F)(F)-NH2', '[*]C(=O)OC(F)(F)N', 'polar'),
-    ('acyloxy-C(F)(F)-CN', '[*]C(=O)OC(F)(F)C#N', 'polar'),
-    ('acyloxy-C(F)(F)-CF3', '[*]C(=O)OC(F)(F)C(F)(F)F', 'polar'),
-    ('acyloxy-C(F)(F)-cyclopropyl', '[*]C(=O)OC(F)(F)C1CC1', 'polar'),
-    ('acyloxy-C(F)(F)-morpholino', '[*]C(=O)OC(F)(F)N1CCOCC1', 'polar'),
-    ('acyloxy-C(F)(F)-piperidino', '[*]C(=O)OC(F)(F)N1CCCCC1', 'polar'),
-    ('acyloxy-C=C-H', '[*]C(=O)OC=C', 'polar'),
-    ('acyloxy-C=C-F', '[*]C(=O)OC=CF', 'polar'),
-    ('acyloxy-C=C-Cl', '[*]C(=O)OC=CCl', 'polar'),
-    ('acyloxy-C=C-Br', '[*]C(=O)OC=CBr', 'polar'),
-    ('acyloxy-C=C-OH', '[*]C(=O)OC=CO', 'polar'),
-    ('acyloxy-C=C-OMe', '[*]C(=O)OC=COC', 'polar'),
-    ('acyloxy-C=C-NH2', '[*]C(=O)OC=CN', 'polar'),
-    ('acyloxy-C=C-CN', '[*]C(=O)OC=CC#N', 'polar'),
-    ('acyloxy-C=C-CF3', '[*]C(=O)OC=CC(F)(F)F', 'polar'),
-    ('acyloxy-C=C-Me', '[*]C(=O)OC=CC', 'polar'),
-    ('acyloxy-C=C-cyclopropyl', '[*]C(=O)OC=CC1CC1', 'polar'),
-    ('acyloxy-C=C-morpholino', '[*]C(=O)OC=CN1CCOCC1', 'polar'),
-    ('acyloxy-C=C-piperidino', '[*]C(=O)OC=CN1CCCCC1', 'polar'),
-    ('acyloxy-C=C-F2', '[*]C(=O)OC=C(F)F', 'polar'),
-    ('acyloxy-C#C-H', '[*]C(=O)OC#C', 'polar'),
-    ('acyloxy-C#C-F', '[*]C(=O)OC#CF', 'polar'),
-    ('acyloxy-C#C-Cl', '[*]C(=O)OC#CCl', 'polar'),
-    ('acyloxy-C#C-Br', '[*]C(=O)OC#CBr', 'polar'),
-    ('acyloxy-C#C-OH', '[*]C(=O)OC#CO', 'polar'),
-    ('acyloxy-C#C-OMe', '[*]C(=O)OC#COC', 'polar'),
-    ('acyloxy-C#C-NH2', '[*]C(=O)OC#CN', 'polar'),
-    ('acyloxy-C#C-CN', '[*]C(=O)OC#CC#N', 'polar'),
-    ('acyloxy-C#C-CF3', '[*]C(=O)OC#CC(F)(F)F', 'polar'),
-    ('acyloxy-C#C-Me', '[*]C(=O)OC#CC', 'polar'),
-    ('acyloxy-C#C-cyclopropyl', '[*]C(=O)OC#CC1CC1', 'polar'),
-    ('acyloxy-C#C-morpholino', '[*]C(=O)OC#CN1CCOCC1', 'polar'),
-    ('acyloxy-C#C-piperidino', '[*]C(=O)OC#CN1CCCCC1', 'polar'),
-    ('acylamino-C-F', '[*]C(=O)NCF', 'polar'),
-    ('acylamino-C-Cl', '[*]C(=O)NCCl', 'polar'),
-    ('acylamino-C-Br', '[*]C(=O)NCBr', 'polar'),
-    ('acylamino-C-OH', '[*]C(=O)NCO', 'polar'),
-    ('acylamino-C-OMe', '[*]C(=O)NCOC', 'polar'),
-    ('acylamino-C-NH2', '[*]C(=O)NCN', 'polar'),
-    ('acylamino-C-CN', '[*]C(=O)NCC#N', 'polar'),
-    ('acylamino-C-CF3', '[*]C(=O)NCC(F)(F)F', 'polar'),
-    ('acylamino-C-cyclopropyl', '[*]C(=O)NCC1CC1', 'polar'),
-    ('acylamino-C-morpholino', '[*]C(=O)NCN1CCOCC1', 'polar'),
-    ('acylamino-C-piperidino', '[*]C(=O)NCN1CCCCC1', 'polar'),
-    ('acylamino-C-F2', '[*]C(=O)NC(F)F', 'polar'),
-    ('acylamino-CC-F', '[*]C(=O)NCCF', 'polar'),
-    ('acylamino-CC-Cl', '[*]C(=O)NCCCl', 'polar'),
-    ('acylamino-CC-Br', '[*]C(=O)NCCBr', 'polar'),
-    ('acylamino-CC-OMe', '[*]C(=O)NCCOC', 'polar'),
-    ('acylamino-CC-NH2', '[*]C(=O)NCCN', 'polar'),
-    ('acylamino-CC-CN', '[*]C(=O)NCCC#N', 'polar'),
-    ('acylamino-CC-CF3', '[*]C(=O)NCCC(F)(F)F', 'polar'),
-    ('acylamino-CC-cyclopropyl', '[*]C(=O)NCCC1CC1', 'polar'),
-    ('acylamino-CC-morpholino', '[*]C(=O)NCCN1CCOCC1', 'polar'),
-    ('acylamino-CC-piperidino', '[*]C(=O)NCCN1CCCCC1', 'polar'),
-    ('acylamino-CC-F2', '[*]C(=O)NCC(F)F', 'polar'),
-    ('acylamino-CCC-F', '[*]C(=O)NCCCF', 'polar'),
-    ('acylamino-CCC-Cl', '[*]C(=O)NCCCCl', 'polar'),
-    ('acylamino-CCC-Br', '[*]C(=O)NCCCBr', 'polar'),
-    ('acylamino-CCC-OH', '[*]C(=O)NCCCO', 'polar'),
-    ('acylamino-CCC-OMe', '[*]C(=O)NCCCOC', 'polar'),
-    ('acylamino-CCC-NH2', '[*]C(=O)NCCCN', 'polar'),
-    ('acylamino-CCC-CN', '[*]C(=O)NCCCC#N', 'polar'),
-    ('acylamino-CCC-CF3', '[*]C(=O)NCCCC(F)(F)F', 'polar'),
-    ('acylamino-CCC-Me', '[*]C(=O)NCCCC', 'polar'),
-    ('acylamino-CCC-cyclopropyl', '[*]C(=O)NCCCC1CC1', 'polar'),
-    ('acylamino-CCC-morpholino', '[*]C(=O)NCCCN1CCOCC1', 'polar'),
-    ('acylamino-CCC-piperidino', '[*]C(=O)NCCCN1CCCCC1', 'polar'),
-    ('acylamino-CCC-F2', '[*]C(=O)NCCC(F)F', 'polar'),
-    ('acylamino-C(C)-F', '[*]C(=O)NC(C)F', 'polar'),
-    ('acylamino-C(C)-Cl', '[*]C(=O)NC(C)Cl', 'polar'),
-    ('acylamino-C(C)-Br', '[*]C(=O)NC(C)Br', 'polar'),
-    ('acylamino-C(C)-OH', '[*]C(=O)NC(C)O', 'polar'),
-    ('acylamino-C(C)-OMe', '[*]C(=O)NC(C)OC', 'polar'),
-    ('acylamino-C(C)-NH2', '[*]C(=O)NC(C)N', 'polar'),
-    ('acylamino-C(C)-CN', '[*]C(=O)NC(C)C#N', 'polar'),
-    ('acylamino-C(C)-CF3', '[*]C(=O)NC(C)C(F)(F)F', 'polar'),
-    ('acylamino-C(C)-cyclopropyl', '[*]C(=O)NC(C)C1CC1', 'polar'),
-    ('acylamino-C(C)-morpholino', '[*]C(=O)NC(C)N1CCOCC1', 'polar'),
-    ('acylamino-C(C)-piperidino', '[*]C(=O)NC(C)N1CCCCC1', 'polar'),
-    ('acylamino-C(C)-F2', '[*]C(=O)NC(C)(F)F', 'polar'),
-    ('acylamino-C(C)C-F', '[*]C(=O)NC(C)CF', 'polar'),
-    ('acylamino-C(C)C-Cl', '[*]C(=O)NC(C)CCl', 'polar'),
-    ('acylamino-C(C)C-Br', '[*]C(=O)NC(C)CBr', 'polar'),
-    ('acylamino-C(C)C-OH', '[*]C(=O)NC(C)CO', 'polar'),
-    ('acylamino-C(C)C-OMe', '[*]C(=O)NC(C)COC', 'polar'),
-    ('acylamino-C(C)C-NH2', '[*]C(=O)NC(C)CN', 'polar'),
-    ('acylamino-C(C)C-CN', '[*]C(=O)NC(C)CC#N', 'polar'),
-    ('acylamino-C(C)C-CF3', '[*]C(=O)NC(C)CC(F)(F)F', 'polar'),
-    ('acylamino-C(C)C-Me', '[*]C(=O)NC(C)CC', 'polar'),
-    ('acylamino-C(C)C-cyclopropyl', '[*]C(=O)NC(C)CC1CC1', 'polar'),
-    ('acylamino-C(C)C-morpholino', '[*]C(=O)NC(C)CN1CCOCC1', 'polar'),
-    ('acylamino-C(C)C-piperidino', '[*]C(=O)NC(C)CN1CCCCC1', 'polar'),
-    ('acylamino-C(C)C-F2', '[*]C(=O)NC(C)C(F)F', 'polar'),
-    ('acylamino-C1CC1-F', '[*]C(=O)NC1CC1F', 'polar'),
-    ('acylamino-C1CC1-Cl', '[*]C(=O)NC1CC1Cl', 'polar'),
-    ('acylamino-C1CC1-Br', '[*]C(=O)NC1CC1Br', 'polar'),
-    ('acylamino-C1CC1-OH', '[*]C(=O)NC1CC1O', 'polar'),
-    ('acylamino-C1CC1-OMe', '[*]C(=O)NC1CC1OC', 'polar'),
-    ('acylamino-C1CC1-NH2', '[*]C(=O)NC1CC1N', 'polar'),
-    ('acylamino-C1CC1-CN', '[*]C(=O)NC1CC1C#N', 'polar'),
-    ('acylamino-C1CC1-CF3', '[*]C(=O)NC1CC1C(F)(F)F', 'polar'),
-    ('acylamino-C1CC1-Me', '[*]C(=O)NC1CC1C', 'polar'),
-    ('acylamino-C1CC1-cyclopropyl', '[*]C(=O)NC1CC1C1CC1', 'polar'),
-    ('acylamino-C1CC1-morpholino', '[*]C(=O)NC1CC1N1CCOCC1', 'polar'),
-    ('acylamino-C1CC1-piperidino', '[*]C(=O)NC1CC1N1CCCCC1', 'polar'),
-    ('acylamino-C1CC1-F2', '[*]C(=O)NC1CC1(F)F', 'polar'),
-    ('acylamino-C1CCC1-F', '[*]C(=O)NC1CCC1F', 'polar'),
-    ('acylamino-C1CCC1-Cl', '[*]C(=O)NC1CCC1Cl', 'polar'),
-    ('acylamino-C1CCC1-Br', '[*]C(=O)NC1CCC1Br', 'polar'),
-    ('acylamino-C1CCC1-OH', '[*]C(=O)NC1CCC1O', 'polar'),
-    ('acylamino-C1CCC1-OMe', '[*]C(=O)NC1CCC1OC', 'polar'),
-    ('acylamino-C1CCC1-NH2', '[*]C(=O)NC1CCC1N', 'polar'),
-    ('acylamino-C1CCC1-CN', '[*]C(=O)NC1CCC1C#N', 'polar'),
-    ('acylamino-C1CCC1-CF3', '[*]C(=O)NC1CCC1C(F)(F)F', 'polar'),
-    ('acylamino-C1CCC1-Me', '[*]C(=O)NC1CCC1C', 'polar'),
-    ('acylamino-C1CCC1-cyclopropyl', '[*]C(=O)NC1CCC1C1CC1', 'polar'),
-    ('acylamino-C1CCC1-morpholino', '[*]C(=O)NC1CCC1N1CCOCC1', 'polar'),
-    ('acylamino-C1CCC1-piperidino', '[*]C(=O)NC1CCC1N1CCCCC1', 'polar'),
-    ('acylamino-C1CCC1-F2', '[*]C(=O)NC1CCC1(F)F', 'polar'),
-    ('acylamino-C(F)(F)-F', '[*]C(=O)NC(F)(F)F', 'polar'),
-    ('acylamino-C(F)(F)-Cl', '[*]C(=O)NC(F)(F)Cl', 'polar'),
-    ('acylamino-C(F)(F)-Br', '[*]C(=O)NC(F)(F)Br', 'polar'),
-    ('acylamino-C(F)(F)-OH', '[*]C(=O)NC(F)(F)O', 'polar'),
-    ('acylamino-C(F)(F)-OMe', '[*]C(=O)NC(F)(F)OC', 'polar'),
-    ('acylamino-C(F)(F)-NH2', '[*]C(=O)NC(F)(F)N', 'polar'),
-    ('acylamino-C(F)(F)-CN', '[*]C(=O)NC(F)(F)C#N', 'polar'),
-    ('acylamino-C(F)(F)-CF3', '[*]C(=O)NC(F)(F)C(F)(F)F', 'polar'),
-    ('acylamino-C(F)(F)-cyclopropyl', '[*]C(=O)NC(F)(F)C1CC1', 'polar'),
-    ('acylamino-C(F)(F)-morpholino', '[*]C(=O)NC(F)(F)N1CCOCC1', 'polar'),
-    ('acylamino-C(F)(F)-piperidino', '[*]C(=O)NC(F)(F)N1CCCCC1', 'polar'),
-    ('acylamino-C=C-H', '[*]C(=O)NC=C', 'polar'),
-    ('acylamino-C=C-F', '[*]C(=O)NC=CF', 'polar'),
-    ('acylamino-C=C-Cl', '[*]C(=O)NC=CCl', 'polar'),
-    ('acylamino-C=C-Br', '[*]C(=O)NC=CBr', 'polar'),
-    ('acylamino-C=C-OH', '[*]C(=O)NC=CO', 'polar'),
-    ('acylamino-C=C-OMe', '[*]C(=O)NC=COC', 'polar'),
-    ('acylamino-C=C-NH2', '[*]C(=O)NC=CN', 'polar'),
-    ('acylamino-C=C-CN', '[*]C(=O)NC=CC#N', 'polar'),
-    ('acylamino-C=C-CF3', '[*]C(=O)NC=CC(F)(F)F', 'polar'),
-    ('acylamino-C=C-Me', '[*]C(=O)NC=CC', 'polar'),
-    ('acylamino-C=C-cyclopropyl', '[*]C(=O)NC=CC1CC1', 'polar'),
-    ('acylamino-C=C-morpholino', '[*]C(=O)NC=CN1CCOCC1', 'polar'),
-    ('acylamino-C=C-piperidino', '[*]C(=O)NC=CN1CCCCC1', 'polar'),
-    ('acylamino-C=C-F2', '[*]C(=O)NC=C(F)F', 'polar'),
-    ('acylamino-C#C-H', '[*]C(=O)NC#C', 'polar'),
-    ('acylamino-C#C-F', '[*]C(=O)NC#CF', 'polar'),
-    ('acylamino-C#C-Cl', '[*]C(=O)NC#CCl', 'polar'),
-    ('acylamino-C#C-Br', '[*]C(=O)NC#CBr', 'polar'),
-    ('acylamino-C#C-OH', '[*]C(=O)NC#CO', 'polar'),
-    ('acylamino-C#C-OMe', '[*]C(=O)NC#COC', 'polar'),
-    ('acylamino-C#C-NH2', '[*]C(=O)NC#CN', 'polar'),
-    ('acylamino-C#C-CN', '[*]C(=O)NC#CC#N', 'polar'),
-    ('acylamino-C#C-CF3', '[*]C(=O)NC#CC(F)(F)F', 'polar'),
-    ('acylamino-C#C-Me', '[*]C(=O)NC#CC', 'polar'),
-    ('acylamino-C#C-cyclopropyl', '[*]C(=O)NC#CC1CC1', 'polar'),
-    ('acylamino-C#C-morpholino', '[*]C(=O)NC#CN1CCOCC1', 'polar'),
-    ('acylamino-C#C-piperidino', '[*]C(=O)NC#CN1CCCCC1', 'polar'),
-    ('bicyclo[2.2.2]octan-1-yl', '[*]C12CCC(CC1)CC2', 'hydrophobic'),
-    ('adamantan-1-yl', '[*]C12CC3CC(CC(C3)C1)C2', 'hydrophobic'),
-    ('adamantan-2-yl', '[*]C1C2CC3CC1CC(C2)C3', 'hydrophobic'),
-    ('spiro[4.4]nonan-1-yl', '[*]C1CCCC12CCCC2', 'hydrophobic'),
-    ('2-oxa-6-azaspiro[3.3]heptyl', '[*]N1CCC12COC2', 'bioisostere'),
-    ('1-oxaspiro[4.4]nonan-3-yl', '[*]C1COCC12CCCC2', 'bioisostere'),
-    ('5-azaspiro[2.4]heptyl', '[*]N1CCCC12CC2', 'bioisostere'),
-    ('2-azaspiro[3.4]octan-2-yl', '[*]N1CCC12CCCC2', 'bioisostere'),
-    ('2-azaspiro[3.5]nonan-2-yl', '[*]N1CCC12CCCCC2', 'bioisostere'),
-    ('6-azaspiro[2.5]octyl', '[*]N1CCCCC12CC2', 'bioisostere'),
-    ('2,2-dimethylcyclopropyl', '[*]C1CC1(C)C', 'hydrophobic'),
-    ('2,2-difluorocyclopropyl', '[*]C1CC1(F)F', 'bioisostere'),
-    ('1-methylcyclobutyl', '[*]C1(C)CCC1', 'hydrophobic'),
-    ('1-fluorocyclobutyl', '[*]C1(F)CCC1', 'hydrophobic'),
-    ('3,3-difluorocyclobutyl', '[*]C1CC(F)(F)C1', 'bioisostere'),
-    ('3,3-difluorocyclopentyl', '[*]C1CCC(F)(F)C1', 'bioisostere'),
-    ('4,4-difluorocyclohexyl', '[*]C1CCC(F)(F)CC1', 'bioisostere'),
-    ('3-methylcyclobutyl_2', '[*]C1CC(C)C1', 'hydrophobic'),
-    ('4-fluorocyclohexyl', '[*]C1CCC(F)CC1', 'hydrophobic'),
-    ('4-hydroxycyclohexyl', '[*]C1CCC(O)CC1', 'polar'),
-    ('4-tBu-cyclohexyl', '[*]C1CCC(C(C)(C)C)CC1', 'hydrophobic'),
-    ('1-Me-pyrazol-3-yl_2', '[*]c1ccnn1C', 'aromatic'),
-    ('1-Me-imidazol-4-yl', '[*]c1cn(C)cn1', 'aromatic'),
-    ('5-Me-1-Me-pyrazol-3-yl', '[*]c1cc(C)nn1C', 'aromatic'),
-    ('5-Me-1-Me-pyrazol-4-yl', '[*]c1c(C)nn(c1)C', 'aromatic'),
-    ('5-Me-1-Me-imidazol-4-yl', '[*]c1c(C)n(C)cn1', 'aromatic'),
-    ('5-Et-1-Me-pyrazol-3-yl', '[*]c1cc(CC)nn1C', 'aromatic'),
-    ('5-Et-1-Me-pyrazol-4-yl', '[*]c1c(CC)nn(c1)C', 'aromatic'),
-    ('5-Et-1-Me-imidazol-4-yl', '[*]c1c(CC)n(C)cn1', 'aromatic'),
-    ('5-F-1-Me-pyrazol-3-yl', '[*]c1cc(F)nn1C', 'aromatic'),
-    ('5-F-1-Me-pyrazol-4-yl', '[*]c1c(F)nn(c1)C', 'aromatic'),
-    ('5-F-1-Me-imidazol-4-yl', '[*]c1c(F)n(C)cn1', 'aromatic'),
-    ('5-Cl-1-Me-pyrazol-3-yl', '[*]c1cc(Cl)nn1C', 'aromatic'),
-    ('5-Cl-1-Me-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)C', 'aromatic'),
-    ('5-Cl-1-Me-imidazol-4-yl', '[*]c1c(Cl)n(C)cn1', 'aromatic'),
-    ('5-CF3-1-Me-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1C', 'aromatic'),
-    ('5-CF3-1-Me-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)C', 'aromatic'),
-    ('5-CF3-1-Me-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(C)cn1', 'aromatic'),
-    ('5-CN-1-Me-pyrazol-3-yl', '[*]c1cc(C#N)nn1C', 'aromatic'),
-    ('5-CN-1-Me-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)C', 'aromatic'),
-    ('5-CN-1-Me-imidazol-4-yl', '[*]c1c(C#N)n(C)cn1', 'aromatic'),
-    ('5-OH-1-Me-pyrazol-3-yl', '[*]c1cc(O)nn1C', 'aromatic'),
-    ('5-OH-1-Me-pyrazol-4-yl', '[*]c1c(O)nn(c1)C', 'aromatic'),
-    ('5-OH-1-Me-imidazol-4-yl', '[*]c1c(O)n(C)cn1', 'aromatic'),
-    ('5-OMe-1-Me-pyrazol-3-yl', '[*]c1cc(OC)nn1C', 'aromatic'),
-    ('5-OMe-1-Me-pyrazol-4-yl', '[*]c1c(OC)nn(c1)C', 'aromatic'),
-    ('5-OMe-1-Me-imidazol-4-yl', '[*]c1c(OC)n(C)cn1', 'aromatic'),
-    ('5-NH2-1-Me-pyrazol-3-yl', '[*]c1cc(N)nn1C', 'aromatic'),
-    ('5-NH2-1-Me-pyrazol-4-yl', '[*]c1c(N)nn(c1)C', 'aromatic'),
-    ('5-NH2-1-Me-imidazol-4-yl', '[*]c1c(N)n(C)cn1', 'aromatic'),
-    ('1-Et-pyrazol-3-yl', '[*]c1ccnn1CC', 'aromatic'),
-    ('1-Et-pyrazol-4-yl', '[*]c1cnn(c1)CC', 'aromatic'),
-    ('1-Et-imidazol-4-yl', '[*]c1cn(CC)cn1', 'aromatic'),
-    ('5-Me-1-Et-pyrazol-3-yl', '[*]c1cc(C)nn1CC', 'aromatic'),
-    ('5-Me-1-Et-pyrazol-4-yl', '[*]c1c(C)nn(c1)CC', 'aromatic'),
-    ('5-Me-1-Et-imidazol-4-yl', '[*]c1c(C)n(CC)cn1', 'aromatic'),
-    ('5-Et-1-Et-pyrazol-3-yl', '[*]c1cc(CC)nn1CC', 'aromatic'),
-    ('5-Et-1-Et-pyrazol-4-yl', '[*]c1c(CC)nn(c1)CC', 'aromatic'),
-    ('5-Et-1-Et-imidazol-4-yl', '[*]c1c(CC)n(CC)cn1', 'aromatic'),
-    ('5-F-1-Et-pyrazol-3-yl', '[*]c1cc(F)nn1CC', 'aromatic'),
-    ('5-F-1-Et-pyrazol-4-yl', '[*]c1c(F)nn(c1)CC', 'aromatic'),
-    ('5-F-1-Et-imidazol-4-yl', '[*]c1c(F)n(CC)cn1', 'aromatic'),
-    ('5-Cl-1-Et-pyrazol-3-yl', '[*]c1cc(Cl)nn1CC', 'aromatic'),
-    ('5-Cl-1-Et-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)CC', 'aromatic'),
-    ('5-Cl-1-Et-imidazol-4-yl', '[*]c1c(Cl)n(CC)cn1', 'aromatic'),
-    ('5-CF3-1-Et-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1CC', 'aromatic'),
-    ('5-CF3-1-Et-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)CC', 'aromatic'),
-    ('5-CF3-1-Et-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(CC)cn1', 'aromatic'),
-    ('5-CN-1-Et-pyrazol-3-yl', '[*]c1cc(C#N)nn1CC', 'aromatic'),
-    ('5-CN-1-Et-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)CC', 'aromatic'),
-    ('5-CN-1-Et-imidazol-4-yl', '[*]c1c(C#N)n(CC)cn1', 'aromatic'),
-    ('5-OH-1-Et-pyrazol-3-yl', '[*]c1cc(O)nn1CC', 'aromatic'),
-    ('5-OH-1-Et-pyrazol-4-yl', '[*]c1c(O)nn(c1)CC', 'aromatic'),
-    ('5-OH-1-Et-imidazol-4-yl', '[*]c1c(O)n(CC)cn1', 'aromatic'),
-    ('5-OMe-1-Et-pyrazol-3-yl', '[*]c1cc(OC)nn1CC', 'aromatic'),
-    ('5-OMe-1-Et-pyrazol-4-yl', '[*]c1c(OC)nn(c1)CC', 'aromatic'),
-    ('5-OMe-1-Et-imidazol-4-yl', '[*]c1c(OC)n(CC)cn1', 'aromatic'),
-    ('5-NH2-1-Et-pyrazol-3-yl', '[*]c1cc(N)nn1CC', 'aromatic'),
-    ('5-NH2-1-Et-pyrazol-4-yl', '[*]c1c(N)nn(c1)CC', 'aromatic'),
-    ('5-NH2-1-Et-imidazol-4-yl', '[*]c1c(N)n(CC)cn1', 'aromatic'),
-    ('1-iPr-pyrazol-3-yl', '[*]c1ccnn1C(C)C', 'aromatic'),
-    ('1-iPr-pyrazol-4-yl', '[*]c1cnn(c1)C(C)C', 'aromatic'),
-    ('1-iPr-imidazol-4-yl', '[*]c1cn(C(C)C)cn1', 'aromatic'),
-    ('5-Me-1-iPr-pyrazol-3-yl', '[*]c1cc(C)nn1C(C)C', 'aromatic'),
-    ('5-Me-1-iPr-pyrazol-4-yl', '[*]c1c(C)nn(c1)C(C)C', 'aromatic'),
-    ('5-Me-1-iPr-imidazol-4-yl', '[*]c1c(C)n(C(C)C)cn1', 'aromatic'),
-    ('5-Et-1-iPr-pyrazol-3-yl', '[*]c1cc(CC)nn1C(C)C', 'aromatic'),
-    ('5-Et-1-iPr-pyrazol-4-yl', '[*]c1c(CC)nn(c1)C(C)C', 'aromatic'),
-    ('5-Et-1-iPr-imidazol-4-yl', '[*]c1c(CC)n(C(C)C)cn1', 'aromatic'),
-    ('5-F-1-iPr-pyrazol-3-yl', '[*]c1cc(F)nn1C(C)C', 'aromatic'),
-    ('5-F-1-iPr-pyrazol-4-yl', '[*]c1c(F)nn(c1)C(C)C', 'aromatic'),
-    ('5-F-1-iPr-imidazol-4-yl', '[*]c1c(F)n(C(C)C)cn1', 'aromatic'),
-    ('5-Cl-1-iPr-pyrazol-3-yl', '[*]c1cc(Cl)nn1C(C)C', 'aromatic'),
-    ('5-Cl-1-iPr-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)C(C)C', 'aromatic'),
-    ('5-Cl-1-iPr-imidazol-4-yl', '[*]c1c(Cl)n(C(C)C)cn1', 'aromatic'),
-    ('5-CF3-1-iPr-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1C(C)C', 'aromatic'),
-    ('5-CF3-1-iPr-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)C(C)C', 'aromatic'),
-    ('5-CF3-1-iPr-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(C(C)C)cn1', 'aromatic'),
-    ('5-CN-1-iPr-pyrazol-3-yl', '[*]c1cc(C#N)nn1C(C)C', 'aromatic'),
-    ('5-CN-1-iPr-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)C(C)C', 'aromatic'),
-    ('5-CN-1-iPr-imidazol-4-yl', '[*]c1c(C#N)n(C(C)C)cn1', 'aromatic'),
-    ('5-OH-1-iPr-pyrazol-3-yl', '[*]c1cc(O)nn1C(C)C', 'aromatic'),
-    ('5-OH-1-iPr-pyrazol-4-yl', '[*]c1c(O)nn(c1)C(C)C', 'aromatic'),
-    ('5-OH-1-iPr-imidazol-4-yl', '[*]c1c(O)n(C(C)C)cn1', 'aromatic'),
-    ('5-OMe-1-iPr-pyrazol-3-yl', '[*]c1cc(OC)nn1C(C)C', 'aromatic'),
-    ('5-OMe-1-iPr-pyrazol-4-yl', '[*]c1c(OC)nn(c1)C(C)C', 'aromatic'),
-    ('5-OMe-1-iPr-imidazol-4-yl', '[*]c1c(OC)n(C(C)C)cn1', 'aromatic'),
-    ('5-NH2-1-iPr-pyrazol-3-yl', '[*]c1cc(N)nn1C(C)C', 'aromatic'),
-    ('5-NH2-1-iPr-pyrazol-4-yl', '[*]c1c(N)nn(c1)C(C)C', 'aromatic'),
-    ('5-NH2-1-iPr-imidazol-4-yl', '[*]c1c(N)n(C(C)C)cn1', 'aromatic'),
-    ('1-cPr-pyrazol-3-yl', '[*]c1ccnn1C1CC1', 'aromatic'),
-    ('1-cPr-pyrazol-4-yl', '[*]c1cnn(c1)C1CC1', 'aromatic'),
-    ('1-cPr-imidazol-4-yl', '[*]c1cn(C1CC1)cn1', 'aromatic'),
-    ('5-Me-1-cPr-pyrazol-3-yl', '[*]c1cc(C)nn1C1CC1', 'aromatic'),
-    ('5-Me-1-cPr-pyrazol-4-yl', '[*]c1c(C)nn(c1)C1CC1', 'aromatic'),
-    ('5-Me-1-cPr-imidazol-4-yl', '[*]c1c(C)n(C1CC1)cn1', 'aromatic'),
-    ('5-Et-1-cPr-pyrazol-3-yl', '[*]c1cc(CC)nn1C1CC1', 'aromatic'),
-    ('5-Et-1-cPr-pyrazol-4-yl', '[*]c1c(CC)nn(c1)C1CC1', 'aromatic'),
-    ('5-Et-1-cPr-imidazol-4-yl', '[*]c1c(CC)n(C1CC1)cn1', 'aromatic'),
-    ('5-F-1-cPr-pyrazol-3-yl', '[*]c1cc(F)nn1C1CC1', 'aromatic'),
-    ('5-F-1-cPr-pyrazol-4-yl', '[*]c1c(F)nn(c1)C1CC1', 'aromatic'),
-    ('5-F-1-cPr-imidazol-4-yl', '[*]c1c(F)n(C1CC1)cn1', 'aromatic'),
-    ('5-Cl-1-cPr-pyrazol-3-yl', '[*]c1cc(Cl)nn1C1CC1', 'aromatic'),
-    ('5-Cl-1-cPr-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)C1CC1', 'aromatic'),
-    ('5-Cl-1-cPr-imidazol-4-yl', '[*]c1c(Cl)n(C1CC1)cn1', 'aromatic'),
-    ('5-CF3-1-cPr-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1C1CC1', 'aromatic'),
-    ('5-CF3-1-cPr-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)C1CC1', 'aromatic'),
-    ('5-CF3-1-cPr-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(C1CC1)cn1', 'aromatic'),
-    ('5-CN-1-cPr-pyrazol-3-yl', '[*]c1cc(C#N)nn1C1CC1', 'aromatic'),
-    ('5-CN-1-cPr-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)C1CC1', 'aromatic'),
-    ('5-CN-1-cPr-imidazol-4-yl', '[*]c1c(C#N)n(C1CC1)cn1', 'aromatic'),
-    ('5-OH-1-cPr-pyrazol-3-yl', '[*]c1cc(O)nn1C1CC1', 'aromatic'),
-    ('5-OH-1-cPr-pyrazol-4-yl', '[*]c1c(O)nn(c1)C1CC1', 'aromatic'),
-    ('5-OH-1-cPr-imidazol-4-yl', '[*]c1c(O)n(C1CC1)cn1', 'aromatic'),
-    ('5-OMe-1-cPr-pyrazol-3-yl', '[*]c1cc(OC)nn1C1CC1', 'aromatic'),
-    ('5-OMe-1-cPr-pyrazol-4-yl', '[*]c1c(OC)nn(c1)C1CC1', 'aromatic'),
-    ('5-OMe-1-cPr-imidazol-4-yl', '[*]c1c(OC)n(C1CC1)cn1', 'aromatic'),
-    ('5-NH2-1-cPr-pyrazol-3-yl', '[*]c1cc(N)nn1C1CC1', 'aromatic'),
-    ('5-NH2-1-cPr-pyrazol-4-yl', '[*]c1c(N)nn(c1)C1CC1', 'aromatic'),
-    ('5-NH2-1-cPr-imidazol-4-yl', '[*]c1c(N)n(C1CC1)cn1', 'aromatic'),
-    ('1-Bn-pyrazol-3-yl', '[*]c1ccnn1Cc1ccccc1', 'aromatic'),
-    ('1-Bn-pyrazol-4-yl', '[*]c1cnn(c1)Cc1ccccc1', 'aromatic'),
-    ('1-Bn-imidazol-4-yl', '[*]c1cn(Cc1ccccc1)cn1', 'aromatic'),
-    ('5-Me-1-Bn-pyrazol-3-yl', '[*]c1cc(C)nn1Cc1ccccc1', 'aromatic'),
-    ('5-Me-1-Bn-pyrazol-4-yl', '[*]c1c(C)nn(c1)Cc1ccccc1', 'aromatic'),
-    ('5-Me-1-Bn-imidazol-4-yl', '[*]c1c(C)n(Cc1ccccc1)cn1', 'aromatic'),
-    ('5-Et-1-Bn-pyrazol-3-yl', '[*]c1cc(CC)nn1Cc1ccccc1', 'aromatic'),
-    ('5-Et-1-Bn-pyrazol-4-yl', '[*]c1c(CC)nn(c1)Cc1ccccc1', 'aromatic'),
-    ('5-Et-1-Bn-imidazol-4-yl', '[*]c1c(CC)n(Cc1ccccc1)cn1', 'aromatic'),
-    ('5-F-1-Bn-pyrazol-3-yl', '[*]c1cc(F)nn1Cc1ccccc1', 'aromatic'),
-    ('5-F-1-Bn-pyrazol-4-yl', '[*]c1c(F)nn(c1)Cc1ccccc1', 'aromatic'),
-    ('5-F-1-Bn-imidazol-4-yl', '[*]c1c(F)n(Cc1ccccc1)cn1', 'aromatic'),
-    ('5-Cl-1-Bn-pyrazol-3-yl', '[*]c1cc(Cl)nn1Cc1ccccc1', 'aromatic'),
-    ('5-Cl-1-Bn-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)Cc1ccccc1', 'aromatic'),
-    ('5-Cl-1-Bn-imidazol-4-yl', '[*]c1c(Cl)n(Cc1ccccc1)cn1', 'aromatic'),
-    ('5-CF3-1-Bn-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1Cc1ccccc1', 'aromatic'),
-    ('5-CF3-1-Bn-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)Cc1ccccc1', 'aromatic'),
-    ('5-CF3-1-Bn-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(Cc1ccccc1)cn1', 'aromatic'),
-    ('5-CN-1-Bn-pyrazol-3-yl', '[*]c1cc(C#N)nn1Cc1ccccc1', 'aromatic'),
-    ('5-CN-1-Bn-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)Cc1ccccc1', 'aromatic'),
-    ('5-CN-1-Bn-imidazol-4-yl', '[*]c1c(C#N)n(Cc1ccccc1)cn1', 'aromatic'),
-    ('5-OH-1-Bn-pyrazol-3-yl', '[*]c1cc(O)nn1Cc1ccccc1', 'aromatic'),
-    ('5-OH-1-Bn-pyrazol-4-yl', '[*]c1c(O)nn(c1)Cc1ccccc1', 'aromatic'),
-    ('5-OH-1-Bn-imidazol-4-yl', '[*]c1c(O)n(Cc1ccccc1)cn1', 'aromatic'),
-    ('5-OMe-1-Bn-pyrazol-3-yl', '[*]c1cc(OC)nn1Cc1ccccc1', 'aromatic'),
-    ('5-OMe-1-Bn-pyrazol-4-yl', '[*]c1c(OC)nn(c1)Cc1ccccc1', 'aromatic'),
-    ('5-OMe-1-Bn-imidazol-4-yl', '[*]c1c(OC)n(Cc1ccccc1)cn1', 'aromatic'),
-    ('5-NH2-1-Bn-pyrazol-3-yl', '[*]c1cc(N)nn1Cc1ccccc1', 'aromatic'),
-    ('5-NH2-1-Bn-pyrazol-4-yl', '[*]c1c(N)nn(c1)Cc1ccccc1', 'aromatic'),
-    ('5-NH2-1-Bn-imidazol-4-yl', '[*]c1c(N)n(Cc1ccccc1)cn1', 'aromatic'),
-    ('1-4-FBn-pyrazol-3-yl', '[*]c1ccnn1Cc1ccc(F)cc1', 'aromatic'),
-    ('1-4-FBn-pyrazol-4-yl', '[*]c1cnn(c1)Cc1ccc(F)cc1', 'aromatic'),
-    ('1-4-FBn-imidazol-4-yl', '[*]c1cn(Cc1ccc(F)cc1)cn1', 'aromatic'),
-    ('5-Me-1-4-FBn-pyrazol-3-yl', '[*]c1cc(C)nn1Cc1ccc(F)cc1', 'aromatic'),
-    ('5-Me-1-4-FBn-pyrazol-4-yl', '[*]c1c(C)nn(c1)Cc1ccc(F)cc1', 'aromatic'),
-    ('5-Me-1-4-FBn-imidazol-4-yl', '[*]c1c(C)n(Cc1ccc(F)cc1)cn1', 'aromatic'),
-    ('5-Et-1-4-FBn-pyrazol-3-yl', '[*]c1cc(CC)nn1Cc1ccc(F)cc1', 'aromatic'),
-    ('5-Et-1-4-FBn-pyrazol-4-yl', '[*]c1c(CC)nn(c1)Cc1ccc(F)cc1', 'aromatic'),
-    ('5-Et-1-4-FBn-imidazol-4-yl', '[*]c1c(CC)n(Cc1ccc(F)cc1)cn1', 'aromatic'),
-    ('5-F-1-4-FBn-pyrazol-3-yl', '[*]c1cc(F)nn1Cc1ccc(F)cc1', 'aromatic'),
-    ('5-F-1-4-FBn-pyrazol-4-yl', '[*]c1c(F)nn(c1)Cc1ccc(F)cc1', 'aromatic'),
-    ('5-F-1-4-FBn-imidazol-4-yl', '[*]c1c(F)n(Cc1ccc(F)cc1)cn1', 'aromatic'),
-    ('5-Cl-1-4-FBn-pyrazol-3-yl', '[*]c1cc(Cl)nn1Cc1ccc(F)cc1', 'aromatic'),
-    ('5-Cl-1-4-FBn-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)Cc1ccc(F)cc1', 'aromatic'),
-    ('5-Cl-1-4-FBn-imidazol-4-yl', '[*]c1c(Cl)n(Cc1ccc(F)cc1)cn1', 'aromatic'),
-    ('5-CF3-1-4-FBn-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1Cc1ccc(F)cc1', 'aromatic'),
-    ('5-CF3-1-4-FBn-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)Cc1ccc(F)cc1', 'aromatic'),
-    ('5-CF3-1-4-FBn-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(Cc1ccc(F)cc1)cn1', 'aromatic'),
-    ('5-CN-1-4-FBn-pyrazol-3-yl', '[*]c1cc(C#N)nn1Cc1ccc(F)cc1', 'aromatic'),
-    ('5-CN-1-4-FBn-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)Cc1ccc(F)cc1', 'aromatic'),
-    ('5-CN-1-4-FBn-imidazol-4-yl', '[*]c1c(C#N)n(Cc1ccc(F)cc1)cn1', 'aromatic'),
-    ('5-OH-1-4-FBn-pyrazol-3-yl', '[*]c1cc(O)nn1Cc1ccc(F)cc1', 'aromatic'),
-    ('5-OH-1-4-FBn-pyrazol-4-yl', '[*]c1c(O)nn(c1)Cc1ccc(F)cc1', 'aromatic'),
-    ('5-OH-1-4-FBn-imidazol-4-yl', '[*]c1c(O)n(Cc1ccc(F)cc1)cn1', 'aromatic'),
-    ('5-OMe-1-4-FBn-pyrazol-3-yl', '[*]c1cc(OC)nn1Cc1ccc(F)cc1', 'aromatic'),
-    ('5-OMe-1-4-FBn-pyrazol-4-yl', '[*]c1c(OC)nn(c1)Cc1ccc(F)cc1', 'aromatic'),
-    ('5-OMe-1-4-FBn-imidazol-4-yl', '[*]c1c(OC)n(Cc1ccc(F)cc1)cn1', 'aromatic'),
-    ('5-NH2-1-4-FBn-pyrazol-3-yl', '[*]c1cc(N)nn1Cc1ccc(F)cc1', 'aromatic'),
-    ('5-NH2-1-4-FBn-pyrazol-4-yl', '[*]c1c(N)nn(c1)Cc1ccc(F)cc1', 'aromatic'),
-    ('5-NH2-1-4-FBn-imidazol-4-yl', '[*]c1c(N)n(Cc1ccc(F)cc1)cn1', 'aromatic'),
-    ('1-CH2CN-pyrazol-3-yl', '[*]c1ccnn1CC#N', 'aromatic'),
-    ('1-CH2CN-pyrazol-4-yl', '[*]c1cnn(c1)CC#N', 'aromatic'),
-    ('1-CH2CN-imidazol-4-yl', '[*]c1cn(CC#N)cn1', 'aromatic'),
-    ('5-Me-1-CH2CN-pyrazol-3-yl', '[*]c1cc(C)nn1CC#N', 'aromatic'),
-    ('5-Me-1-CH2CN-pyrazol-4-yl', '[*]c1c(C)nn(c1)CC#N', 'aromatic'),
-    ('5-Me-1-CH2CN-imidazol-4-yl', '[*]c1c(C)n(CC#N)cn1', 'aromatic'),
-    ('5-Et-1-CH2CN-pyrazol-3-yl', '[*]c1cc(CC)nn1CC#N', 'aromatic'),
-    ('5-Et-1-CH2CN-pyrazol-4-yl', '[*]c1c(CC)nn(c1)CC#N', 'aromatic'),
-    ('5-Et-1-CH2CN-imidazol-4-yl', '[*]c1c(CC)n(CC#N)cn1', 'aromatic'),
-    ('5-F-1-CH2CN-pyrazol-3-yl', '[*]c1cc(F)nn1CC#N', 'aromatic'),
-    ('5-F-1-CH2CN-pyrazol-4-yl', '[*]c1c(F)nn(c1)CC#N', 'aromatic'),
-    ('5-F-1-CH2CN-imidazol-4-yl', '[*]c1c(F)n(CC#N)cn1', 'aromatic'),
-    ('5-Cl-1-CH2CN-pyrazol-3-yl', '[*]c1cc(Cl)nn1CC#N', 'aromatic'),
-    ('5-Cl-1-CH2CN-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)CC#N', 'aromatic'),
-    ('5-Cl-1-CH2CN-imidazol-4-yl', '[*]c1c(Cl)n(CC#N)cn1', 'aromatic'),
-    ('5-CF3-1-CH2CN-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1CC#N', 'aromatic'),
-    ('5-CF3-1-CH2CN-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)CC#N', 'aromatic'),
-    ('5-CF3-1-CH2CN-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(CC#N)cn1', 'aromatic'),
-    ('5-CN-1-CH2CN-pyrazol-3-yl', '[*]c1cc(C#N)nn1CC#N', 'aromatic'),
-    ('5-CN-1-CH2CN-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)CC#N', 'aromatic'),
-    ('5-CN-1-CH2CN-imidazol-4-yl', '[*]c1c(C#N)n(CC#N)cn1', 'aromatic'),
-    ('5-OH-1-CH2CN-pyrazol-3-yl', '[*]c1cc(O)nn1CC#N', 'aromatic'),
-    ('5-OH-1-CH2CN-pyrazol-4-yl', '[*]c1c(O)nn(c1)CC#N', 'aromatic'),
-    ('5-OH-1-CH2CN-imidazol-4-yl', '[*]c1c(O)n(CC#N)cn1', 'aromatic'),
-    ('5-OMe-1-CH2CN-pyrazol-3-yl', '[*]c1cc(OC)nn1CC#N', 'aromatic'),
-    ('5-OMe-1-CH2CN-pyrazol-4-yl', '[*]c1c(OC)nn(c1)CC#N', 'aromatic'),
-    ('5-OMe-1-CH2CN-imidazol-4-yl', '[*]c1c(OC)n(CC#N)cn1', 'aromatic'),
-    ('5-NH2-1-CH2CN-pyrazol-3-yl', '[*]c1cc(N)nn1CC#N', 'aromatic'),
-    ('5-NH2-1-CH2CN-pyrazol-4-yl', '[*]c1c(N)nn(c1)CC#N', 'aromatic'),
-    ('5-NH2-1-CH2CN-imidazol-4-yl', '[*]c1c(N)n(CC#N)cn1', 'aromatic'),
-    ('1-CH2OH-pyrazol-3-yl', '[*]c1ccnn1CO', 'aromatic'),
-    ('1-CH2OH-pyrazol-4-yl', '[*]c1cnn(c1)CO', 'aromatic'),
-    ('1-CH2OH-imidazol-4-yl', '[*]c1cn(CO)cn1', 'aromatic'),
-    ('5-Me-1-CH2OH-pyrazol-3-yl', '[*]c1cc(C)nn1CO', 'aromatic'),
-    ('5-Me-1-CH2OH-pyrazol-4-yl', '[*]c1c(C)nn(c1)CO', 'aromatic'),
-    ('5-Me-1-CH2OH-imidazol-4-yl', '[*]c1c(C)n(CO)cn1', 'aromatic'),
-    ('5-Et-1-CH2OH-pyrazol-3-yl', '[*]c1cc(CC)nn1CO', 'aromatic'),
-    ('5-Et-1-CH2OH-pyrazol-4-yl', '[*]c1c(CC)nn(c1)CO', 'aromatic'),
-    ('5-Et-1-CH2OH-imidazol-4-yl', '[*]c1c(CC)n(CO)cn1', 'aromatic'),
-    ('5-F-1-CH2OH-pyrazol-3-yl', '[*]c1cc(F)nn1CO', 'aromatic'),
-    ('5-F-1-CH2OH-pyrazol-4-yl', '[*]c1c(F)nn(c1)CO', 'aromatic'),
-    ('5-F-1-CH2OH-imidazol-4-yl', '[*]c1c(F)n(CO)cn1', 'aromatic'),
-    ('5-Cl-1-CH2OH-pyrazol-3-yl', '[*]c1cc(Cl)nn1CO', 'aromatic'),
-    ('5-Cl-1-CH2OH-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)CO', 'aromatic'),
-    ('5-Cl-1-CH2OH-imidazol-4-yl', '[*]c1c(Cl)n(CO)cn1', 'aromatic'),
-    ('5-CF3-1-CH2OH-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1CO', 'aromatic'),
-    ('5-CF3-1-CH2OH-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)CO', 'aromatic'),
-    ('5-CF3-1-CH2OH-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(CO)cn1', 'aromatic'),
-    ('5-CN-1-CH2OH-pyrazol-3-yl', '[*]c1cc(C#N)nn1CO', 'aromatic'),
-    ('5-CN-1-CH2OH-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)CO', 'aromatic'),
-    ('5-CN-1-CH2OH-imidazol-4-yl', '[*]c1c(C#N)n(CO)cn1', 'aromatic'),
-    ('5-OH-1-CH2OH-pyrazol-3-yl', '[*]c1cc(O)nn1CO', 'aromatic'),
-    ('5-OH-1-CH2OH-pyrazol-4-yl', '[*]c1c(O)nn(c1)CO', 'aromatic'),
-    ('5-OH-1-CH2OH-imidazol-4-yl', '[*]c1c(O)n(CO)cn1', 'aromatic'),
-    ('5-OMe-1-CH2OH-pyrazol-3-yl', '[*]c1cc(OC)nn1CO', 'aromatic'),
-    ('5-OMe-1-CH2OH-pyrazol-4-yl', '[*]c1c(OC)nn(c1)CO', 'aromatic'),
-    ('5-OMe-1-CH2OH-imidazol-4-yl', '[*]c1c(OC)n(CO)cn1', 'aromatic'),
-    ('5-NH2-1-CH2OH-pyrazol-3-yl', '[*]c1cc(N)nn1CO', 'aromatic'),
-    ('5-NH2-1-CH2OH-pyrazol-4-yl', '[*]c1c(N)nn(c1)CO', 'aromatic'),
-    ('5-NH2-1-CH2OH-imidazol-4-yl', '[*]c1c(N)n(CO)cn1', 'aromatic'),
-    ('1-allyl-pyrazol-3-yl', '[*]c1ccnn1CC=C', 'aromatic'),
-    ('1-allyl-pyrazol-4-yl', '[*]c1cnn(c1)CC=C', 'aromatic'),
-    ('1-allyl-imidazol-4-yl', '[*]c1cn(CC=C)cn1', 'aromatic'),
-    ('5-Me-1-allyl-pyrazol-3-yl', '[*]c1cc(C)nn1CC=C', 'aromatic'),
-    ('5-Me-1-allyl-pyrazol-4-yl', '[*]c1c(C)nn(c1)CC=C', 'aromatic'),
-    ('5-Me-1-allyl-imidazol-4-yl', '[*]c1c(C)n(CC=C)cn1', 'aromatic'),
-    ('5-Et-1-allyl-pyrazol-3-yl', '[*]c1cc(CC)nn1CC=C', 'aromatic'),
-    ('5-Et-1-allyl-pyrazol-4-yl', '[*]c1c(CC)nn(c1)CC=C', 'aromatic'),
-    ('5-Et-1-allyl-imidazol-4-yl', '[*]c1c(CC)n(CC=C)cn1', 'aromatic'),
-    ('5-F-1-allyl-pyrazol-3-yl', '[*]c1cc(F)nn1CC=C', 'aromatic'),
-    ('5-F-1-allyl-pyrazol-4-yl', '[*]c1c(F)nn(c1)CC=C', 'aromatic'),
-    ('5-F-1-allyl-imidazol-4-yl', '[*]c1c(F)n(CC=C)cn1', 'aromatic'),
-    ('5-Cl-1-allyl-pyrazol-3-yl', '[*]c1cc(Cl)nn1CC=C', 'aromatic'),
-    ('5-Cl-1-allyl-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)CC=C', 'aromatic'),
-    ('5-Cl-1-allyl-imidazol-4-yl', '[*]c1c(Cl)n(CC=C)cn1', 'aromatic'),
-    ('5-CF3-1-allyl-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1CC=C', 'aromatic'),
-    ('5-CF3-1-allyl-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)CC=C', 'aromatic'),
-    ('5-CF3-1-allyl-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(CC=C)cn1', 'aromatic'),
-    ('5-CN-1-allyl-pyrazol-3-yl', '[*]c1cc(C#N)nn1CC=C', 'aromatic'),
-    ('5-CN-1-allyl-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)CC=C', 'aromatic'),
-    ('5-CN-1-allyl-imidazol-4-yl', '[*]c1c(C#N)n(CC=C)cn1', 'aromatic'),
-    ('5-OH-1-allyl-pyrazol-3-yl', '[*]c1cc(O)nn1CC=C', 'aromatic'),
-    ('5-OH-1-allyl-pyrazol-4-yl', '[*]c1c(O)nn(c1)CC=C', 'aromatic'),
-    ('5-OH-1-allyl-imidazol-4-yl', '[*]c1c(O)n(CC=C)cn1', 'aromatic'),
-    ('5-OMe-1-allyl-pyrazol-3-yl', '[*]c1cc(OC)nn1CC=C', 'aromatic'),
-    ('5-OMe-1-allyl-pyrazol-4-yl', '[*]c1c(OC)nn(c1)CC=C', 'aromatic'),
-    ('5-OMe-1-allyl-imidazol-4-yl', '[*]c1c(OC)n(CC=C)cn1', 'aromatic'),
-    ('5-NH2-1-allyl-pyrazol-3-yl', '[*]c1cc(N)nn1CC=C', 'aromatic'),
-    ('5-NH2-1-allyl-pyrazol-4-yl', '[*]c1c(N)nn(c1)CC=C', 'aromatic'),
-    ('5-NH2-1-allyl-imidazol-4-yl', '[*]c1c(N)n(CC=C)cn1', 'aromatic'),
-    ('1-tBu-pyrazol-3-yl', '[*]c1ccnn1C(C)(C)C', 'aromatic'),
-    ('1-tBu-pyrazol-4-yl', '[*]c1cnn(c1)C(C)(C)C', 'aromatic'),
-    ('1-tBu-imidazol-4-yl', '[*]c1cn(C(C)(C)C)cn1', 'aromatic'),
-    ('5-Me-1-tBu-pyrazol-3-yl', '[*]c1cc(C)nn1C(C)(C)C', 'aromatic'),
-    ('5-Me-1-tBu-pyrazol-4-yl', '[*]c1c(C)nn(c1)C(C)(C)C', 'aromatic'),
-    ('5-Me-1-tBu-imidazol-4-yl', '[*]c1c(C)n(C(C)(C)C)cn1', 'aromatic'),
-    ('5-Et-1-tBu-pyrazol-3-yl', '[*]c1cc(CC)nn1C(C)(C)C', 'aromatic'),
-    ('5-Et-1-tBu-pyrazol-4-yl', '[*]c1c(CC)nn(c1)C(C)(C)C', 'aromatic'),
-    ('5-Et-1-tBu-imidazol-4-yl', '[*]c1c(CC)n(C(C)(C)C)cn1', 'aromatic'),
-    ('5-F-1-tBu-pyrazol-3-yl', '[*]c1cc(F)nn1C(C)(C)C', 'aromatic'),
-    ('5-F-1-tBu-pyrazol-4-yl', '[*]c1c(F)nn(c1)C(C)(C)C', 'aromatic'),
-    ('5-F-1-tBu-imidazol-4-yl', '[*]c1c(F)n(C(C)(C)C)cn1', 'aromatic'),
-    ('5-Cl-1-tBu-pyrazol-3-yl', '[*]c1cc(Cl)nn1C(C)(C)C', 'aromatic'),
-    ('5-Cl-1-tBu-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)C(C)(C)C', 'aromatic'),
-    ('5-Cl-1-tBu-imidazol-4-yl', '[*]c1c(Cl)n(C(C)(C)C)cn1', 'aromatic'),
-    ('5-CF3-1-tBu-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1C(C)(C)C', 'aromatic'),
-    ('5-CF3-1-tBu-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)C(C)(C)C', 'aromatic'),
-    ('5-CF3-1-tBu-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(C(C)(C)C)cn1', 'aromatic'),
-    ('5-CN-1-tBu-pyrazol-3-yl', '[*]c1cc(C#N)nn1C(C)(C)C', 'aromatic'),
-    ('5-CN-1-tBu-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)C(C)(C)C', 'aromatic'),
-    ('5-CN-1-tBu-imidazol-4-yl', '[*]c1c(C#N)n(C(C)(C)C)cn1', 'aromatic'),
-    ('5-OH-1-tBu-pyrazol-3-yl', '[*]c1cc(O)nn1C(C)(C)C', 'aromatic'),
-    ('5-OH-1-tBu-pyrazol-4-yl', '[*]c1c(O)nn(c1)C(C)(C)C', 'aromatic'),
-    ('5-OH-1-tBu-imidazol-4-yl', '[*]c1c(O)n(C(C)(C)C)cn1', 'aromatic'),
-    ('5-OMe-1-tBu-pyrazol-3-yl', '[*]c1cc(OC)nn1C(C)(C)C', 'aromatic'),
-    ('5-OMe-1-tBu-pyrazol-4-yl', '[*]c1c(OC)nn(c1)C(C)(C)C', 'aromatic'),
-    ('5-OMe-1-tBu-imidazol-4-yl', '[*]c1c(OC)n(C(C)(C)C)cn1', 'aromatic'),
-    ('5-NH2-1-tBu-pyrazol-3-yl', '[*]c1cc(N)nn1C(C)(C)C', 'aromatic'),
-    ('5-NH2-1-tBu-pyrazol-4-yl', '[*]c1c(N)nn(c1)C(C)(C)C', 'aromatic'),
-    ('5-NH2-1-tBu-imidazol-4-yl', '[*]c1c(N)n(C(C)(C)C)cn1', 'aromatic'),
-    ('1-CHF2-pyrazol-3-yl', '[*]c1ccnn1C(F)F', 'aromatic'),
-    ('1-CHF2-pyrazol-4-yl', '[*]c1cnn(c1)C(F)F', 'aromatic'),
-    ('1-CHF2-imidazol-4-yl', '[*]c1cn(C(F)F)cn1', 'aromatic'),
-    ('5-Me-1-CHF2-pyrazol-3-yl', '[*]c1cc(C)nn1C(F)F', 'aromatic'),
-    ('5-Me-1-CHF2-pyrazol-4-yl', '[*]c1c(C)nn(c1)C(F)F', 'aromatic'),
-    ('5-Me-1-CHF2-imidazol-4-yl', '[*]c1c(C)n(C(F)F)cn1', 'aromatic'),
-    ('5-Et-1-CHF2-pyrazol-3-yl', '[*]c1cc(CC)nn1C(F)F', 'aromatic'),
-    ('5-Et-1-CHF2-pyrazol-4-yl', '[*]c1c(CC)nn(c1)C(F)F', 'aromatic'),
-    ('5-Et-1-CHF2-imidazol-4-yl', '[*]c1c(CC)n(C(F)F)cn1', 'aromatic'),
-    ('5-F-1-CHF2-pyrazol-3-yl', '[*]c1cc(F)nn1C(F)F', 'aromatic'),
-    ('5-F-1-CHF2-pyrazol-4-yl', '[*]c1c(F)nn(c1)C(F)F', 'aromatic'),
-    ('5-F-1-CHF2-imidazol-4-yl', '[*]c1c(F)n(C(F)F)cn1', 'aromatic'),
-    ('5-Cl-1-CHF2-pyrazol-3-yl', '[*]c1cc(Cl)nn1C(F)F', 'aromatic'),
-    ('5-Cl-1-CHF2-pyrazol-4-yl', '[*]c1c(Cl)nn(c1)C(F)F', 'aromatic'),
-    ('5-Cl-1-CHF2-imidazol-4-yl', '[*]c1c(Cl)n(C(F)F)cn1', 'aromatic'),
-    ('5-CF3-1-CHF2-pyrazol-3-yl', '[*]c1cc(C(F)(F)F)nn1C(F)F', 'aromatic'),
-    ('5-CF3-1-CHF2-pyrazol-4-yl', '[*]c1c(C(F)(F)F)nn(c1)C(F)F', 'aromatic'),
-    ('5-CF3-1-CHF2-imidazol-4-yl', '[*]c1c(C(F)(F)F)n(C(F)F)cn1', 'aromatic'),
-    ('5-CN-1-CHF2-pyrazol-3-yl', '[*]c1cc(C#N)nn1C(F)F', 'aromatic'),
-    ('5-CN-1-CHF2-pyrazol-4-yl', '[*]c1c(C#N)nn(c1)C(F)F', 'aromatic'),
-    ('5-CN-1-CHF2-imidazol-4-yl', '[*]c1c(C#N)n(C(F)F)cn1', 'aromatic'),
-    ('5-OH-1-CHF2-pyrazol-3-yl', '[*]c1cc(O)nn1C(F)F', 'aromatic'),
-    ('5-OH-1-CHF2-pyrazol-4-yl', '[*]c1c(O)nn(c1)C(F)F', 'aromatic'),
-    ('5-OH-1-CHF2-imidazol-4-yl', '[*]c1c(O)n(C(F)F)cn1', 'aromatic'),
-    ('5-OMe-1-CHF2-pyrazol-3-yl', '[*]c1cc(OC)nn1C(F)F', 'aromatic'),
-    ('5-OMe-1-CHF2-pyrazol-4-yl', '[*]c1c(OC)nn(c1)C(F)F', 'aromatic'),
-    ('5-OMe-1-CHF2-imidazol-4-yl', '[*]c1c(OC)n(C(F)F)cn1', 'aromatic'),
-    ('5-NH2-1-CHF2-pyrazol-3-yl', '[*]c1cc(N)nn1C(F)F', 'aromatic'),
-    ('5-NH2-1-CHF2-pyrazol-4-yl', '[*]c1c(N)nn(c1)C(F)F', 'aromatic'),
-    ('5-NH2-1-CHF2-imidazol-4-yl', '[*]c1c(N)n(C(F)F)cn1', 'aromatic'),
-    ('1,4-dioxanyl', '[*]C1COCCO1', 'polar'),
-    ('C-tetrahydropyranyl', '[*]CC1CCOCC1', 'polar'),
-    ('C-1,4-dioxanyl', '[*]CC1COCCO1', 'polar'),
-    ('CC-tetrahydrofuranyl', '[*]CCC1CCCO1', 'polar'),
-    ('CC-tetrahydropyranyl', '[*]CCC1CCOCC1', 'polar'),
-    ('CC-1,4-dioxanyl', '[*]CCC1COCCO1', 'polar'),
-    ('CCC-piperazinyl', '[*]CCCN1CCNCC1', 'basic'),
-    ('CCC-azepanyl', '[*]CCCN1CCCCCC1', 'basic'),
-    ('CCC-tetrahydrofuranyl', '[*]CCCC1CCCO1', 'polar'),
-    ('CCC-tetrahydropyranyl', '[*]CCCC1CCOCC1', 'polar'),
-    ('CCC-1,4-dioxanyl', '[*]CCCC1COCCO1', 'polar'),
-    ('C(C)-piperazinyl', '[*]C(C)N1CCNCC1', 'basic'),
-    ('C(C)-azepanyl', '[*]C(C)N1CCCCCC1', 'basic'),
-    ('C(C)-tetrahydrofuranyl', '[*]C(C)C1CCCO1', 'polar'),
-    ('C(C)-tetrahydropyranyl', '[*]C(C)C1CCOCC1', 'polar'),
-    ('C(C)-1,4-dioxanyl', '[*]C(C)C1COCCO1', 'polar'),
-    ('CO-piperazinyl', '[*]CON1CCNCC1', 'basic'),
-    ('CO-azepanyl', '[*]CON1CCCCCC1', 'basic'),
-    ('CO-tetrahydrofuranyl', '[*]COC1CCCO1', 'polar'),
-    ('CO-tetrahydropyranyl', '[*]COC1CCOCC1', 'polar'),
-    ('CO-1,4-dioxanyl', '[*]COC1COCCO1', 'polar'),
-    ('CCO-piperazinyl', '[*]CCON1CCNCC1', 'basic'),
-    ('CCO-azepanyl', '[*]CCON1CCCCCC1', 'basic'),
-    ('CCO-tetrahydrofuranyl', '[*]CCOC1CCCO1', 'polar'),
-    ('CCO-tetrahydropyranyl', '[*]CCOC1CCOCC1', 'polar'),
-    ('CCO-1,4-dioxanyl', '[*]CCOC1COCCO1', 'polar'),
-    ('3-OMe-benzyl', '[*]Cc1cccc(OC)c1', 'aromatic'),
-    ('2-F-benzyl', '[*]Cc1ccccc1F', 'aromatic'),
-    ('2-Cl-benzyl', '[*]Cc1ccccc1Cl', 'aromatic'),
-    ('3,4-diF-benzyl', '[*]Cc1ccc(F)c(F)c1', 'aromatic'),
-    ('3,4-diCl-benzyl', '[*]Cc1ccc(Cl)c(Cl)c1', 'aromatic'),
-    ('2,4-diF-benzyl', '[*]Cc1ccc(F)cc1F', 'aromatic'),
-    ('3,5-diF-benzyl', '[*]Cc1cc(F)cc(F)c1', 'aromatic'),
-    ('pentafluorobenzyl', '[*]Cc1c(F)c(F)c(F)c(F)c1F', 'aromatic')
-]
-
-LIBRARY: List[Frag] = []
-_seen_names: set = set()
-for _name, _smi, _cat in _FRAGMENT_ROWS + _EXTENDED_ROWS:
-    if _name in _seen_names:
-        raise ValueError(f"Duplicate fragment name: {_name}")
-    _seen_names.add(_name)
-    _mol = Chem.MolFromSmiles(_smi)
-    if _mol is None:
-        raise ValueError(f"Invalid fragment SMILES {_name}: {_smi}")
-    LIBRARY.append(Frag(_name, _smi, _cat, _merge_goals(_cat)))
-
-BUILTIN_LIBRARY: List[Frag] = list(LIBRARY)
-
-def infer_fragment_size_class(frag_or_smiles) -> str:
-    if isinstance(frag_or_smiles, Frag):
-        if frag_or_smiles.size_class and frag_or_smiles.size_class != "auto":
-            return frag_or_smiles.size_class
-        heavy = frag_or_smiles.heavy
+def analog_tier(n: int) -> str:
+    """Return tier string based on number of analogs."""
+    if n <= 20:
+        return "docking"      # full: docking + download SMI + 3D
+    elif n <= 200:
+        return "pkanet"       # download SMI + pKaNET 3D only
     else:
-        m = Chem.MolFromSmiles(str(frag_or_smiles).replace("[*]", "[H]"))
-        heavy = m.GetNumHeavyAtoms() if m else 99
-    if heavy <= 2:
-        return "small"
-    if heavy <= 5:
-        return "medium"
-    if heavy <= 10:
-        return "large"
-    return "extended"
+        return "smi_only"     # download SMI only
 
 
-def validate_fragment_smiles(smi: str) -> Tuple[bool, str]:
-    if not isinstance(smi, str) or not smi.strip():
-        return False, "empty"
-    mol = Chem.MolFromSmiles(smi.strip())
-    if mol is None:
-        return False, "RDKit parse failed"
-    ndummy = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 0)
-    if ndummy != 1:
-        return False, f"needs exactly one [*], found {ndummy}"
-    try:
-        Chem.SanitizeMol(mol)
-    except Exception as e:
-        return False, f"sanitize failed: {e}"
-    return True, "ok"
+# ─────────────────────────────────────────────────────────────────────────────
+# Page config + global CSS
+# ─────────────────────────────────────────────────────────────────────────────
 
+st.set_page_config(
+    page_title="⌬+⌬ Analog Builder",
+    page_icon=LOGO_URL,
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-def infer_charge_class(smi: str) -> str:
-    mol = Chem.MolFromSmiles(str(smi))
-    if mol is None:
-        return "unknown"
-    q = Chem.GetFormalCharge(mol)
-    if q > 0:
-        return "basic_or_cationic"
-    if q < 0:
-        return "acidic_or_anionic"
-    if any(x in smi for x in ["C(=O)O", "S(=O)(=O)O", "n[nH]nn"]):
-        return "acidic_possible"
-    if any(x in smi for x in ["N", "n1", "n2"]):
-        return "basic_or_hbonding_possible"
-    return "neutral"
-
-
-def annotate_library(lib: List[Frag]) -> None:
-    for f in lib:
-        if f.size_class == "auto":
-            f.size_class = infer_fragment_size_class(f)
-        if f.charge_class == "auto":
-            f.charge_class = infer_charge_class(f.smiles)
-
-
-annotate_library(BUILTIN_LIBRARY)
-
-AVOID_SMARTS = {
-    "nitro": "[N+](=O)[O-]",
-    "aldehyde": "[CX3H1](=O)[#6]",
-    "reactive_acylhalide": "[CX3](=O)[F,Cl,Br,I]",
-    "azide": "[N-]=[N+]=N",
-    "michael_acceptor": "[CX3]=[CX3][CX3]=O",
-    "epoxide": "C1OC1",
+st.markdown("""
+<style>
+/* ── Warm base ── */
+[data-testid="stAppViewContainer"] {
+    background: #FAF7F2;
+}
+[data-testid="stSidebar"] {
+    background: #F0EAE0;
+    border-right: 1px solid #E0D6C8;
 }
 
+/* ── Typography ── */
+html, body, [class*="css"] {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #2C2C2C;
+}
+h1 { font-size: 1.6rem !important; font-weight: 700; color: #2C2C2C; }
+h2 { font-size: 1.2rem !important; font-weight: 600; color: #2C2C2C; }
+h3 { font-size: 1.0rem !important; font-weight: 600; color: #3D7A74; }
+
+/* ── Primary button: amber ── */
+[data-testid="stButton"] > button[kind="primary"] {
+    background: #E8A020 !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    padding: 0.5rem 1.4rem !important;
+}
+[data-testid="stButton"] > button[kind="primary"]:hover {
+    background: #C88010 !important;
+}
+
+/* ── Secondary button ── */
+[data-testid="stButton"] > button {
+    border-radius: 8px !important;
+    border: 1px solid #C8B89A !important;
+    background: #FAF7F2 !important;
+    color: #2C2C2C !important;
+}
+
+/* ── Mode cards — clickable ── */
+/* ── Mode cards — card = stMarkdown div + button fused visually ── */
+/* Equal height columns */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col) {
+    align-items: stretch !important;
+}
+/* The stVerticalBlock inside each column: flex so card+button fill height */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"] {
+    display: flex !important;
+    flex-direction: column !important;
+    height: 100% !important;
+}
+/* stMarkdownContainer must also stretch to fill available height */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stMarkdownContainer"] {
+    display: flex !important;
+    flex-direction: column !important;
+    flex: 1 !important;
+}
+/* Card content div fills the stMarkdownContainer */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stMarkdownContainer"]
+    > .mode-card-col {
+    flex: 1 !important;
+}
+/* Card content div */
+.mode-card-col {
+    background: #FFFFFF;
+    border: 2px solid #E0D6C8;
+    border-bottom: none;
+    border-radius: 14px 14px 0 0;
+    padding: 2rem 1.5rem 1.2rem;
+    text-align: center;
+    flex: 1;
+    min-height: 220px;
+    box-sizing: border-box;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+/* Hover: target the stMarkdown wrapper so hovering card highlights border */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]:hover .mode-card-col {
+    border-color: #E8A020;
+}
+/* stMarkdown wrapper that contains mode-card-col: remove its own border/bg */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stMarkdownContainer"] {
+    flex: 1 !important;
+    display: flex !important;
+    flex-direction: column !important;
+}
+/* Button container: no gap between card div and button */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stButton"] {
+    margin-top: 0 !important;
+}
+/* Button styling: bottom half of card */
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stButton"] > button {
+    background: #E8A020 !important;
+    color: #fff !important;
+    border: 2px solid #E8A020 !important;
+    border-top: none !important;
+    border-radius: 0 0 14px 14px !important;
+    font-weight: 600 !important;
+    padding: 0.7rem 1.2rem !important;
+    width: 100% !important;
+    cursor: pointer !important;
+    font-size: 0.95rem !important;
+}
+div[data-testid="stHorizontalBlock"]:has(.mode-card-col)
+    > div[data-testid="stColumn"]
+    > div[data-testid="stVerticalBlock"]
+    > div[data-testid="stButton"] > button:hover {
+    background: #C88010 !important;
+    border-color: #C88010 !important;
+}
+
+/* ── Step progress in sidebar ── */
+.step-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 10px;
+    border-radius: 8px;
+    margin-bottom: 4px;
+    font-size: 0.88rem;
+    color: #6B5E4E;
+    cursor: pointer;
+}
+.step-item.active {
+    background: #E8A020;
+    color: #fff;
+    font-weight: 600;
+}
+.step-item.done {
+    color: #3D7A74;
+    font-weight: 500;
+}
+.step-dot {
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: #E0D6C8;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.75rem; font-weight: 700; flex-shrink: 0;
+    color: #6B5E4E;
+}
+.step-item.active .step-dot { background: rgba(255,255,255,0.3); color: #fff; }
+.step-item.done .step-dot { background: #3D7A74; color: #fff; }
+
+/* ── Hint text ── */
+.hint { color: #8B7355; font-size: 0.82rem; margin-top: -6px; margin-bottom: 10px; }
+
+/* ── Info cards ── */
+.info-card {
+    background: #FFF8EE;
+    border-left: 3px solid #E8A020;
+    border-radius: 0 8px 8px 0;
+    padding: 0.7rem 1rem;
+    margin: 0.5rem 0 1rem;
+    font-size: 0.88rem;
+    color: #5A4A35;
+}
+
+/* ── Tier badge ── */
+.tier-badge {
+    display: inline-block;
+    padding: 0.25rem 0.75rem;
+    border-radius: 20px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    margin-left: 8px;
+    vertical-align: middle;
+}
+.tier-docking  { background: #E6F4EA; color: #1E7E34; border: 1px solid #B7DEC0; }
+.tier-pkanet   { background: #FFF3CD; color: #856404; border: 1px solid #FFE083; }
+.tier-smi-only { background: #F8D7DA; color: #842029; border: 1px solid #F5C2C7; }
+
+/* ── Metric row ── */
+.metric-row {
+    display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0;
+}
+.metric-box {
+    background: #fff;
+    border: 1px solid #E0D6C8;
+    border-radius: 10px;
+    padding: 0.8rem 1.2rem;
+    min-width: 120px;
+    text-align: center;
+}
+.metric-box .val { font-size: 1.5rem; font-weight: 700; color: #E8A020; }
+.metric-box .lbl { font-size: 0.78rem; color: #8B7355; margin-top: 2px; }
+
+/* ── Dataframe tweaks ── */
+[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
+
+/* ── Expander (Advanced) ── */
+[data-testid="stExpander"] summary {
+    font-size: 0.85rem;
+    color: #8B7355;
+}
+
+/* ── Fixed page footer ── */
+.page-footer {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    background: #F0EAE0;
+    border-top: 1px solid #E0D6C8;
+    padding: 6px 20px;
+    font-size: 0.75rem;
+    color: #A89070;
+    z-index: 999;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.page-footer a { color: #A89070; text-decoration: none; }
+.page-footer a:hover { color: #E8A020; }
+
+/* ── Mode tab bar ── */
+.main .block-container div[data-testid="stHorizontalBlock"]:first-of-type
+    button {
+    background: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
+    border-bottom: 3px solid transparent !important;
+    color: #8B7355 !important;
+    font-size: 1rem !important;
+    font-weight: 500 !important;
+    padding: 0.55rem 0.2rem !important;
+    box-shadow: none !important;
+}
+.main .block-container div[data-testid="stHorizontalBlock"]:first-of-type
+    button:hover {
+    color: #2C2C2C !important;
+    background: transparent !important;
+}
+.main .block-container div[data-testid="stHorizontalBlock"]:first-of-type
+    button[kind="primary"] {
+    background: transparent !important;
+    color: #2C2C2C !important;
+    border-bottom: 3px solid #E8A020 !important;
+    font-weight: 700 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown(
+    '<div class="page-footer">' +
+    '⌬+⌬ Analog Builder &nbsp;—&nbsp;' +
+    '<a href="mailto:kowith@ccs.tsukuba.ac.jp">kowith@ccs.tsukuba.ac.jp</a>' +
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session state
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULTS = {
+    "mode": None,
+    "step": 1,
+    "parent_smiles": "",
+    "parent_name": "compound",
+    "parent_mol": None,
+    "receptor_path": None,
+    "protein_path": None,
+    "complex_path": None,
+    "ref_ligand_path": None,
+    "selected_atoms": set(),
+    "concerted": False,
+    "allow_heteroatom_H": False,
+    "risk": "Moderate",
+    "n_analogs": 20,
+    "rank_by": "Overall drug-likeness (recommended)",
+    "rank_code": "Balanced (100-pt weights)",
+    "weights": {"potency": 30, "selectivity": 10, "solubility": 25,
+                "metabolic": 15, "synthesis": 10, "novelty": 10},
+    "categories_on": {k: True for k in core.CATEGORY_BASE_GOALS},
+    "max_MW": 600.0,
+    "avoid_nitro": True,
+    "avoid_aldehyde": True,
+    "avoid_reactive": True,
+    "avoid_toxic": True,
+    "custom_frags_text": "",
+    "pocket_residue_text": "",
+    "accept_pocket_suggestions": True,
+    "max_pocket_frags": 6,
+    "pocket_frags": [],
+    "analogs_df": None,
+    "docking_ligands": None,
+    "_void_subpockets": [],
+    "_void_mode": "",
+    "_void_size_filter": None,
+    "struct_mode": "A",
+    "_plip_df": None,            # PLIP interaction table (parent ligand)
+    "_plip_tag_counts": {},      # residue tags from PLIP
+    "_plip_rec": None,           # unified recommendation dict
+    "_plip_parent_feats": [],    # cIFP features of parent
+    "_analog_plip": {},          # {compound: [features]} for analogs
+    "_cifp_comparison": None,    # compare_cifp DataFrame          # "A" = co-crystal complex | "B" = ligand+protein
+    "modeB_docked": False,       # True after Mode B docking completed
+    "modeB_complex_path": None,  # path to pseudo-complex (protein + docked pose)
+    "docking_summary": None,
+    "cifp_results": None,
+    "work_dir": None,
+}
+
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+def get_work_dir() -> Path:
+    if st.session_state.work_dir is None:
+        st.session_state.work_dir = Path(tempfile.mkdtemp(prefix="analog_"))
+    return Path(st.session_state.work_dir)
+
+
+def go(step: int):
+    st.session_state.step = step
+    st.rerun()
+
+
+def hint(text: str):
+    st.markdown(f'<p class="hint">💡 {text}</p>', unsafe_allow_html=True)
+
+
+def info_card(text: str):
+    st.markdown(f'<div class="info-card">{text}</div>', unsafe_allow_html=True)
+
 
 # ---------------------------------------------------------------------------
-# Molecule drawing
+# 3D Viewer helpers (adapted from ACD / anyonecandock)
 # ---------------------------------------------------------------------------
 
-def draw_mol_svg(mol: Chem.Mol, highlight: Optional[List[int]] = None, size=(560, 460)) -> str:
-    highlight = list(highlight or [])
-    d = rdMolDraw2D.MolDraw2DSVG(*size)
-    o = d.drawOptions()
-    o.addAtomIndices = True
-    o.annotationFontScale = 0.8
-    rdMolDraw2D.PrepareAndDrawMolecule(
-        d,
-        mol,
-        highlightAtoms=highlight,
-        highlightAtomColors={i: (1.0, 0.6, 0.6) for i in highlight},
+def _viewer_bg() -> str:
+    """Return background colour for py3Dmol canvas."""
+    try:
+        theme = st.get_option("theme.base")
+        return "#1a1a2e" if theme == "dark" else "#f8f6f2"
+    except Exception:
+        return "#f8f6f2"
+
+
+def show3d(view, height: int = 480):
+    """Render a py3Dmol view via components.html (no stmol dependency)."""
+    import re as _re
+    try:
+        raw  = view._make_html()
+        resp = _re.sub(r'(width\s*[:=]\s*)["\'\']?\d+px?["\'\']?', r'\g<1>100%', raw)
+        st.iframe(
+            f'<div style="width:100%;overflow:hidden">{resp}</div>',
+            height=height, scrolling=False,
+        )
+    except Exception as _e:
+        st.warning(f"3D viewer render error: {_e}")
+
+
+def render_complex_3d(
+    receptor_pdb: str,
+    pose_mol,                   # RDKit Mol with 3D conformer
+    height: int = 500,
+    cutoff: float = 4.0,
+    show_labels: bool = True,
+    show_surface: bool = False,
+    ref_ligand_pdb: str = "",   # co-crystal / reference ligand (magenta)
+    key_prefix: str = "v3d",
+):
+    """
+    Render protein–ligand complex in 3D using py3Dmol.
+
+    Protein  → cartoon, spectrum colouring, 45% opacity
+    Ligand   → cyan sticks
+    Pocket residues (≤ cutoff Å) → orange sticks + optional labels
+    Reference ligand → magenta sticks (if provided)
+    """
+    try:
+        import py3Dmol
+        from rdkit import Chem
+
+        v  = py3Dmol.view(width="100%", height=height)
+        v.setBackgroundColor(_viewer_bg())
+        mi = 0
+
+        # ── Protein ─────────────────────────────────────────────────────
+        if receptor_pdb and os.path.exists(receptor_pdb):
+            v.addModel(open(receptor_pdb).read(), "pdb")
+            v.setStyle({"model": mi}, {
+                "cartoon": {"color": "spectrum", "opacity": 0.45}
+            })
+            if show_surface:
+                v.addSurface(py3Dmol.SAS,
+                             {"opacity": 0.40, "color": "white"},
+                             {"model": mi})
+            mi += 1
+
+        # ── Reference / co-crystal ligand (magenta) ──────────────────────
+        if ref_ligand_pdb and os.path.exists(ref_ligand_pdb):
+            v.addModel(open(ref_ligand_pdb).read(), "pdb")
+            v.setStyle({"model": mi}, {
+                "stick": {"colorscheme": "magentaCarbon", "radius": 0.18}
+            })
+            mi += 1
+
+        # ── Docked / query ligand (cyan) ──────────────────────────────────
+        if pose_mol is not None:
+            mol_block = Chem.MolToMolBlock(pose_mol)
+            v.addModel(mol_block, "mol")
+            lig_m = mi
+            v.setStyle({"model": lig_m}, {
+                "stick": {"colorscheme": "cyanCarbon", "radius": 0.30}
+            })
+            v.addSphere({"center": {"x": 0, "y": 0, "z": 0}, "radius": 0.01,
+                         "model": lig_m, "opacity": 0})  # anchor for zoomTo
+
+            # ── Pocket residues (orange sticks + labels) ─────────────────
+            if receptor_pdb and os.path.exists(receptor_pdb):
+                interacting = core.get_interacting_residues(
+                    receptor_pdb, pose_mol, cutoff=cutoff)
+                for rb in interacting:
+                    sel = {"model": 0, "resi": rb["resi"]}
+                    if rb["chain"] and rb["chain"].strip():
+                        sel["chain"] = rb["chain"]
+                    v.setStyle(sel, {
+                        "stick": {"colorscheme": "orangeCarbon", "radius": 0.20}
+                    })
+                    if show_labels:
+                        chain_str = rb["chain"] if rb["chain"].strip() else ""
+                        v.addLabel(
+                            f"{rb['resn']}{rb['resi']}{chain_str}",
+                            {"fontSize": 11, "fontColor": "yellow",
+                             "backgroundColor": "black",
+                             "backgroundOpacity": 0.65,
+                             "inFront": True, "showBackground": True},
+                            sel,
+                        )
+            v.zoomTo({"model": lig_m})
+        else:
+            v.zoomTo()
+
+        show3d(v, height=height)
+
+    except ImportError:
+        st.info("Install `py3Dmol` to enable 3D viewer: `pip install py3Dmol`")
+    except Exception as _e:
+        st.warning(f"3D viewer error: {_e}")
+
+
+def tier_badge_html(tier: str) -> str:
+    if tier == "docking":
+        return '<span class="tier-badge tier-docking">✅ Full: Docking + pKaNET + SMI</span>'
+    elif tier == "pkanet":
+        return '<span class="tier-badge tier-pkanet">⚡ pKaNET + SMI (no docking)</span>'
+    else:
+        return '<span class="tier-badge tier-smi-only">📄 SMI only</span>'
+
+
+def show_mol(mol, highlight=None, size=(400, 300), width='stretch', atom_indices=False):
+    if mol is None:
+        return
+    try:
+        AllChem.Compute2DCoords(mol)
+        if atom_indices:
+            from rdkit.Chem.Draw import rdMolDraw2D as _d2d
+            d = _d2d.MolDraw2DCairo(*size)
+            o = d.drawOptions()
+            o.addAtomIndices = True
+            o.annotationFontScale = 0.7
+            _d2d.PrepareAndDrawMolecule(
+                d, mol,
+                highlightAtoms=list(highlight or []),
+                highlightAtomColors={i: (1.0, 0.6, 0.6) for i in (highlight or [])},
+            )
+            d.FinishDrawing()
+            png = d.GetDrawingText()
+        else:
+            png = Draw.MolsToGridImage(
+                [mol], molsPerRow=1,
+                subImgSize=size,
+                highlightAtomLists=[list(highlight or [])],
+                returnPNG=True,
+            )
+        st.image(png, width='stretch')
+    except Exception:
+        st.caption("(Could not render structure)")
+
+
+def _load_receptor_widget(key_prefix: str = "") -> None:
+    """Reusable receptor loader widget (search / PDB ID / upload)."""
+    rec_src = st.radio(
+        "Load receptor from",
+        ["🔍 Search RCSB", "#️⃣ PDB ID", "📁 Upload file"],
+        horizontal=True,
+        key=f"rec_src_{key_prefix}",
     )
-    d.FinishDrawing()
-    return d.GetDrawingText()
+
+    if rec_src == "🔍 Search RCSB":
+        rcsb_query = st.text_input(
+            "Search RCSB PDB", value="",
+            placeholder="e.g. EGFR kinase, JAK2, insulin receptor",
+            key=f"rcsb_search_q_{key_prefix}",
+        )
+        hint("Search by protein name, gene, UniProt ID, or keyword.")
+        if st.button("Search RCSB", key=f"rcsb_search_btn_{key_prefix}") and rcsb_query.strip():
+            with st.spinner("Searching RCSB PDB…"):
+                st.session_state[f"_rcsb_results_{key_prefix}"] = core.search_rcsb(rcsb_query.strip(), max_results=8)
+        rcsb_results = st.session_state.get(f"_rcsb_results_{key_prefix}", [])
+        if rcsb_results:
+            st.markdown(f"**{len(rcsb_results)} results**")
+            for r in rcsb_results:
+                cols = st.columns([1, 6, 2])
+                with cols[0]:
+                    st.markdown(f"**{r['id']}**")
+                with cols[1]:
+                    st.caption(f"{r['title']}")
+                    st.caption(f"{r['resolution']} · {r['method']} · {r['organism']}")
+                with cols[2]:
+                    if st.button("Use", key=f"rcsb_use_{r['id']}_{key_prefix}"):
+                        with st.spinner(f"Downloading {r['id']}…"):
+                            try:
+                                work = get_work_dir()
+                                path = core.download_pdb(r["id"], work)
+                                prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                                st.session_state.receptor_path   = path
+                                st.session_state.protein_path    = prot
+                                st.session_state.ref_ligand_path = lig
+                                if lig:  # co-crystal complex
+                                    st.session_state.complex_path = path
+                                st.success(f"Receptor loaded ({r['id']}) ✅")
+                            except Exception as e:
+                                st.error(f"Could not download: {e}")
+
+    elif rec_src == "#️⃣ PDB ID":
+        pdb_id = st.text_input("4-letter PDB ID", value="", max_chars=4,
+                               placeholder="e.g. 1M17", key=f"pdb_id_{key_prefix}")
+        hint("Example: 1M17 is EGFR, 6VXX is SARS-CoV-2 spike.")
+        if st.button("Load receptor", key=f"load_rec_{key_prefix}") and pdb_id.strip():
+            with st.spinner("Downloading from RCSB…"):
+                try:
+                    work = get_work_dir()
+                    path = core.download_pdb(pdb_id.strip().upper(), work)
+                    prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                    st.session_state.receptor_path   = path
+                    st.session_state.protein_path    = prot
+                    st.session_state.ref_ligand_path = lig
+                    if lig:
+                        st.session_state.complex_path = path
+                    st.success(f"Receptor loaded ({pdb_id.upper()}) ✅")
+                except Exception as e:
+                    st.error(f"Could not download: {e}")
+
+    else:  # Upload file
+        up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"],
+                               key=f"rec_upload_{key_prefix}")
+        if up:
+            work = get_work_dir()
+            raw = work / up.name
+            raw.write_bytes(up.read())
+            try:
+                path = core.cif_to_pdb_if_needed(str(raw))
+                prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                st.session_state.receptor_path   = path
+                st.session_state.protein_path    = prot
+                st.session_state.ref_ligand_path = lig
+                if lig:
+                    st.session_state.complex_path = path
+                st.success("Receptor uploaded ✅")
+            except Exception as e:
+                st.error(f"Could not process file: {e}")
+
+    if st.session_state.receptor_path:
+        st.success(f"✅ Receptor: `{Path(st.session_state.receptor_path).name}`")
+        if st.session_state.ref_ligand_path:
+            st.info("Co-crystal ligand detected (Mode A ready)")
 
 
-def attachable_atom_indices(mol: Chem.Mol, carbon_only: bool = False) -> List[int]:
-    return [
-        a.GetIdx()
-        for a in mol.GetAtoms()
-        if a.GetTotalNumHs() > 0 and (not carbon_only or a.GetAtomicNum() == 6)
+def _render_step1_receptor_and_continue(smiles: str, name: str):
+    """Step 1 footer: confirmation + continue button for all tracks."""
+    md = st.session_state.mode
+
+    if md == "structure":
+        # Receptor loading already handled in the step==1 block above.
+        # Just show a compact status line.
+        if st.session_state.receptor_path:
+            sc = "A" if st.session_state.ref_ligand_path else "B"
+            mode_label = "Co-crystal (Mode A)" if sc == "A" else "Apo / docking (Mode B)"
+            st.caption(
+                f"🧬 Receptor: `{Path(st.session_state.receptor_path).name}` · {mode_label}"
+            )
+
+    st.write("")
+    if md == "structure" and not st.session_state.receptor_path:
+        st.warning("⚠️ Load a protein structure above before continuing.")
+
+    ready = bool(smiles and smiles.strip()) and (
+        md != "structure" or bool(st.session_state.receptor_path)
+    )
+    if st.button("Load compound & continue →", type="primary", disabled=not ready):
+        mol = Chem.MolFromSmiles(smiles.strip())
+        if mol is None:
+            st.error("That SMILES doesn\'t look right. Check for typos.")
+        else:
+            AllChem.Compute2DCoords(mol)
+            st.session_state.parent_smiles  = smiles.strip()
+            st.session_state.parent_name    = name.strip() or "compound"
+            st.session_state.parent_mol     = mol
+            st.session_state.selected_atoms = set()
+            st.session_state.analogs_df     = None
+            st.session_state.modeB_docked   = False
+            st.session_state.modeB_complex_path = None
+            go(2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar – progress tracker
+# ─────────────────────────────────────────────────────────────────────────────
+
+LIGAND_STEPS = ["Parent compound", "Choose atoms", "Design options", "View results", "Docking", "Export"]
+STRUCT_STEPS = ["Parent + receptor", "Choose atoms", "Pocket guidance", "View results", "Docking & cIFP", "Export"]
+
+
+def render_sidebar():
+    st.sidebar.markdown(
+        '<style>[data-testid="stSidebar"] [data-testid="stImage"] {text-align: center;}</style>',
+        unsafe_allow_html=True,
+    )
+    st.sidebar.image(LOGO_URL, width=160)
+    st.sidebar.markdown(
+        '<p style="text-align:center;font-size:0.78rem;color:#8B7355;margin-top:-8px;">Ligand design for everyone</p>',
+        unsafe_allow_html=True,
+    )
+    st.sidebar.divider()
+
+    mode = st.session_state.mode
+    if mode is None:
+        st.sidebar.markdown('<p style="color:#8B7355;font-size:0.85rem;">Select a mode to begin.</p>',
+                            unsafe_allow_html=True)
+        return
+
+    steps = LIGAND_STEPS if mode == "ligand" else STRUCT_STEPS
+    current = st.session_state.step
+
+    _mode_icon = LB_URL if mode == "ligand" else SB_URL
+    _mode_name = "Ligand-based" if mode == "ligand" else "Structure-based"
+    st.sidebar.markdown(
+        f'<p style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.08em;'
+        f'color:#8B7355;margin-bottom:8px;">'
+        f'<img src="{_mode_icon}" width="16" style="vertical-align:middle;margin-right:4px;"/>'
+        f'{_mode_name} track</p>',
+        unsafe_allow_html=True
+    )
+
+    for i, label in enumerate(steps, start=1):
+        cls = "active" if i == current else ("done" if i < current else "")
+        if st.sidebar.button(
+            f"{'●' if i == current else ('✓' if i < current else str(i))}  {label}",
+            key=f"nav_{i}",
+            width='stretch',
+            type="primary" if i == current else "secondary",
+        ):
+            if i < current or (i == current + 1 and _step_complete(current)):
+                go(i)
+
+    st.sidebar.divider()
+
+    # Show tier info in sidebar if analogs generated
+    df_sb = st.session_state.analogs_df
+    if df_sb is not None and not df_sb.empty:
+        n_sb = len(df_sb)
+        tier_sb = analog_tier(n_sb)
+        tier_labels = {
+            "docking": "🟢 Docking enabled",
+            "pkanet": "🟡 pKaNET + SMI",
+            "smi_only": "🔴 SMI download only",
+        }
+        st.sidebar.markdown(
+            f'<div style="background:#FFF8EE;border-radius:8px;padding:0.5rem 0.75rem;'
+            f'font-size:0.78rem;color:#5A4A35;margin-bottom:8px;">'
+            f'<strong>{n_sb} analogs</strong><br>{tier_labels[tier_sb]}</div>',
+            unsafe_allow_html=True,
+        )
+
+    if st.sidebar.button("↩ Change mode", width='stretch'):
+        st.session_state.mode = None
+        st.session_state.step = 1
+        st.session_state.parent_mol = None
+        st.session_state.analogs_df = None
+        st.rerun()
+
+    st.sidebar.caption(f"Fragment library: {len(core.LIBRARY):,} groups")
+    st.sidebar.divider()
+    st.sidebar.markdown(
+        '<p style="font-size:0.75rem;color:#A89070;line-height:1.5;margin:0;">'
+        '⌬+⌬ Analog Builder<br>'
+        '<a href="mailto:kowith@ccs.tsukuba.ac.jp" style="color:#A89070;">kowith@ccs.tsukuba.ac.jp</a>'
+        '</p>',
+        unsafe_allow_html=True,
+    )
+
+
+def _step_complete(step: int) -> bool:
+    if step == 1:
+        return st.session_state.parent_mol is not None
+    if step == 2:
+        return len(st.session_state.selected_atoms) > 0
+    if step == 3:
+        return True
+    if step == 4:
+        return st.session_state.analogs_df is not None
+    return True
+
+
+render_sidebar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LANDING – mode picker  (clickable cards)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if st.session_state.mode is None:
+    st.markdown(
+        f'<div style="text-align:center;margin:40px 0 8px;">'
+        f'<img src="{LOGO_URL}" width="260" style="display:inline-block;"/>'
+        f'</div>'
+        f'<p style="text-align:center;color:#8B7355;margin-bottom:28px;">'
+        f'Design new drug candidates by modifying a parent compound. Choose how you want to work:</p>',
+        unsafe_allow_html=True,
+    )
+
+    col_l, col_r = st.columns(2, gap="large")
+
+    with col_l:
+        # Card content + button in one visual unit
+        # CSS wraps both into a single card appearance
+        st.markdown(
+            f'<div class="mode-card-col" id="card-ligand">'
+            f'<img src="{LB_URL}" width="90" style="display:block;margin:0 auto 0.75rem;"/>'
+            f'<div style="font-size:1.15rem;font-weight:700;color:#2C2C2C;margin-bottom:0.4rem;">Ligand-based</div>'
+            f'<div style="font-size:0.88rem;color:#6B5E4E;line-height:1.55;">'
+            f'Start with just a SMILES string.<br>'
+            f'Great for exploring substitutions quickly — no protein structure needed.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Select Ligand-based →", key="pick_ligand", width='stretch', type="primary"):
+            st.session_state.mode = "ligand"
+            st.session_state.step = 1
+            st.rerun()
+
+    with col_r:
+        st.markdown(
+            f'<div class="mode-card-col" id="card-structure">'
+            f'<img src="{SB_URL}" width="90" style="display:block;margin:0 auto 0.75rem;"/>'
+            f'<div style="font-size:1.15rem;font-weight:700;color:#2C2C2C;margin-bottom:0.4rem;">Structure-based</div>'
+            f'<div style="font-size:0.88rem;color:#6B5E4E;line-height:1.55;">'
+            f'Upload or fetch a protein structure.<br>'
+            f'Analogs are guided by the actual binding pocket environment.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Select Structure-based →", key="pick_struct", width='stretch', type="primary"):
+            st.session_state.mode = "structure"
+            st.session_state.step = 1
+            st.rerun()
+
+    st.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mode tab bar
+# ─────────────────────────────────────────────────────────────────────────────
+
+mode  = st.session_state.mode
+step  = st.session_state.step
+
+
+def switch_mode(new_mode: str):
+    if new_mode == st.session_state.mode:
+        return
+    st.session_state.mode = new_mode
+    new_len = len(LIGAND_STEPS if new_mode == "ligand" else STRUCT_STEPS)
+    st.session_state.step = min(st.session_state.step, new_len)
+    st.rerun()
+
+
+tab_l, tab_r = st.columns(2)
+with tab_l:
+    st.markdown(
+        f'<div style="text-align:center;margin-bottom:-8px;">'
+        f'<img src="{LB_URL}" width="70" style="opacity:{1.0 if mode=="ligand" else 0.4};"/></div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("Ligand-based", key="tab_ligand", width='stretch',
+                 type="primary" if mode == "ligand" else "secondary"):
+        switch_mode("ligand")
+with tab_r:
+    st.markdown(
+        f'<div style="text-align:center;margin-bottom:-8px;">'
+        f'<img src="{SB_URL}" width="70" style="opacity:{1.0 if mode=="structure" else 0.4};"/></div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("Structure-based", key="tab_structure", width='stretch',
+                 type="primary" if mode == "structure" else "secondary"):
+        switch_mode("structure")
+
+st.markdown('<hr style="margin:0.2rem 0 1.2rem 0;border:none;border-top:1px solid #E0D6C8;">',
+            unsafe_allow_html=True)
+
+mode  = st.session_state.mode
+step  = st.session_state.step
+steps = LIGAND_STEPS if mode == "ligand" else STRUCT_STEPS
+
+st.markdown(
+    f'<p style="font-size:0.8rem;color:#8B7355;margin-bottom:0;">'
+    f'Step {step} of {len(steps)}: <strong>{steps[step-1]}</strong></p>',
+    unsafe_allow_html=True
+)
+st.markdown(f"## {steps[step-1]}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 – Parent compound
+# ─────────────────────────────────────────────────────────────────────────────
+
+if step == 1:
+    md = st.session_state.mode   # alias used throughout Step 1
+    # ── Structure track: show receptor loader FIRST ───────────────────────────
+    if mode == "structure":
+        st.markdown("### Step 1A — Load protein structure")
+        info_card(
+            "Load your protein from RCSB or upload a PDB file. "
+            "The app will <strong>auto-detect</strong> whether it contains a bound ligand."
+        )
+        _load_receptor_widget(key_prefix="struct")
+
+        if st.session_state.receptor_path:
+            has_lig = bool(st.session_state.ref_ligand_path)
+            if has_lig:
+                st.success(
+                    f"✅ **Co-crystal ligand detected** in "
+                    f"`{Path(st.session_state.receptor_path).name}`"
+                )
+                _extracted_smi = core.ligand_pdb_to_smiles(
+                    st.session_state.ref_ligand_path)
+                if _extracted_smi:
+                    st.session_state["_modeA_extracted_smiles"] = _extracted_smi
+
+                _col_smi, _col_opt = st.columns([3, 2])
+                with _col_smi:
+                    if _extracted_smi:
+                        st.markdown("**Co-crystal ligand SMILES (auto-extracted):**")
+                        st.code(_extracted_smi, language=None)
+                        if st.button("Use as parent compound ↑", key="use_extracted"):
+                            st.session_state.parent_smiles = _extracted_smi
+                            st.rerun()
+                with _col_opt:
+                    st.markdown("**What would you like to do?**")
+                    _dock_choice = st.radio(
+                        "Docking option",
+                        [
+                            "Use this complex as-is — skip docking",
+                            "Dock my own ligand into this protein instead",
+                        ],
+                        index=0,
+                        key="complex_dock_choice",
+                        label_visibility="collapsed",
+                    )
+                    if _dock_choice.startswith("Use this complex"):
+                        st.session_state.struct_mode = "A"
+                        st.caption("✅ Co-crystal pose will be used directly.")
+                    else:
+                        st.session_state.struct_mode = "B"
+                        st.caption("ℹ️ ACD will dock your ligand after Step 2.")
+            else:
+                st.session_state.struct_mode = "B"
+                st.info(
+                    f"**Apo structure** — `{Path(st.session_state.receptor_path).name}`  \n"
+                    "No bound ligand. ACD docking will run automatically after Step 2."
+                )
+
+        st.markdown("---")
+
+    # ── If Mode A and SMILES already extracted, skip full radio ─────────
+    _modeA_smi = st.session_state.get("_modeA_extracted_smiles", "")
+    _is_modeA_auto = (md == "structure"
+                      and st.session_state.get("struct_mode") == "A"
+                      and bool(_modeA_smi))
+
+    # Only show Step 1B header when parent SMILES still needs user input
+    if md == "structure" and not _is_modeA_auto:
+        st.markdown("### Step 1B — Parent compound")
+
+    # Defaults — overridden below when user can choose input method
+    input_tab    = "⌨️ Paste SMILES"
+    draw_mode    = False
+    paste_mode   = True
+    pubchem_mode = False
+
+    if _is_modeA_auto:
+        # Show compact SMILES confirmation — no radio needed
+        st.markdown(
+            f'<div style="background:#F0F9F0;border:1.5px solid #C3E6CB;border-radius:10px;'
+            f'padding:0.9rem 1.2rem;margin-bottom:0.6rem;">'
+            f'<div style="font-size:0.78rem;font-weight:600;color:#1E7E34;margin-bottom:4px;">'
+            f'✅ Parent compound — extracted from co-crystal PDB</div>'
+            f'<code style="font-size:0.8rem;color:#155724;word-break:break-all;">{_modeA_smi}</code>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("✏️ Use a different SMILES instead", key="modeA_override_smi"):
+            st.session_state["_modeA_extracted_smiles"] = ""
+            st.rerun()
+        smiles_input  = _modeA_smi
+        draw_mode     = False
+        paste_mode    = False
+        pubchem_mode  = False
+        # Pre-fill session so continue button works
+        if not st.session_state.get("parent_smiles"):
+            st.session_state.parent_smiles = _modeA_smi
+    else:
+        input_options = ["🔍 Search PubChem", "⌨️ Paste SMILES", "✏️ Draw it"]
+        input_tab = st.radio(
+            "How do you want to enter your compound?",
+            input_options,
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        draw_mode    = (input_tab == "✏️ Draw it") and _KETCHER_OK
+        paste_mode   = (input_tab == "⌨️ Paste SMILES") or (input_tab == "✏️ Draw it" and not _KETCHER_OK)
+        pubchem_mode = (input_tab == "🔍 Search PubChem")
+
+    if pubchem_mode:
+        pc_col1, pc_col2 = st.columns([5, 1])
+        with pc_col1:
+            pc_query = st.text_input("Compound name",
+                placeholder="e.g. imatinib, apigenin, caffeine, aspirin…", key="pubchem_query")
+        with pc_col2:
+            st.markdown("<div style='height:1.75rem;'></div>", unsafe_allow_html=True)
+            pc_search = st.button("Search", key="pc_search_btn", type="secondary")
+
+        if pc_search and pc_query.strip():
+            with st.spinner(f"Searching PubChem for '{pc_query.strip()}'…"):
+                _sr = core.search_pubchem(pc_query.strip())
+                st.session_state["_pc_result"] = _sr
+                if _sr.get("found") and (_sr.get("smiles") or "").strip():
+                    st.session_state["smiles_in_pc"] = _sr["smiles"]
+                    _auto_name = (_sr["iupac"] or pc_query)[:20].lower().replace(" ", "_")
+                    st.session_state["pc_compound_name"] = _auto_name
+                    st.session_state.parent_smiles = _sr["smiles"]
+                    st.session_state.parent_name = _auto_name
+                    st.rerun()
+
+        _sr = st.session_state.get("_pc_result")
+        if _sr and _sr.get("found"):
+            _ic, _imgc = st.columns([3, 1])
+            with _ic:
+                st.markdown(
+                    f"**{_sr['iupac']}**  \n"
+                    f"`{_sr['formula']}` · {_sr['mw']:.2f} g/mol · "
+                    f"[PubChem CID {_sr['cid']}]({_sr['url']})"
+                )
+            with _imgc:
+                st.image(_sr["img_url"], width=140)
+            if not (_sr.get("smiles") or "").strip():
+                st.warning("This PubChem result did not return a usable SMILES string.")
+        elif _sr and not _sr.get("found"):
+            st.error(f"Not found: {_sr.get('error', 'Unknown error')}")
+
+        smiles = st.text_input("SMILES string", value=st.session_state.parent_smiles,
+            key="smiles_in_pc", help="Auto-filled from PubChem search, or paste your own SMILES here.")
+        st.session_state.parent_smiles = smiles
+        name = st.text_input("Compound name", value=st.session_state.parent_name, key="pc_compound_name")
+        hint("Used to label your output files.")
+        _render_step1_receptor_and_continue(smiles, name)
+
+    elif draw_mode:
+        hint("Draw your molecule, then click **Apply** in the sketcher to capture it.")
+        drawn = st_ketcher(st.session_state.parent_smiles or "", key="ketcher_draw", height=480)
+        smiles = drawn or st.session_state.parent_smiles
+
+        prev_col, form_col = st.columns([1, 1], gap="large")
+        with prev_col:
+            mol_preview = Chem.MolFromSmiles(smiles.strip()) if smiles and smiles.strip() else None
+            if mol_preview:
+                c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
+                st.markdown("**Preview** — highlighted atoms can be modified")
+                show_mol(mol_preview, highlight=c_sites, atom_indices=True)
+                st.caption(f"Captured SMILES: `{smiles}`  ·  {mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
+            else:
+                st.markdown(
+                    '<div style="background:#F0EAE0;border-radius:12px;height:240px;'
+                    'display:flex;align-items:center;justify-content:center;color:#A89070;">'
+                    '<span style="font-size:0.9rem;">Draw a molecule and click Apply to see the preview</span></div>',
+                    unsafe_allow_html=True)
+        with form_col:
+            name = st.text_input("Give it a short name", value=st.session_state.parent_name,
+                                 placeholder="e.g. compound_1")
+            hint("Used to label your output files.")
+            _render_step1_receptor_and_continue(smiles, name)
+
+    else:
+        col_form, col_mol = st.columns([1, 1], gap="large")
+        with col_form:
+            if input_tab == "✏️ Draw it" and not _KETCHER_OK:
+                st.warning("The drawing tool isn't installed here. Add `streamlit-ketcher` to "
+                           "requirements.txt to enable it. For now, paste a SMILES instead.")
+            smiles = st.text_area("Paste your compound SMILES", value=st.session_state.parent_smiles,
+                height=90, placeholder="e.g. CC1=CC=CC=C1")
+            hint("SMILES is a text code for a molecule. Copy it from ChemDraw, PubChem, or any chemistry database.")
+            name = st.text_input("Give it a short name", value=st.session_state.parent_name,
+                                 placeholder="e.g. compound_1")
+            hint("Used to label your output files.")
+            _render_step1_receptor_and_continue(smiles, name)
+
+        with col_mol:
+            mol_preview = Chem.MolFromSmiles(smiles.strip()) if smiles.strip() else None
+            if mol_preview:
+                c_sites = core.attachable_atom_indices(mol_preview, carbon_only=True)
+                st.markdown("**Preview** — highlighted atoms can be modified")
+                show_mol(mol_preview, highlight=c_sites, atom_indices=True)
+                st.caption(f"{mol_preview.GetNumAtoms()} atoms · {len(c_sites)} modifiable C–H sites")
+            else:
+                st.markdown(
+                    '<div style="background:#F0EAE0;border-radius:12px;height:320px;'
+                    'display:flex;align-items:center;justify-content:center;color:#A89070;">'
+                    '<span style="font-size:0.9rem;">Molecule preview appears here</span></div>',
+                    unsafe_allow_html=True)
+            if mode == "structure" and st.session_state.receptor_path:
+                st.markdown("**Receptor status**")
+                st.success(f"✅ {Path(st.session_state.receptor_path).name}")
+                if st.session_state.ref_ligand_path:
+                    st.info("Co-crystal ligand detected — will be used as reference pose")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 – Choose atoms
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif step == 2:
+    mol = st.session_state.parent_mol
+    if mol is None:
+        st.warning("Go back to Step 1 and load a compound first.")
+        st.stop()
+
+    attachable = core.attachable_atom_indices(mol, carbon_only=False)
+    c_only     = core.attachable_atom_indices(mol, carbon_only=True)
+
+    # Get contact atoms for colour-coding (structure track only)
+    _contact_atoms_2d = set()
+    if mode == "structure":
+        _ref_lig   = st.session_state.ref_ligand_path or ""
+        _cpx_path  = st.session_state.complex_path or ""
+
+        # Auto-run PLIP if not yet done and complex is available
+        if (st.session_state.get("_plip_df") is None
+                and _cpx_path and os.path.exists(str(_cpx_path))
+                and _PA_OK):
+            try:
+                with st.spinner("Analysing protein-ligand interactions…"):
+                    _xml, _msg, _log = _pa.run_plip_on_complex(
+                        str(_cpx_path), str(get_work_dir() / "plip_step2"), "auto")
+                    if _xml:
+                        _plip_df_auto = _pa.parse_plip_to_table(_xml)
+                        _tags_auto    = _pa.plip_to_residue_tags(_plip_df_auto)
+                        st.session_state["_plip_df"]         = _plip_df_auto
+                        st.session_state["_plip_tag_counts"] = _tags_auto
+            except Exception:
+                pass
+
+        _plip_df = st.session_state.get("_plip_df")
+        if _ref_lig and os.path.exists(_ref_lig):
+            try:
+                _contact_atoms_2d = core.get_ligand_contact_atoms(
+                    mol, _ref_lig, plip_df=_plip_df)
+            except Exception:
+                pass
+
+        # Fallback: distance-based contact if PLIP not available
+        if not _contact_atoms_2d and _cpx_path and os.path.exists(str(_cpx_path)):
+            try:
+                _atom_xyz_c = core.map_attachment_atoms_to_3d(mol, _ref_lig)
+                _, _c_df, _, _ = core.analyze_complex_distance_shell(
+                    str(_cpx_path), pocket_cutoff=6.0, contact_cutoff=4.0)
+                if not _c_df.empty and "resnum" in _c_df.columns:
+                    # Get all ligand atoms within contact distance
+                    _prot_atoms, _lig_atoms = core.read_complex_atoms_for_pocket(str(_cpx_path))
+                    import numpy as _npc
+                    _contact_3d = set()
+                    for _la_idx, _la in enumerate(_lig_atoms):
+                        for _pa_r in _prot_atoms:
+                            if float(_npc.linalg.norm(_la["xyz"] - _pa_r["xyz"])) <= 4.0:
+                                _contact_3d.add(_la_idx)
+                                break
+                    # Map 3D lig indices → 2D via MCS
+                    if _contact_3d and _ref_lig and os.path.exists(_ref_lig):
+                        from rdkit.Chem import rdFMCS as _rFMCS
+                        _m3d = Chem.MolFromPDBFile(_ref_lig, removeHs=True, sanitize=True)
+                        if _m3d:
+                            _mcs = _rFMCS.FindMCS([mol, _m3d], timeout=5,
+                                atomCompare=_rFMCS.AtomCompare.CompareElements,
+                                bondCompare=_rFMCS.BondCompare.CompareAny)
+                            _mm = Chem.MolFromSmarts(_mcs.smartsString)
+                            _mt2d = mol.GetSubstructMatch(_mm)
+                            _mt3d = _m3d.GetSubstructMatch(_mm)
+                            _d3to2 = {_mt3d[i]: _mt2d[i] for i in range(len(_mt2d))}
+                            _contact_atoms_2d = {_d3to2[i] for i in _contact_3d if i in _d3to2}
+            except Exception:
+                pass
+
+    info_card(
+        "Atom indices are shown on the structure. "
+        "<span style='background:#FF8C00;color:white;padding:1px 6px;border-radius:4px;font-size:0.85em'>Orange</span> = attachable C–H sites. "
+        + (
+        "<span style='background:#3399FF;color:white;padding:1px 6px;border-radius:4px;font-size:0.85em'>Blue</span> = atoms contacting the protein pocket — "
+        "good candidates for modification. "
+        if _contact_atoms_2d else ""
+        ) +
+        "Select the atoms where you want to grow new fragments."
+    )
+
+    col_pick, col_view = st.columns([1, 2], gap="large")
+
+    with col_pick:
+        st.markdown("### Pick attachment points")
+        hint("C–H sites (carbon) are safest to modify. Blue-highlighted atoms are nearest to pocket residues.")
+
+        new_sel = set()
+        for idx in attachable:
+            atom  = mol.GetAtomWithIdx(idx)
+            atype = "C–H" if atom.GetAtomicNum() == 6 else f"{atom.GetSymbol()}–H"
+            label = f"Atom {idx}  ({atype})"
+            if idx not in c_only:
+                label += "  *(heteroatom)*"
+            if idx in _contact_atoms_2d:
+                label += "  🔵 pocket contact"
+            if st.checkbox(label, value=idx in st.session_state.selected_atoms, key=f"atm_{idx}"):
+                new_sel.add(idx)
+
+        st.session_state.selected_atoms = new_sel
+        st.write("")
+        st.markdown("### Options")
+        st.session_state.allow_heteroatom_H = st.checkbox(
+            "Allow N–H / O–H / S–H substitution",
+            value=st.session_state.allow_heteroatom_H,
+        )
+        hint("By default only carbon (C–H) sites are modified.")
+        st.session_state.concerted = st.checkbox(
+            "Concerted mode — attach the same group to all selected atoms at once",
+            value=st.session_state.concerted,
+        )
+        hint("Off: each analog changes one site. On: all selected sites changed together.")
+
+    with col_view:
+        st.markdown("### Structure — highlighted interaction sites")
+        # Draw 2D SVG with colour-coded highlights
+        try:
+            _svg = core.draw_2d_interaction_svg(
+                mol,
+                selected_atoms=new_sel,
+                contact_atoms=_contact_atoms_2d,
+                width=560, height=400,
+            )
+            import base64 as _b64
+            _svg_b64 = _b64.b64encode(_svg.encode()).decode()
+            st.markdown(
+                f'<img src="data:image/svg+xml;base64,{_svg_b64}" '
+                f'style="width:100%;max-width:580px;background:white;'
+                f'border-radius:8px;border:1px solid #E0D6C8;padding:4px"/>',
+                unsafe_allow_html=True,
+            )
+        except Exception as _draw_e:
+            st.warning(f"2D diagram error: {_draw_e}")
+            show_mol(mol, highlight=sorted(new_sel), atom_indices=True)
+
+        # Legend
+        st.markdown(
+            '<div style="font-size:0.78rem;line-height:2;margin-top:4px;">'
+            '<span style="background:#FF8C00;color:white;padding:1px 6px;border-radius:4px;">■</span> Selected for modification &nbsp;&nbsp;'
+            '<span style="background:#3399FF;color:white;padding:1px 6px;border-radius:4px;">■</span> Pocket contact site'
+            + (" &nbsp;&nbsp;<em>(no contact data yet — run pocket analysis in Step 3 first)</em>"
+               if not _contact_atoms_2d and mode == "structure" else "")
+            + '</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Structure-based: show PLIP interaction summary
+        if mode == "structure":
+            _plip_df = st.session_state.get("_plip_df")
+            if _plip_df is not None and not _plip_df.empty:
+                st.markdown("**Detected interactions (from PLIP):**")
+                _int_types = _plip_df["type"].value_counts() if "type" in _plip_df.columns else {}
+                _summary = "  ".join(
+                    f"`{t}` ×{n}" for t, n in _int_types.items()
+                ) if len(_int_types) else "—"
+                st.caption(_summary)
+                with st.expander("Full interaction table"):
+                    _show_cols = [c for c in ["type","resname","resnum","chain","dist_A"]
+                                  if c in _plip_df.columns]
+                    st.dataframe(_plip_df[_show_cols] if _show_cols else _plip_df,
+                                 hide_index=True, width='stretch')
+                hint("Blue atoms on the 2D structure are in contact with these residues — "
+                     "modifying them will change the interaction profile.")
+            else:
+                st.info("ℹ️ Run **pocket analysis** in Step 3 first to see protein-contact atoms highlighted in blue.")
+
+    st.write("")
+    col_back, col_next = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            go(1)
+    with col_next:
+        if st.button("Continue →", type="primary", disabled=len(new_sel) == 0):
+            go(3)
+        if not new_sel:
+            st.caption("Select at least one atom to continue.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 – Design options  (ligand track)
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif step == 3 and mode == "ligand":
+    info_card("These settings control what kinds of groups are added and how the results are ranked. "
+              "The defaults work well — you can leave them and click Generate.")
+
+    col_a, col_b = st.columns(2, gap="large")
+
+    with col_a:
+        st.markdown("### How many analogs?")
+        st.session_state.n_analogs = st.slider(
+            "Number of analogs to generate", 5, 1000,
+            st.session_state.n_analogs, step=5,
+        )
+        # Live tier preview
+        _tier_preview = analog_tier(st.session_state.n_analogs)
+        st.markdown(
+            f'<p style="font-size:0.82rem;margin-top:-4px;">'
+            f'With <strong>{st.session_state.n_analogs}</strong> analogs: '
+            f'{tier_badge_html(_tier_preview)}</p>',
+            unsafe_allow_html=True,
+        )
+        if _tier_preview == "docking":
+            hint("≤ 20 analogs → Docking button available after generation.")
+        elif _tier_preview == "pkanet":
+            hint("21–200 analogs → Download SMI + pKaNET protonation/3D conversion.")
+        else:
+            hint("> 200 analogs → SMI download only (too many for docking or 3D).")
+
+        st.markdown("### How adventurous?")
+        risk_map = {
+            "Conservative — small groups only": "Conservative",
+            "Moderate — balanced (recommended)": "Moderate",
+            "Exploratory — larger groups allowed": "Exploratory",
+        }
+        risk_label = st.radio("Substitution size", list(risk_map.keys()),
+                               index=list(risk_map.values()).index(st.session_state.risk))
+        st.session_state.risk = risk_map[risk_label]
+        hint("Conservative keeps modifications small and drug-like.")
+
+    with col_b:
+        st.markdown("### Rank results by")
+        rank_map = {
+            "Overall drug-likeness (recommended)": "Balanced (100-pt weights)",
+            "Most similar to parent":              "Similarity to parent",
+            "Best predicted solubility":           "Solubility (ESOL)",
+            "Easiest to synthesise":               "Synthetic feasibility",
+        }
+        rank_labels = list(rank_map.keys())
+        current_label = st.session_state.rank_by if st.session_state.rank_by in rank_labels else rank_labels[0]
+        rank_label = st.radio("Sort analogs by", rank_labels,
+                               index=rank_labels.index(current_label))
+        st.session_state.rank_by   = rank_label
+        st.session_state.rank_code = rank_map[rank_label]
+
+        st.markdown("### Fragment categories")
+        hint("Uncheck any group types you want to exclude.")
+        cat_cols = st.columns(2)
+        cats = list(core.CATEGORY_BASE_GOALS.keys())
+        new_cats = {}
+        for i, cat in enumerate(cats):
+            with cat_cols[i % 2]:
+                new_cats[cat] = st.checkbox(cat.replace("_", " ").capitalize(),
+                    value=st.session_state.categories_on.get(cat, True), key=f"cat_{cat}")
+        st.session_state.categories_on = new_cats
+
+        # ── Module 2: pocket-aware ML ranking (ligand track) ──────────────
+        if _PR_OK:
+            st.markdown("### 🧬 Pocket-aware fragment ranking")
+            hint("Enter binding-site residues — ML will auto-rank and use the best fragments. Leave blank to use all fragment categories.")
+            lb_residues = st.text_input(
+                "Key binding-site residues *(optional)*",
+                value=st.session_state.get("lb_pocket_residues", ""),
+                placeholder="e.g. ASP315 LYS89 PHE82 LEU83  (one-letter or three-letter OK)",
+                key="lb_pocket_input",
+            )
+
+            if lb_residues.strip():
+                lb_codes = core.parse_pocket_residues(lb_residues)
+                if lb_codes:
+                    # ── Auto-compute ML scores immediately ──────────────────
+                    st.session_state["lb_pocket_residues"] = lb_residues
+                    _lb_tag_counts: dict = {}
+                    for _aa in lb_codes:
+                        for _tag in core.AA_TAGS.get(_aa, []):
+                            _lb_tag_counts[_tag] = _lb_tag_counts.get(_tag, 0) + 1
+                    st.session_state["_pocket_tag_counts"] = _lb_tag_counts
+
+                    all_frags = [f for f in core.LIBRARY
+                                 if st.session_state.categories_on.get(f.category, True)]
+                    lb_scored = _pr.score_fragments(all_frags, _lb_tag_counts, alpha=0.7)
+
+                    # Auto-use top-N as generation pool (no checkbox needed)
+                    n_ml = st.session_state.n_analogs
+                    top_n = lb_scored[:max(n_ml, 50)]  # always keep ≥50 for diversity
+                    st.session_state.pocket_frags = [f for f, _ in top_n]
+
+                    # ── Summary info card ───────────────────────────────────
+                    dominant = max(_lb_tag_counts, key=_lb_tag_counts.get)
+                    _mstatus = _pr.model_status()
+                    _badge = "🟢 ChemBERTa" if _mstatus["chemberta_loaded"] else "🟡 Rule-based fallback"
+                    info_card(
+                        f"<strong>{len(lb_codes)} residues detected</strong> · "
+                        f"dominant: <code>{dominant.replace('_', ' ')}</code> · "
+                        f"{_badge}<br>"
+                        f"Ranked {len(all_frags):,} fragments → using top <strong>{len(top_n)}</strong> "
+                        f"as generation pool for Step 4."
+                    )
+
+                    # ── Ranked table (top 20 preview) ──────────────────────
+                    st.markdown(f"**Top 20 ML-ranked fragments** *(used automatically in Step 4)*")
+                    preview_20 = lb_scored[:20]
+                    lb_df = pd.DataFrame([{
+                        "Rank":     i + 1,
+                        "Fragment": f.name,
+                        "Category": f.category,
+                        "ML score": f"{s:.3f}",
+                        "Reason":   _pr.explain_score(f, _lb_tag_counts)["reason"][:60] + "…",
+                    } for i, (f, s) in enumerate(preview_20)])
+
+                    def _lb_colour(val):
+                        try:
+                            v = float(val)
+                            if v >= 0.75:   return "background-color:#E6F4EA;color:#1E7E34"
+                            elif v >= 0.50: return "background-color:#FFF3CD;color:#856404"
+                            else:           return "background-color:#FDE8E8;color:#842029"
+                        except Exception:
+                            return ""
+
+                    st.dataframe(
+                        lb_df.style.map(_lb_colour, subset=["ML score"]),
+                        width='stretch', hide_index=True, height=340,
+                    )
+
+                    with st.expander("🔍 Score breakdown for top fragment"):
+                        top_f, top_s = preview_20[0]
+                        exp = _pr.explain_score(top_f, _lb_tag_counts)
+                        st.markdown(f"**{top_f.name}** — ML score: `{top_s:.3f}`")
+                        st.markdown(f"- Category: `{exp.get('category', '—')}`")
+                        st.markdown(f"- Category score: `{exp.get('category_score', '—')}`")
+                        st.markdown(f"- Model: `{exp.get('model_used', 'rule-based')}`")
+                        st.markdown(f"- Dominant pocket tag: `{exp.get('dominant_pocket_tag', '—')}`")
+                        st.markdown(f"- Reason: {exp.get('reason', '—')}")
+                        top_tags = exp.get('top_pocket_tags') or exp.get('top_matching_tags') or []
+                        if top_tags:
+                            tags_str = ", ".join(f"`{t}` ({c})" for t, c in top_tags[:3])
+                            st.markdown(f"- Top pocket tags: {tags_str}")
+
+                else:
+                    st.warning("Could not parse residue codes. Try formats like: ASP315 LYS89 PHE82  or  D K F L")
+            else:
+                # No residues provided → clear ML selection, use all categories
+                st.session_state["_pocket_tag_counts"] = {}
+                if st.session_state.get("pocket_frags"):
+                    st.session_state.pocket_frags = []
+                st.caption("💡 No residues entered — all fragment categories will be used in Step 4.")
+
+    with st.expander("⚙️ Advanced options"):
+        adv1, adv2 = st.columns(2)
+        with adv1:
+            st.markdown("**Structural filters**")
+            st.session_state.avoid_nitro    = st.checkbox("Remove nitro groups",    value=st.session_state.avoid_nitro)
+            st.session_state.avoid_aldehyde = st.checkbox("Remove aldehydes",       value=st.session_state.avoid_aldehyde)
+            st.session_state.avoid_reactive = st.checkbox("Remove reactive groups", value=st.session_state.avoid_reactive)
+            st.session_state.avoid_toxic    = st.checkbox("Remove toxic flags",     value=st.session_state.avoid_toxic)
+            st.session_state.max_MW = st.number_input("Max molecular weight (Da)", value=st.session_state.max_MW, step=25.0)
+        with adv2:
+            st.markdown("**Goal weights** (must sum to ~100)")
+            w = st.session_state.weights
+            new_w = {}
+            for k in w:
+                new_w[k] = st.slider(k.capitalize(), 0, 100, int(w[k]), step=5, key=f"w_{k}")
+            st.session_state.weights = new_w
+
+        # ── External Fragment Libraries ───────────────────────────────────────
+        st.markdown("### 🌐 External fragment libraries")
+        hint(
+            "Fetch fragments from **ChEMBL** (rule-of-three) or **ZINC** (pre-curated fragment subset). "
+            "Fetched fragments are merged with the built-in library. Cached 24–72 h locally."
+        )
+        _efl_sources = st.multiselect(
+            "Fetch from",
+            ["ChEMBL (rule-of-three, ~300K)", "ZINC Fragments (~300K)"],
+            default=[],
+            key="efl_sources",
+        )
+        _efl_max = st.slider(
+            "Max per source", 50, 2000, 300, 50, key="efl_max",
+            help="Results are cached — first fetch may take 15–60 s."
+        )
+        if _efl_sources:
+            _src_keys = []
+            if any("ChEMBL" in s for s in _efl_sources): _src_keys.append("chembl")
+            if any("ZINC"   in s for s in _efl_sources): _src_keys.append("zinc")
+            _ef1, _ef2 = st.columns([2, 1])
+            with _ef1:
+                if st.button("🔄 Fetch external fragments", key="efl_fetch_btn"):
+                    if not _EFL_OK:
+                        st.error("external_fragment_library.py not found in app folder.")
+                    else:
+                        _prog = st.progress(0.0, text="Connecting…")
+                        def _cb(done, total):
+                            _prog.progress(min(1.0, done / max(total, 1)),
+                                           text=f"Fetched {done}/{total}…")
+                        with st.spinner("Fetching — first run may take 15–60 s…"):
+                            try:
+                                _fetched = _efl.fetch_external_fragments(
+                                    sources=_src_keys,
+                                    max_per_source=_efl_max,
+                                    progress_cb=_cb,
+                                )
+                                st.session_state["_efl_fragments"] = _fetched
+                                _prog.empty()
+                                from collections import Counter as _C
+                                _bs = _C(f["source"] for f in _fetched)
+                                _bc = _C(f["category"] for f in _fetched)
+                                st.success(f"✅ {len(_fetched)} fragments — " +
+                                           "  ".join(f"{s}:{n}" for s,n in _bs.items()))
+                                st.caption("Categories: " +
+                                           "  ".join(f"{c}({n})" for c,n in _bc.most_common(6)))
+                            except Exception as _ee:
+                                _prog.empty()
+                                st.error(f"Fetch failed: {_ee}")
+            with _ef2:
+                _cached_efl = st.session_state.get("_efl_fragments", [])
+                if _cached_efl:
+                    st.metric("Cached", f"{len(_cached_efl):,}")
+                    if st.button("🗑️ Clear", key="efl_clear"):
+                        st.session_state.pop("_efl_fragments", None)
+                        if _EFL_OK: _efl.clear_cache()
+                        st.rerun()
+                if _EFL_OK:
+                    _ci = _efl.cache_info()
+                    st.caption(f"💾 {_ci['files']} files · {_ci['total_mb']:.1f} MB")
+
+        st.markdown("**Custom fragments** — one SMILES with `[*]` per line")
+        st.session_state.custom_frags_text = st.text_area(
+            "Custom fragments", value=st.session_state.custom_frags_text,
+            height=80, label_visibility="collapsed", placeholder="[*]C1CC1\n[*]OCC")
+
+    st.write("")
+    col_back, col_next = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            go(2)
+    with col_next:
+        if st.button("Generate analogs →", type="primary"):
+            go(4)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 – Pocket guidance  (structure track)
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif step == 3 and mode == "structure":
+    info_card("We'll analyse which residues are near the binding site and suggest the best functional groups to add.")
+
+    # ── Mode B: dock ligand first if not yet done ────────────────────────────
+    if st.session_state.struct_mode == "B" and not st.session_state.modeB_docked:
+        st.markdown("### 🔬 Step 3A — Dock ligand with ACD")
+        info_card(
+            "<strong>Mode B</strong>: Your ligand needs to be docked into the "
+            "protein before pocket analysis. ACD (Anyone Can Dock) will run now."
+        )
+        acd_ok    = bool(shutil.which("acd"))
+        obabel_ok = bool(shutil.which("obabel"))
+        receptor  = st.session_state.receptor_path
+        protein   = st.session_state.protein_path
+
+        bcol1, bcol2 = st.columns(2)
+        bcol1.markdown(
+            f'<div style="padding:0.6rem 1rem;border-radius:8px;'
+            f'background:{"#E6F4EA" if acd_ok else "#FDECEA"};'
+            f'color:{"#1E7E34" if acd_ok else "#B00020"};font-size:0.85rem;">'
+            f'{"✅ acd available" if acd_ok else "❌ acd not found — pip install anyonecandock"}</div>',
+            unsafe_allow_html=True,
+        )
+        bcol2.markdown(
+            f'<div style="padding:0.6rem 1rem;border-radius:8px;'
+            f'background:{"#E6F4EA" if obabel_ok else "#FDECEA"};'
+            f'color:{"#1E7E34" if obabel_ok else "#B00020"};font-size:0.85rem;">'
+            f'{"✅ obabel available" if obabel_ok else "❌ obabel not found — apt install openbabel"}</div>',
+            unsafe_allow_html=True,
+        )
+
+        if acd_ok and obabel_ok and receptor:
+            dock_ph  = st.number_input("pH for protonation", value=7.4, step=0.1, key="modeB_ph")
+            use_pkanet = st.checkbox("Use pKaNET protonation", value=True, key="modeB_pkanet")
+
+            if st.button("🚀 Dock ligand now", type="primary", key="modeB_dock_btn"):
+                work     = get_work_dir()
+                dock_out = str(work / "modeB_docking")
+                compound = st.session_state.parent_name or "ligand"
+                smiles   = st.session_state.parent_smiles
+
+                with st.spinner(f"Docking {compound} into {Path(receptor).name}…"):
+                    cmd = core.build_acd_dock_cmd(
+                        receptor=receptor,
+                        smiles=smiles,
+                        name=compound,
+                        ph=float(dock_ph),
+                        output_dir=dock_out,
+                        use_pkanet=bool(use_pkanet),
+                        save_poses=True,
+                        exhaustiveness=8,
+                        num_poses=10,
+                        box_x=16.0, box_y=16.0, box_z=16.0,
+                    )
+                    # Show command for debugging
+                    with st.expander("🔧 ACD command", expanded=False):
+                        st.code(" ".join(str(c) for c in cmd), language="bash")
+                    rc, log = core.run_command(cmd)
+                    (work / "modeB_acd.log").write_text(log)
+
+                    if rc != 0:
+                        st.error(f"ACD docking failed (exit {rc}). Check the log below.")
+                        with st.expander("ACD log"):
+                            st.text(log[-3000:])
+                    else:
+                        # Find best pose SDF → convert to PDB → build pseudo-complex
+                        sdf_path = core.find_pose_sdf(dock_out)
+                        if sdf_path:
+                            pose_pdb = str(work / "modeB_pose.pdb")
+                            core.sdf_first_mol_to_pdb(sdf_path, pose_pdb)
+                            # Build pseudo-complex: protein + docked pose
+                            complex_pdb = str(work / "modeB_complex.pdb")
+                            if protein and os.path.exists(protein):
+                                core.combine_protein_ligand_pdb(protein, pose_pdb, complex_pdb)
+                            else:
+                                core.combine_protein_ligand_pdb(receptor, pose_pdb, complex_pdb)
+
+                            st.session_state.complex_path       = complex_pdb
+                            st.session_state.ref_ligand_path    = pose_pdb
+                            st.session_state.modeB_docked       = True
+                            st.session_state.modeB_complex_path = complex_pdb
+
+                            # Parse best score
+                            # Read best BE directly from PDBQT REMARK lines
+                            best_be = None
+                            import glob as _glob
+                            for _pdbqt in _glob.glob(str(Path(dock_out) / "**" / "*.pdbqt"), recursive=True):
+                                for _line in open(_pdbqt, errors="ignore"):
+                                    if _line.strip().startswith("REMARK VINA RESULT:"):
+                                        try:
+                                            best_be = float(_line.split()[3])
+                                        except Exception:
+                                            pass
+                                        break
+                                if best_be is not None:
+                                    break
+                            be_str = f"  ·  BE = {best_be:.2f} kcal/mol" if best_be is not None else ""
+
+                            st.success(f"✅ Docking complete{be_str} — proceeding to pocket analysis")
+                            st.rerun()
+                        else:
+                            st.error("Docking ran but no pose SDF found. Check ACD output.")
+                            with st.expander("ACD log"):
+                                st.text(log[-3000:])
+        elif not receptor:
+            st.warning("No receptor loaded. Go back to Step 1 and load a protein PDB.")
+        else:
+            st.info("ACD or OpenBabel not available. Cannot run docking in Mode B.")
+
+        # Stop here until docking is done
+        if not st.session_state.modeB_docked:
+            st.divider()
+            if st.button("← Back to Step 1", key="modeB_back"):
+                go(1)
+            st.stop()
+
+    # ── Pocket analysis (Mode A or Mode B after docking) ─────────────────────
+    if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
+        col_analysis, col_result = st.columns([1, 1], gap="large")
+
+        with col_analysis:
+            st.markdown("### Automatic pocket analysis")
+            hint("Click the button to detect residues within 6 Å of the co-crystal ligand.")
+            cutoff = st.slider("Pocket distance cutoff (Å)", 4.0, 10.0, 6.0, 0.5)
+            if st.button("Analyse pocket", type="primary"):
+                with st.spinner("Analysing binding pocket…"):
+                    try:
+                        pocket_df, contact_df, growth_df, lig_atoms = core.analyze_complex_distance_shell(
+                            st.session_state.complex_path, pocket_cutoff=cutoff)
+                        residue_codes = [x for x in growth_df["aa_one"].tolist() if x]
+                        st.session_state.pocket_residue_text = " ".join(
+                            core.AA_ONE_TO_THREE.get(r, r) for r in residue_codes)
+                        active_lib = list(core.BUILTIN_LIBRARY)
+                        _, _, pocket_frags = core.suggest_fragments_from_residues(
+                            residue_codes, active_lib, st.session_state.max_pocket_frags)
+                        st.session_state.pocket_frags = pocket_frags
+                        # Store tag counts for Module 2 ML scoring
+                        _tag_counts: dict = {}
+                        for _aa in residue_codes:
+                            for _tag in core.AA_TAGS.get(_aa, []):
+                                _tag_counts[_tag] = _tag_counts.get(_tag, 0) + 1
+                        st.session_state["_pocket_tag_counts"] = _tag_counts
+                        st.success(f"Found {len(pocket_df)} pocket residues, {len(growth_df)} growth opportunities")
+                    except Exception as e:
+                        st.error(f"Analysis failed: {e}")
+
+            st.markdown("### Or paste residues manually")
+            hint("Type residue names like: ASP315 LYS89 TYR102")
+            manual = st.text_input("Pocket residues", value=st.session_state.pocket_residue_text,
+                placeholder="ASP315 LYS89 TYR102", label_visibility="collapsed")
+            if manual != st.session_state.pocket_residue_text:
+                st.session_state.pocket_residue_text = manual
+                codes = core.parse_pocket_residues(manual)
+                if codes:
+                    _, _, pf = core.suggest_fragments_from_residues(codes, core.BUILTIN_LIBRARY, 6)
+                    st.session_state.pocket_frags = pf
+                    # Store tag counts for Module 2 ML scoring
+                    _tag_counts_m: dict = {}
+                    for _aa in codes:
+                        for _tag in core.AA_TAGS.get(_aa, []):
+                            _tag_counts_m[_tag] = _tag_counts_m.get(_tag, 0) + 1
+                    st.session_state["_pocket_tag_counts"] = _tag_counts_m
+
+        with col_result:
+            if st.session_state.pocket_frags:
+                st.markdown("### Suggested functional groups")
+
+                # ── Module 2: ML pocket-aware ranking ──────────────────────
+                if _PR_OK and st.session_state.get("_pocket_tag_counts"):
+                    # Show model status badge
+                    _mstatus = _pr.model_status()
+                    _badge_col = "🟢" if _mstatus["chemberta_loaded"] else "🟡"
+                    st.markdown(
+                        f'<div style="font-size:0.78rem;color:#5A4A35;margin-bottom:6px;">'
+                        f'{_badge_col} <strong>{_mstatus["mode"]}</strong>'
+                        f'{" · cache: " + str(_mstatus["cache_size"]) + " SMILES" if _mstatus["chemberta_loaded"] else ""}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                    hint("Ranked by ChemBERTa semantic similarity + PDB co-occurrence (blended).")
+                    tag_counts = st.session_state["_pocket_tag_counts"]
+                    alpha = st.slider(
+                        "Category vs fragment-level weight",
+                        0.0, 1.0, 0.7, 0.05,
+                        help="Higher = more weight on fragment category fit; lower = more weight on specific fragment PDB frequency",
+                        key="pr_alpha",
+                    )
+                    scored = _pr.score_fragments(
+                        st.session_state.pocket_frags, tag_counts, alpha=alpha
+                    )
+                    fdf = pd.DataFrame([{
+                        "Rank":     i + 1,
+                        "Group":    f.name,
+                        "Category": f.category,
+                        "ML score": f"{score:.3f}",
+                        "Why":      _pr.explain_score(f, tag_counts)["reason"],
+                    } for i, (f, score) in enumerate(scored)])
+
+                    # Colour-code by score
+                    def _score_colour(val):
+                        try:
+                            v = float(val)
+                            if v >= 0.75:   return "background-color:#E6F4EA;color:#1E7E34"
+                            elif v >= 0.50: return "background-color:#FFF3CD;color:#856404"
+                            else:           return "background-color:#FDE8E8;color:#842029"
+                        except Exception:
+                            return ""
+
+                    styled = fdf.style.map(_score_colour, subset=["ML score"])
+                    st.dataframe(styled, width='stretch', hide_index=True, height=320)
+
+                    # Update pocket_frags order to ML-ranked order
+                    st.session_state.pocket_frags = [f for f, _ in scored]
+
+                    # Expandable explanation for top fragment
+                    with st.expander("🔍 Score breakdown for top fragment"):
+                        top_f, top_s = scored[0]
+                        exp = _pr.explain_score(top_f, tag_counts)
+                        st.markdown(f"**{top_f.name}** — ML score: `{top_s:.3f}`")
+                        st.markdown(f"- Category: `{exp.get('category', '—')}`")
+                        st.markdown(f"- Category score: `{exp.get('category_score', '—')}`")
+                        st.markdown(f"- Model: `{exp.get('model_used', 'rule-based')}`")
+                        st.markdown(f"- Dominant pocket tag: `{exp.get('dominant_pocket_tag', '—')}`")
+                        st.markdown(f"- Reason: {exp.get('reason', '—')}")
+                        top_tags = exp.get('top_pocket_tags') or exp.get('top_matching_tags') or []
+                        if top_tags:
+                            tags_str = ", ".join(f"`{t}` ({c})" for t, c in top_tags[:3])
+                            st.markdown(f"- Top pocket tags: {tags_str}")
+
+                else:
+                    # Fallback: rule-based display
+                    hint("These groups match the chemistry of your binding pocket residues.")
+                    fdf = pd.DataFrame([
+                        {"Group": f.name, "Category": f.category, "Why": f.notes or f.category}
+                        for f in st.session_state.pocket_frags
+                    ])
+                    st.dataframe(fdf, width='stretch', hide_index=True)
+                    if not _PR_OK:
+                        st.caption("ℹ️ Install `pocket_reference.py` to enable ML scoring.")
+            else:
+                st.markdown(
+                    '<div style="background:#F0EAE0;border-radius:12px;padding:2rem;'
+                    'text-align:center;color:#A89070;margin-top:1rem;">'
+                    'Suggested groups will appear here after analysis</div>',
+                    unsafe_allow_html=True)
+    else:
+        st.warning("No receptor file found. Go back to Step 1 and load a receptor.")
+
+    # ── PLIP interaction analysis ───────────────────────────────────────────
+    if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
+        st.divider()
+        st.markdown("### 🔬 Protein–Ligand Interaction Analysis (PLIP)")
+        plip_ok = bool(shutil.which("plipcmd") or shutil.which("plip"))
+
+        if not plip_ok:
+            st.info(
+                "PLIP is not installed — using distance-based contact fingerprint as fallback. "
+                "Install with: `pip install plip`"
+            )
+
+        col_plip_btn, col_plip_status = st.columns([2, 3])
+        with col_plip_btn:
+            if st.button("Run PLIP analysis", type="primary", key="plip_btn"):
+                work = get_work_dir()
+                cpx  = st.session_state.complex_path
+                name = st.session_state.parent_name or "ligand"
+
+                with st.spinner("Running PLIP interaction analysis…"):
+                    if plip_ok:
+                        xml_path, err, log = _pa.run_plip_on_complex(
+                            cpx, str(work / "plip_out"), name)
+                        if xml_path:
+                            plip_df = _pa.parse_plip_to_table(xml_path)
+                        else:
+                            st.warning(f"PLIP failed: {err} — using distance fallback")
+                            plip_df = pd.DataFrame()
+                    else:
+                        plip_df = pd.DataFrame()
+
+                    # Fallback: distance-based cIFP
+                    if plip_df.empty:
+                        feats = _pa.distance_cifp_features(cpx, cutoff=4.0)
+                        st.session_state["_plip_parent_feats"] = feats
+                        st.session_state["_plip_df"] = pd.DataFrame(
+                            [{"type":"CONTACT","residue":f,"distance_A":None,"is_key":False}
+                             for f in feats])
+                        st.session_state["_plip_tag_counts"] = {}
+                        st.session_state["_plip_rec"] = None
+                        st.success(f"Distance cIFP: {len(feats)} contacts detected")
+                    else:
+                        # Build tag counts + recommendation
+                        tag_counts, res_codes = _pa.plip_to_residue_tags(
+                            plip_df, core.AA_TAGS)
+                        st.session_state["_plip_df"]         = plip_df
+                        st.session_state["_plip_tag_counts"] = tag_counts
+                        st.session_state["_plip_parent_feats"] = [
+                            f"{r['type']}:{r['chain']}:{r['resname']}:{r['resnum']}"
+                            for _, r in plip_df.iterrows()
+                        ]
+                        # Store for pocket_reference ML scoring
+                        st.session_state["_pocket_tag_counts"] = tag_counts
+                        st.success(
+                            f"PLIP: {len(plip_df)} interactions · "
+                            f"{plip_df['is_key'].sum()} key contacts"
+                        )
+                        st.rerun()
+
+        with col_plip_status:
+            plip_df = st.session_state.get("_plip_df")
+            if plip_df is not None and not plip_df.empty and "type" in plip_df.columns:
+                from collections import Counter
+                type_counts = Counter(plip_df["type"].tolist())
+                badges = " &nbsp; ".join(
+                    f'<span style="background:#E8A020;color:#fff;padding:2px 8px;'
+                    f'border-radius:10px;font-size:0.75rem;">{t}: {c}</span>'
+                    for t, c in sorted(type_counts.items())
+                )
+                st.markdown(badges, unsafe_allow_html=True)
+
+        # Show PLIP results
+        plip_df = st.session_state.get("_plip_df")
+        if plip_df is not None and not plip_df.empty:
+            tab_int, tab_rec = st.tabs(["📋 Interaction table", "💡 Design recommendation"])
+
+            with tab_int:
+                def _style_plip(val):
+                    colors = {
+                        "HBOND":"#E6F4EA","SALTBRIDGE":"#FDECEA","PISTACK":"#EDE7F6",
+                        "HYDROPHOBIC":"#FFF3CD","PICATION":"#E3F2FD",
+                        "HALOGEN":"#FBE9E7","METAL":"#FCE4EC","WATERBRIDGE":"#E0F7FA",
+                        "CONTACT":"#F3E5F5",
+                    }
+                    return f"background-color:{colors.get(val,'#FAFAFA')}"
+
+                show_cols = [c for c in ["type","residue","distance_A","is_key"] if c in plip_df.columns]
+                styled = plip_df[show_cols].style.map(
+                    _style_plip, subset=["type"] if "type" in show_cols else [])
+                st.dataframe(styled, width='stretch', hide_index=True)
+
+            with tab_rec:
+                rec = st.session_state.get("_plip_rec")
+                tag_counts = st.session_state.get("_plip_tag_counts", {})
+
+                if tag_counts and _VA_OK:
+                    # Build recommendation using void subpockets
+                    void_sps = st.session_state.get("_void_subpockets", [])
+                    rec = _pa.unified_recommendation(
+                        plip_df, void_sps, tag_counts, core.AA_TAGS)
+                    st.session_state["_plip_rec"] = rec
+
+                    st.markdown(f"**{rec['summary']}**")
+                    st.markdown("")
+
+                    if rec["preserve"]:
+                        st.markdown("#### 🔒 Interactions to preserve")
+                        for p in rec["preserve"]:
+                            st.markdown(
+                                f"- **{p['residue']}** `{p['type']}` — {p['strategy']}"
+                            )
+
+                    if rec["grow"]:
+                        st.markdown("#### 🌱 Growth vectors (unoccupied space)")
+                        for g in rec["grow"]:
+                            st.markdown(
+                                f"- **Sub-pocket {g['sub_pocket_id']}**"
+                                f" [{g['size_class']}, {g['void_volume_A3']:.0f} ų] — "
+                                f"{g['strategy']}\n\nExample fragments: *{g['example_frags']}*"
+                            )
+                    elif not void_sps:
+                        st.info(
+                            "Run **Unoccupied space analysis** below to see growth vectors."
+                        )
+                elif tag_counts:
+                    st.info("Run **Unoccupied space analysis** below to get full recommendations.")
+                else:
+                    st.info("Run PLIP analysis above to get design recommendations.")
+
+    # ── 3D Complex Viewer (parent ligand in pocket) ─────────────────────
+    if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
+        st.divider()
+        st.markdown("### 🧬 Binding Pocket 3D View")
+        hint("Parent ligand (cyan) in the protein pocket. Orange = interacting residues. Magenta = reference ligand (if available).")
+
+        v3d_s_col1, v3d_s_col2 = st.columns([1, 3])
+        with v3d_s_col1:
+            s3_labels  = st.checkbox("Residue labels",  value=True,  key="s3_labels")
+            s3_surface = st.checkbox("Protein surface", value=False, key="s3_surface")
+            s3_cutoff  = st.slider("Pocket cutoff (Å)", 3.0, 6.0, 4.0, 0.5, key="s3_cutoff")
+            s3_height  = st.slider("Height (px)", 300, 600, 460, 50, key="s3_height")
+            st.markdown("""
+<div style="font-size:0.75rem;line-height:1.8;margin-top:6px;">
+<span style="color:#00FFFF">■</span> Ligand &nbsp;
+<span style="color:#FF8C00">■</span> Pocket residues<br>
+<span style="color:#FF00FF">■</span> Reference &nbsp;
+<span style="color:#888">■</span> Protein
+</div>""", unsafe_allow_html=True)
+
+        with v3d_s_col2:
+            # Load ref ligand mol from PDB if available
+            ref_pdb  = st.session_state.ref_ligand_path or ""
+            prot_pdb = st.session_state.protein_path or st.session_state.receptor_path or ""
+            cpx_pdb  = st.session_state.complex_path or ""
+
+            pose_mol_s3 = None
+            if ref_pdb and os.path.exists(ref_pdb):
+                try:
+                    from rdkit import Chem as _Chem_s3
+                    pose_mol_s3 = _Chem_s3.MolFromPDBFile(ref_pdb, removeHs=False)
+                except Exception:
+                    pass
+
+            # Build viewer manually for full control over pocket display
+            try:
+                import py3Dmol as _py3_s3
+                _vs3 = _py3_s3.view(width="100%", height=s3_height)
+                _vs3.setBackgroundColor(_viewer_bg())
+                _mi_s3 = 0
+
+                # Protein cartoon
+                if prot_pdb and os.path.exists(prot_pdb):
+                    _vs3.addModel(open(prot_pdb).read(), "pdb")
+                    _vs3.setStyle({"model": _mi_s3}, {
+                        "cartoon": {"color": "spectrum", "opacity": 0.40}
+                    })
+                    if s3_surface:
+                        _vs3.addSurface(_py3_s3.SAS,
+                                        {"opacity": 0.18, "color": "white"},
+                                        {"model": _mi_s3})
+                    _mi_s3 += 1
+
+                # Co-crystal ligand (cyan) — this IS the pose
+                if pose_mol_s3 is not None:
+                    from rdkit.Chem import MolToMolBlock as _MB
+                    _vs3.addModel(_MB(pose_mol_s3), "mol")
+                    _lig_mi = _mi_s3
+                    _vs3.setStyle({"model": _lig_mi}, {
+                        "stick": {"colorscheme": "cyanCarbon", "radius": 0.28}
+                    })
+                    _mi_s3 += 1
+
+                # Pocket residues from distance shell or fpocket
+                # Use complex_path (protein+ligand together) for distance calc
+                _pocket_pdb = cpx_pdb if (cpx_pdb and os.path.exists(str(cpx_pdb))) else prot_pdb
+                if _pocket_pdb and pose_mol_s3 is not None and os.path.exists(_pocket_pdb):
+                    try:
+                        _pocket_res = core.get_interacting_residues(
+                            _pocket_pdb, pose_mol_s3, cutoff=s3_cutoff)
+                        for _rb in _pocket_res:
+                            _sel_s3 = {"model": 0, "resi": _rb["resi"]}
+                            if _rb.get("chain", "").strip():
+                                _sel_s3["chain"] = _rb["chain"]
+                            _vs3.setStyle(_sel_s3, {
+                                "stick":   {"colorscheme": "orangeCarbon", "radius": 0.20},
+                                "cartoon": {"color": "spectrum", "opacity": 0.70},
+                            })
+                            if s3_labels:
+                                _vs3.addLabel(
+                                    f"{_rb['resn']}{_rb['resi']}",
+                                    {"fontSize": 11, "fontColor": "yellow",
+                                     "backgroundColor": "black",
+                                     "backgroundOpacity": 0.65,
+                                     "inFront": True, "showBackground": True},
+                                    _sel_s3,
+                                )
+                    except Exception as _pe:
+                        pass  # pocket detection failed silently
+
+                # If no mol (can't read PDB), show pocket from session state
+                if pose_mol_s3 is None:
+                    # Draw pocket residues from distance shell data stored in session
+                    _pd = st.session_state.get("_void_all_pocket_resnums", [])
+                    for _rn in _pd:
+                        _vs3.setStyle(
+                            {"model": 0, "resi": _rn},
+                            {"stick":   {"colorscheme": "orangeCarbon", "radius": 0.20},
+                             "cartoon": {"color": "spectrum", "opacity": 0.75}},
+                        )
+
+                # Zoom to ligand or pocket
+                if pose_mol_s3 is not None:
+                    _vs3.zoomTo({"model": _lig_mi})
+                elif st.session_state.get("_void_all_pocket_resnums"):
+                    _vs3.zoomTo({"resi": st.session_state["_void_all_pocket_resnums"][:5]})
+                else:
+                    _vs3.zoomTo({"model": 0})
+
+                show3d(_vs3, height=s3_height)
+
+            except ImportError:
+                st.info("Install `py3Dmol` to enable 3D viewer.")
+            except Exception as _s3e:
+                st.warning(f"3D viewer error: {_s3e}")
+
+    # ── fpocket real pocket detection ────────────────────────────────────
+    _prot_pdb_fp = (st.session_state.protein_path or
+                    st.session_state.receptor_path or "")
+    _fpocket_available = _FPA_OK if _fpa else False
+
+    if _prot_pdb_fp and os.path.exists(str(_prot_pdb_fp)):
+        st.divider()
+        st.markdown("### 🕳️ Real pocket detection (fpocket)")
+
+        if not _fpocket_available:
+            info_card(
+                "<strong>fpocket not installed.</strong> "
+                "Install with <code>sudo apt install fpocket</code> (Linux) "
+                "or <code>brew install fpocket</code> (macOS). "
+                "Until then, pocket residues are detected by distance from ligand only."
+            )
+        else:
+            info_card(
+                "fpocket uses <strong>Voronoi tessellation + alpha-sphere algorithm</strong> "
+                "to detect all druggable pockets — no ligand needed. "
+                "The pocket <strong>nearest to the co-crystal ligand</strong> is auto-selected "
+                "for void analysis and ML fragment ranking."
+            )
+
+            _fp_c1, _fp_c2 = st.columns([3, 1])
+            with _fp_c1:
+                _fp_min = st.slider("Min alpha-sphere radius (Å)", 2, 5, 3, 1, key="fp_min")
+                _fp_max = st.slider("Max alpha-sphere radius (Å)", 4, 10, 6, 1, key="fp_max")
+            with _fp_c2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🔍 Run fpocket", type="primary", key="fpocket_run_btn"):
+                    _lig_atoms_fp = st.session_state.get("_ligand_atoms_for_void", [])
+                    with st.spinner("Running fpocket pocket detection…"):
+                        _fp_res_df, _fp_all, _fp_sel, _fp_msg = _fpa.fpocket_pocket_analysis(
+                            _prot_pdb_fp,
+                            ligand_atoms=_lig_atoms_fp,
+                            work_dir=str(get_work_dir() / "fpocket"),
+                            min_sphere=_fp_min,
+                            max_sphere=_fp_max,
+                        )
+                    if _fp_res_df is not None and not _fp_res_df.empty:
+                        st.session_state["_fpocket_pockets"]    = _fp_all
+                        st.session_state["_fpocket_selected"]   = _fp_sel
+                        st.session_state["_pocket_df_override"] = _fp_res_df
+                        st.success(
+                            f"✅ {len(_fp_all)} pockets found. "
+                            f"Pocket {_fp_sel.get('pocket_id',1)} selected — "
+                            f"dist to ligand: {_fp_sel.get('dist_to_ligand_centroid_A','?')} Å · "
+                            f"druggability: {_fp_sel.get('druggability_score',0):.2f} · "
+                            f"volume: {_fp_sel.get('volume_A3',0):.0f} ų"
+                        )
+                    else:
+                        st.warning(f"fpocket: {_fp_msg or 'no pockets found'}")
+
+            _fp_cached = st.session_state.get("_fpocket_pockets", [])
+            if _fp_cached:
+                _fp_sel_id = st.session_state.get("_fpocket_selected", {}).get("pocket_id")
+                _fp_rows = [{
+                    "Pocket":           p["pocket_id"],
+                    "Score":            round(p.get("fpocket_score", 0), 2),
+                    "Druggability":     round(p.get("druggability_score", 0), 2),
+                    "Volume (ų)":       int(p.get("volume_A3", 0)),
+                    "α-spheres":        int(p.get("n_alpha_spheres", 0)),
+                    "Residues":         p.get("n_residues", 0),
+                    "Dist to ligand (Å)": p.get("dist_to_ligand_centroid_A", "—"),
+                    "":                  "✅ selected" if p.get("pocket_id") == _fp_sel_id else "",
+                } for p in _fp_cached]
+                st.dataframe(pd.DataFrame(_fp_rows), hide_index=True, width='stretch')
+                hint("Druggability ≥ 0.5 indicates a well-defined druggable pocket. "
+                     "The selected pocket's residues are used for void analysis and ChemBERTa ML ranking.")
+
+                # Override button — let user pick a different pocket
+                _alt_ids = [f"Pocket {p['pocket_id']}" for p in _fp_cached]
+                _cur_idx = next((i for i, p in enumerate(_fp_cached)
+                                 if p.get("pocket_id") == _fp_sel_id), 0)
+                _sel_label = st.selectbox("Override selection:", _alt_ids,
+                                          index=_cur_idx, key="fp_override_sel")
+                _override_id = int(_sel_label.split()[1])
+                if _override_id != _fp_sel_id:
+                    if st.button("Use this pocket instead", key="fp_override_btn"):
+                        _new_sel = next(p for p in _fp_cached
+                                        if p["pocket_id"] == _override_id)
+                        st.session_state["_fpocket_selected"]   = _new_sel
+                        st.session_state["_pocket_df_override"] = _fpa.pocket_residues_df(_new_sel)
+                        st.rerun()
+
+    # ── Void / unoccupied space analysis ─────────────────────────────────
+    if _VA_OK and st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
+        st.divider()
+        st.markdown("### 📐 Unoccupied pocket space analysis")
+        info_card(
+            "Detects sub-pockets <strong>not filled by the current ligand</strong> "
+            "and recommends fragment sizes that fit the available space. "
+            "Use this to decide which attachment vector to grow into."
+        )
+
+        va_cutoff = st.slider("Pocket cutoff (Å)", 4.0, 10.0, 6.0, 0.5, key="va_cutoff")
+        va_cluster = st.slider("Sub-pocket cluster distance (Å)", 3.0, 10.0, 6.0, 0.5, key="va_cluster")
+
+        if st.button("Analyse unoccupied space", type="primary", key="va_btn"):
+            with st.spinner("Detecting void sub-pockets…"):
+                try:
+                    from core import read_complex_atoms_for_pocket, analyze_complex_distance_shell
+                    prot_atoms, lig_atoms = read_complex_atoms_for_pocket(
+                        st.session_state.complex_path)
+                    p_df, c_df, g_df, lig_raw = analyze_complex_distance_shell(
+                        st.session_state.complex_path,
+                        pocket_cutoff=va_cutoff,
+                        contact_cutoff=4.0,
+                    )
+                    # Override with fpocket residues if available
+                    _fp_ov = st.session_state.get("_pocket_df_override")
+                    if _fp_ov is not None and not _fp_ov.empty:
+                        p_df = _fp_ov.copy()
+                        g_df = _fp_ov.copy()
+                        st.caption("ℹ️ Using fpocket-detected pocket residues for void analysis.")
+                    # Store ligand atoms for fpocket (used if fpocket runs later)
+                    if lig_atoms:
+                        st.session_state["_ligand_atoms_for_void"] = lig_atoms
+                    subpockets, va_mode = _va.analyze_void(
+                        prot_atoms, lig_atoms if lig_atoms else None,
+                        p_df, g_df,
+                        pocket_cutoff=va_cutoff,
+                        cluster_dist=va_cluster,
+                    )
+                    st.session_state["_void_subpockets"] = subpockets
+                    st.session_state["_void_mode"] = va_mode
+
+                    # ── Per-atom sub-pocket routing ──────────────────────────
+                    # Map each selected attachment atom → its directional sub-pocket
+                    _sel_atoms   = list(st.session_state.selected_atoms)
+                    _ref_lig     = st.session_state.ref_ligand_path or ""
+                    _parent_mol  = st.session_state.parent_mol
+
+                    if _sel_atoms and _parent_mol and _ref_lig and os.path.exists(_ref_lig):
+                        # 1. Map 2D atom indices → 3D XYZ
+                        _atom_xyz = core.map_attachment_atoms_to_3d(_parent_mol, _ref_lig)
+
+                        # 2. Compute ligand centroid
+                        _lig_xyz_list = [a["xyz"] for a in lig_atoms] if lig_atoms else []
+                        if _lig_xyz_list:
+                            import numpy as _np2
+                            _lig_ctr = _np2.mean(_lig_xyz_list, axis=0)
+                        else:
+                            _lig_ctr = _np2.zeros(3)
+
+                        # 3. Route each atom to its directional sub-pocket
+                        _atom_sp_map = core.route_atoms_to_subpockets(
+                            _sel_atoms, _atom_xyz, subpockets, _lig_ctr
+                        )
+                        st.session_state["_atom_subpocket_map"] = _atom_sp_map
+
+                        # ── Filter subpockets to only those near selected atoms ──
+                        # Keep sub-pockets that are directionally matched to
+                        # at least one selected atom (score > 0 = forward direction)
+                        _relevant_sp_ids = set()
+                        for _asp in _atom_sp_map.values():
+                            _relevant_sp_ids.add(_asp.get("sub_pocket_id"))
+                        if _relevant_sp_ids:
+                            _filtered_subpockets = [
+                                sp for sp in subpockets
+                                if sp["sub_pocket_id"] in _relevant_sp_ids
+                            ]
+                            st.session_state["_void_subpockets"] = _filtered_subpockets
+                            if len(_filtered_subpockets) < len(subpockets):
+                                hint(
+                                    f"ℹ️ Showing {len(_filtered_subpockets)} of "
+                                    f"{len(subpockets)} sub-pockets — filtered to "
+                                    "those near your selected attachment atoms."
+                                )
+
+                        # 4. Apply both criteria per atom
+                        _atom_criteria = core.per_atom_fragment_criteria(
+                            _atom_sp_map,
+                            list(core.LIBRARY),
+                            st.session_state.get("_plip_tag_counts") or
+                            st.session_state.get("_pocket_tag_counts") or {},
+                            pocket_reference_module=_pr if _PR_OK else None,
+                            size_filter_module=_va if _VA_OK else None,
+                        )
+                        st.session_state["_atom_criteria"] = _atom_criteria
+
+                        if _atom_sp_map:
+                            _sp_summary = "  ".join(
+                                f"Atom {a} → SP{v['sub_pocket_id']} "
+                                f"[{v['size_class']}, r={v['available_radius_A']:.1f}Å]"
+                                for a, v in _atom_sp_map.items()
+                            )
+                            st.success(f"✅ Per-atom pocket routing: {_sp_summary}")
+
+                    # Store all pocket residue resnums for viewer grey-out
+                    try:
+                        _all_resnums = [
+                            row.get("resnum", "")
+                            for _, row in p_df.iterrows()
+                        ]
+                        st.session_state["_void_all_pocket_resnums"] = [r for r in _all_resnums if r]
+                    except Exception:
+                        st.session_state["_void_all_pocket_resnums"] = []
+                    st.success(
+                        f"Mode: **{va_mode}** — "
+                        f"found **{len(subpockets)}** unoccupied sub-pocket(s)"
+                    )
+                except Exception as e:
+                    st.error(f"Void analysis failed: {e}")
+
+        # Show results if available
+        subpockets = st.session_state.get("_void_subpockets", [])
+        va_mode    = st.session_state.get("_void_mode", "")
+        if subpockets:
+            # Summary text
+            st.markdown(_va.void_summary_text(subpockets, va_mode))
+
+            # Detailed table
+            sp_df = _va.subpockets_to_df(subpockets)
+            st.dataframe(sp_df, width='stretch', hide_index=True)
+
+            # Per sub-pocket fragment size filter
+            st.markdown("#### Apply size filter to fragment generation")
+            sp_options = ["All sizes (no filter)"] + [
+                f"Sub-pocket {sp['sub_pocket_id']}: {sp['size_class']} "
+                f"(r≤{sp['available_radius_A']:.1f}Å, {sp['void_volume_est_A3']:.0f}ų)"
+                for sp in subpockets
+            ]
+            chosen_sp = st.selectbox(
+                "Restrict fragments to fit selected sub-pocket",
+                sp_options, index=0, key="va_sp_select",
+            )
+            if chosen_sp != "All sizes (no filter)":
+                sp_idx = int(chosen_sp.split(":")[0].replace("Sub-pocket","").strip()) - 1
+                if 0 <= sp_idx < len(subpockets):
+                    sel_sp = subpockets[sp_idx]
+                    st.session_state["_void_size_filter"] = sel_sp["size_class"]
+                    hint(
+                        f"Fragments larger than **{sel_sp['size_class']}** will be excluded. "
+                        f"Examples that fit: {_va.SIZE_EXAMPLES.get(sel_sp['size_class'], '')}"
+                    )
+            else:
+                st.session_state["_void_size_filter"] = None
+
+            # ── 3D Pocket Viewer (void sub-pockets) ──────────────────────
+            if subpockets:
+                st.markdown("#### 🧬 Pocket 3D view — sub-pocket map")
+                hint(
+                    "Protein pocket coloured by sub-pocket. "
+                    "Each colour represents a distinct unoccupied region detected by void analysis."
+                )
+
+                # Sub-pocket colour palette
+                _SP_COLOURS = [
+                    "orangeCarbon",   # sub-pocket 1
+                    "cyanCarbon",     # sub-pocket 2
+                    "magentaCarbon",  # sub-pocket 3
+                    "greenCarbon",    # sub-pocket 4
+                    "yellowCarbon",   # sub-pocket 5
+                ]
+                _SP_HEX = ["#FF8C00", "#00FFFF", "#FF00FF", "#00FF44", "#FFD700"]
+
+                _va_v3d_col1, _va_v3d_col2 = st.columns([1, 3])
+                with _va_v3d_col1:
+                    _va_labels  = st.checkbox("Residue labels", value=True, key="va3d_labels")
+                    _va_surface = st.checkbox("Protein surface", value=False, key="va3d_surface")
+                    _va_cutoff  = st.slider("Cutoff (Å)", 3.0, 8.0, 6.0, 0.5, key="va3d_cutoff")
+                    _va_height  = st.slider("Height (px)", 300, 600, 440, 50, key="va3d_height")
+
+                    # Legend
+                    st.markdown("**Sub-pocket legend:**")
+                    for sp in subpockets[:5]:
+                        sp_id  = sp["sub_pocket_id"] - 1
+                        colour = _SP_HEX[sp_id % len(_SP_HEX)]
+                        sc     = sp["size_class"]
+                        vol    = sp["void_volume_est_A3"]
+                        st.markdown(
+                            f'<div style="display:flex;align-items:center;gap:8px;'
+                            f'font-size:0.78rem;margin-bottom:3px;">'
+                            f'<div style="width:12px;height:12px;border-radius:3px;'
+                            f'background:{colour};flex-shrink:0"></div>'
+                            f'SP{sp["sub_pocket_id"]} [{sc}, {vol:.0f}ų]</div>',
+                            unsafe_allow_html=True,
+                        )
+                    st.markdown(
+                        '<div style="font-size:0.72rem;color:#888;margin-top:6px;">'
+                        '<span style="color:#AAAAAA">■</span> Protein &nbsp; '
+                        '<span style="color:#888">·</span> All pocket residues</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                with _va_v3d_col2:
+                    try:
+                        import py3Dmol as _p3d
+                        _va_view = _p3d.view(width="100%", height=_va_height)
+                        _va_view.setBackgroundColor(_viewer_bg())
+
+                        # Protein cartoon
+                        rec_pdb = (st.session_state.protein_path
+                                   or st.session_state.receptor_path or "")
+                        if rec_pdb and os.path.exists(rec_pdb):
+                            _va_view.addModel(open(rec_pdb).read(), "pdb")
+                            _va_view.setStyle({"model": 0}, {
+                                "cartoon": {"color": "lightgray", "opacity": 0.30}
+                            })
+                            if _va_surface:
+                                _va_view.addSurface(
+                                    _p3d.SAS,
+                                    {"opacity": 0.18, "color": "white"},
+                                    {"model": 0}
+                                )
+
+                        # Co-crystal / docked ligand (cyan)
+                        ref_pdb = st.session_state.ref_ligand_path or ""
+                        if ref_pdb and os.path.exists(ref_pdb):
+                            _va_view.addModel(open(ref_pdb).read(), "pdb")
+                            _va_view.setStyle({"model": 1}, {
+                                "stick": {"colorscheme": "cyanCarbon", "radius": 0.30}
+                            })
+
+                        # Colour each sub-pocket's residues differently
+                        _zoom_sel = []
+                        for sp in subpockets[:5]:
+                            sp_id    = sp["sub_pocket_id"] - 1
+                            _colour  = _SP_COLOURS[sp_id % len(_SP_COLOURS)]
+                            _hex     = _SP_HEX[sp_id % len(_SP_HEX)]
+                            for member in sp.get("members", []):
+                                _rnum  = member["resnum"]
+                                _chain = member.get("chain", "")
+                                _rname = member.get("resname", "")
+                                _sel   = {"resi": _rnum}
+                                if _chain and _chain.strip():
+                                    _sel["chain"] = _chain
+                                _va_view.setStyle(_sel, {
+                                    "stick": {"colorscheme": _colour, "radius": 0.22}
+                                })
+                                if _va_labels:
+                                    _va_view.addLabel(
+                                        f"{_rname}{_rnum}",
+                                        {
+                                            "fontSize": 10,
+                                            "fontColor": _hex,
+                                            "backgroundColor": "black",
+                                            "backgroundOpacity": 0.55,
+                                            "inFront": True,
+                                        },
+                                        _sel,
+                                    )
+                                _zoom_sel.append(_rnum)
+
+                        # All other pocket residues (not in any sub-pocket)
+                        _sp_residues = {
+                            m["resnum"]
+                            for sp in subpockets
+                            for m in sp.get("members", [])
+                        }
+                        _all_pocket = st.session_state.get("_void_all_pocket_resnums", [])
+                        for _rnum in _all_pocket:
+                            if _rnum not in _sp_residues:
+                                _va_view.setStyle(
+                                    {"resi": _rnum},
+                                    {"stick": {"color": "#555555", "radius": 0.12}}
+                                )
+
+                        # Zoom to pocket
+                        if _zoom_sel:
+                            _va_view.zoomTo({"resi": _zoom_sel})
+                        else:
+                            _va_view.zoomTo()
+
+                        show3d(_va_view, height=_va_height)
+
+                    except ImportError:
+                        st.info("Install `py3Dmol` to enable 3D pocket viewer.")
+                    except Exception as _va_e:
+                        st.warning(f"3D pocket viewer error: {_va_e}")
+
+    st.divider()
+    st.markdown("### Generation settings")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.session_state.n_analogs = st.slider(
+            "Number of analogs", 5, 1000, st.session_state.n_analogs, step=5)
+        _tier_preview = analog_tier(st.session_state.n_analogs)
+        st.markdown(
+            f'<p style="font-size:0.82rem;margin-top:-4px;">'
+            f'With <strong>{st.session_state.n_analogs}</strong> analogs: '
+            f'{tier_badge_html(_tier_preview)}</p>',
+            unsafe_allow_html=True,
+        )
+    with c2:
+        risk_map = {
+            "Conservative":          "Conservative",
+            "Moderate (recommended)":"Moderate",
+            "Exploratory":           "Exploratory",
+        }
+        r = st.radio("Substitution size", list(risk_map.keys()),
+                     index=list(risk_map.values()).index(st.session_state.risk), horizontal=True)
+        st.session_state.risk = risk_map[r]
+
+    with st.expander("⚙️ Advanced options"):
+        st.session_state.max_MW      = st.number_input("Max MW (Da)", value=st.session_state.max_MW, step=25.0)
+        st.session_state.avoid_nitro = st.checkbox("Remove nitro groups", value=st.session_state.avoid_nitro)
+        st.session_state.avoid_toxic = st.checkbox("Remove toxic flags",  value=st.session_state.avoid_toxic)
+        st.session_state.max_pocket_frags = st.slider("Max pocket-guided fragments", 3, 20,
+                                                       st.session_state.max_pocket_frags)
+
+    st.write("")
+    col_back, col_next = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            go(2)
+    with col_next:
+        if st.button("Generate analogs →", type="primary"):
+            go(4)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 – View results
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif step == 4:
+    mol = st.session_state.parent_mol
+
+    size_cap = {"Conservative": 4, "Moderate": 8, "Exploratory": 14}[st.session_state.risk]
+    active_lib = [
+        f for f in core.LIBRARY
+        if st.session_state.categories_on.get(f.category, True) and f.heavy <= size_cap
+    ]
+    # Apply void size filter if user selected a sub-pocket
+    _void_size_filter = st.session_state.get("_void_size_filter")
+    if _void_size_filter and _VA_OK:
+        active_lib = _va.filter_frags_by_size(active_lib, _void_size_filter, allow_smaller=True)
+        st.info(
+            f"📐 Void filter active: showing fragments ≤ **{_void_size_filter}** size "
+            f"({len(active_lib):,} fragments match). "
+            f"Change in Step 3 → Unoccupied space analysis."
+        )
+    pocket_frags = st.session_state.pocket_frags or []
+    _atom_criteria = st.session_state.get("_atom_criteria", {})
+
+    if mode == "structure" and _atom_criteria and st.session_state.selected_atoms:
+        # ── Per-atom routing: build chosen pool from per-atom criteria ────────
+        # Each selected atom has its own ranked + size-filtered fragment list.
+        # Merge: union of all atoms' combined_frags, sorted by mean score.
+        from collections import defaultdict as _dd
+        _frag_scores: dict = _dd(list)
+        for atom_idx, criteria in _atom_criteria.items():
+            for frag, score in criteria.get("combined_frags", []):
+                _frag_scores[frag.name].append(score)
+
+        if _frag_scores:
+            # Mean score across atoms; sort descending
+            _merged = sorted(
+                [(name, sum(scores)/len(scores))
+                 for name, scores in _frag_scores.items()],
+                key=lambda x: -x[1]
+            )
+            _merged_names = {name for name, _ in _merged}
+            # Re-order active_lib to match merged ranking
+            _lib_by_name  = {f.name: f for f in active_lib}
+            chosen = (
+                [_lib_by_name[n] for n, _ in _merged if n in _lib_by_name] +
+                [f for f in active_lib if f.name not in _merged_names]
+            )
+            # Show per-atom summary in Step 4
+            with st.expander("🎯 Per-atom fragment criteria", expanded=False):
+                for atom_idx, crit in _atom_criteria.items():
+                    sp = crit["sub_pocket"]
+                    st.markdown(
+                        f"**Atom {atom_idx}** → Sub-pocket {sp.get('sub_pocket_id','?')}  "
+                        f"[{crit['size_class']}, r={crit['available_radius_A']:.1f} Å]  "
+                        f"· {crit['n_combined']} fragments fit both criteria"
+                    )
+                    if crit.get("combined_frags"):
+                        top5 = [(f.name, round(s,3)) for f,s in crit["combined_frags"][:5]]
+                        st.caption("Top 5: " + "  ".join(f"`{n}` ({s})" for n,s in top5))
+        else:
+            # Fallback to global pocket_frags
+            chosen = pocket_frags + [f for f in active_lib if f.name not in {g.name for g in pocket_frags}]
+
+    elif mode == "structure" and pocket_frags and st.session_state.accept_pocket_suggestions:
+        chosen = pocket_frags + [f for f in active_lib if f.name not in {g.name for g in pocket_frags}]
+    else:
+        chosen = active_lib
+
+    # ── Custom fragments: bypass all rules, generate directly ───────────────
+    _custom_text = st.session_state.custom_frags_text.strip()
+    _custom_frags = []
+    for smi in _custom_text.splitlines():
+        smi = smi.strip()
+        if not smi:
+            continue
+        ok, _ = core.validate_fragment_smiles(smi)
+        if ok:
+            _custom_frags.append(core.Frag(f"custom_{len(_custom_frags)}", smi, "custom", core.G()))
+
+    _custom_only = bool(_custom_frags)   # True → ignore library, skip all filters
+    if _custom_only:
+        chosen = _custom_frags   # replace entire library with user fragments
+    else:
+        chosen.extend(_custom_frags)   # append custom to library
+
+    # ── Merge external fragments (ChEMBL / ZINC) if fetched ──────────────────
+    _efl_raw = st.session_state.get("_efl_fragments", [])
+    if _efl_raw and not _custom_only and _EFL_OK:
+        _efl_frags = _efl.to_frag_objects(_efl_raw, core)
+        _existing_names = {f.name for f in chosen}
+        _new_efl = [f for f in _efl_frags if f.name not in _existing_names]
+        chosen.extend(_new_efl)
+        if _new_efl:
+            hint(f"ℹ️ {len(_new_efl)} external fragments (ChEMBL/ZINC) added to library.")
+
+    selected = st.session_state.selected_atoms
+    allow_het = st.session_state.allow_heteroatom_H
+    valid_sites = [
+        s for s in sorted(selected)
+        if mol.GetAtomWithIdx(s).GetTotalNumHs() > 0
+        and (allow_het or mol.GetAtomWithIdx(s).GetAtomicNum() == 6)
     ]
 
+    if not valid_sites:
+        st.error("No valid attachment sites. Go back to Step 2 and select atoms.")
+        if st.button("← Back to atom selection"):
+            go(2)
+        st.stop()
 
-# ---------------------------------------------------------------------------
-# Analog generation
-# ---------------------------------------------------------------------------
+    site_groups = [tuple(valid_sites)] if (st.session_state.concerted and len(valid_sites) > 1) \
+                  else [(s,) for s in valid_sites]
 
-def attach(parent: Chem.Mol, atom_idx: int, frag_smiles: str) -> Optional[Chem.Mol]:
-    """Attach a [*]-fragment to parent atom by replacing one implicit H."""
-    atom_idx = int(atom_idx)
-    if parent.GetAtomWithIdx(atom_idx).GetTotalNumHs() == 0:
-        return None
-    frag = Chem.MolFromSmiles(frag_smiles)
-    if frag is None:
-        return None
-    dummies = [a.GetIdx() for a in frag.GetAtoms() if a.GetAtomicNum() == 0]
-    if len(dummies) != 1:
-        return None
-    dummy_idx = dummies[0]
-    nbrs = frag.GetAtomWithIdx(dummy_idx).GetNeighbors()
-    if len(nbrs) != 1:
-        return None
-    nbr_idx = nbrs[0].GetIdx()
-    combo = Chem.CombineMols(parent, frag)
-    rw = Chem.RWMol(combo)
-    off = parent.GetNumAtoms()
-    rw.AddBond(atom_idx, nbr_idx + off, Chem.BondType.SINGLE)
-    rw.RemoveAtom(dummy_idx + off)
-    m = rw.GetMol()
-    try:
-        Chem.SanitizeMol(m)
-        AllChem.Compute2DCoords(m)
-    except Exception:
-        return None
-    return m
+    tot = sum(st.session_state.weights.values()) or 1
+    weights = {k: v / tot for k, v in st.session_state.weights.items()}
 
-
-def attach_to_sites(
-    parent: Chem.Mol, atom_indices: List[int], frag_smiles: str
-) -> Optional[Chem.Mol]:
-    m = Chem.Mol(parent)
-    for atom_idx in atom_indices:
-        m = attach(m, int(atom_idx), frag_smiles)
-        if m is None:
-            return None
-    return m
-
-
-def _frag_heavy(f) -> int:
-    if hasattr(f, "heavy"):
-        try:
-            return int(f.heavy)
-        except Exception:
-            pass
-    smi = getattr(f, "smiles", "")
-    mol = Chem.MolFromSmiles(smi)
-    return sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() not in [0, 1]) if mol else 999
-
-
-def generate_analogs(
-    parent: Chem.Mol,
-    selected_atoms: List[int],
-    chosen_frags: List[Frag],
-    site_groups: Optional[List[Tuple]] = None,
-    weights: Optional[Dict] = None,
-    avoid_opts: Optional[Dict] = None,
-    max_MW: float = 600.0,
-    max_analogs: int = 100,
-    rank_by: str = "Balanced (100-pt weights)",
-    parent_name: str = "parent",
-) -> pd.DataFrame:
-    """
-    Generate analogs by attaching fragments to selected sites.
-    Returns a DataFrame with property columns.
-    """
-    if weights is None:
-        weights = {k: 1 / 6 for k in ["potency", "selectivity", "solubility", "metabolic", "synthesis", "novelty"]}
-    if avoid_opts is None:
-        avoid_opts = {k: True for k in AVOID_SMARTS}
-
-    avoid_q = {
-        k: Chem.MolFromSmarts(v)
-        for k, v in AVOID_SMARTS.items()
-        if avoid_opts.get(k, False)
+    avoid_opts = {
+        "nitro":             st.session_state.avoid_nitro,
+        "aldehyde":          st.session_state.avoid_aldehyde,
+        "reactive_acylhalide": st.session_state.avoid_reactive,
+        "azide":             st.session_state.avoid_toxic,
+        "michael_acceptor":  st.session_state.avoid_reactive,
+        "epoxide":           st.session_state.avoid_toxic,
     }
 
-    if site_groups is None:
-        site_groups = [(s,) for s in selected_atoms]
+    if st.session_state.analogs_df is None:
+        if _custom_only:
+            _spinner_msg = f"Generating analogs from {len(chosen)} custom fragment(s) — all rules bypassed…"
+        else:
+            _spinner_msg = f"Generating up to {st.session_state.n_analogs} analogs from {len(chosen):,} fragments…"
+        with st.spinner(_spinner_msg):
+            df = core.generate_analogs(
+                mol,
+                selected_atoms=list(selected),
+                chosen_frags=chosen,
+                site_groups=site_groups,
+                # Custom-only: no weights, no MW filter, no avoid rules, no cap
+                weights=({k: 1.0 for k in weights} if _custom_only else weights),
+                avoid_opts=({k: False for k in avoid_opts} if _custom_only else avoid_opts),
+                max_MW=(9999 if _custom_only else st.session_state.max_MW),
+                max_analogs=(999999 if _custom_only else st.session_state.n_analogs),
+                rank_by=("none" if _custom_only else st.session_state.get("rank_code", "Balanced (100-pt weights)")),
+            )
+        st.session_state.analogs_df = df
+        if _custom_only and df is not None and not df.empty:
+            st.info(
+                f"✅ Generated **{len(df)} analogs** from {len(chosen)} custom fragment(s). "
+                "All property filters and goal weights were bypassed."
+            )
 
-    parent_can = Chem.MolToSmiles(parent)
-    pfp = AllChem.GetMorganFingerprintAsBitVect(parent, 2, nBits=2048)
+    df = st.session_state.analogs_df
 
-    rows, seen = [], {parent_can}
-    filter_counts = {"attach_failed": 0, "duplicate": 0, "MW": 0, "formal_charge": 0, "SMARTS": 0, "SA": 0}
+    if df is None or df.empty:
+        st.error("No analogs were generated. Try relaxing your filters in Step 3.")
+        if st.button("← Back to settings"):
+            go(3)
+        st.stop()
 
-    def _passes(mol):
-        if Descriptors.MolWt(mol) > max_MW:
-            return False, "MW"
-        if abs(Chem.GetFormalCharge(mol)) > 1:
-            return False, "formal_charge"
-        for q in avoid_q.values():
-            if q and mol.HasSubstructMatch(q):
-                return False, "SMARTS"
-        return True, "passed"
+    n_analogs = len(df)
+    tier = analog_tier(n_analogs)
 
-    for sites in site_groups:
-        for f in chosen_frags:
-            m = attach_to_sites(parent, list(sites), f.smiles)
-            if m is None:
-                filter_counts["attach_failed"] += 1
-                continue
-            can = Chem.MolToSmiles(m)
-            if can in seen:
-                filter_counts["duplicate"] += 1
-                continue
-            ok, reason = _passes(m)
-            if not ok:
-                filter_counts[reason] = filter_counts.get(reason, 0) + 1
-                continue
-            seen.add(can)
-            fp = AllChem.GetMorganFingerprintAsBitVect(m, 2, nBits=2048)
-            site_label = ",".join(map(str, sites))
-            rows.append(dict(
-                smiles=can,
-                change=(
-                    f"concerted@{site_label}+{f.name}"
-                    if len(sites) > 1
-                    else f"@{site_label}+{f.name}"
-                ),
-                mode=("concerted" if len(sites) > 1 else "individual"),
-                sites=site_label,
-                n_sites=len(sites),
-                fragment_name=f.name,
-                fragment_smiles=f.smiles,
-                fragment_category=f.category,
-                fragment_size_class=infer_fragment_size_class(f),
-                fragment_heavy_atoms=_frag_heavy(f),
-                MW=round(Descriptors.MolWt(m), 1),
-                logP=round(Crippen.MolLogP(m), 2),
-                TPSA=round(rdMolDescriptors.CalcTPSA(m), 1),
-                HBD=rdMolDescriptors.CalcNumHBD(m),
-                HBA=rdMolDescriptors.CalcNumHBA(m),
-                QED=round(QED.qed(m), 3),
-                ESOL=round(esol_logS(m), 2),
-                SA=round(sa_score(m), 2),
-                sim=round(TanimotoSimilarity(pfp, fp), 3),
-            ))
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # Ranking
-    def _norm(s):
-        s = pd.Series(s).astype(float)
-        lo, hi = s.min(), s.max()
-        return (s - lo) / (hi - lo) if hi > lo else s * 0 + 0.5
-
-    balanced = (
-        weights.get("solubility", 0) * _norm(df.ESOL)
-        + weights.get("synthesis", 0) * (1 - _norm(df.SA))
-        + weights.get("novelty", 0) * (1 - _norm(df.sim))
-        + weights.get("metabolic", 0) * (1 - _norm((df.logP - 2.5).abs()))
-        + (weights.get("potency", 0) + weights.get("selectivity", 0)) * _norm(df.QED)
-    )
-    df["balanced"] = balanced.round(3)
-    df["binding_proxy"] = (_norm(df.logP.clip(upper=4)) + _norm(df.QED)).round(3)
-
-    rank_col_map = {
-        "Balanced (100-pt weights)": ("balanced", False),
-        "Similarity to parent": ("sim", False),
-        "Solubility (ESOL)": ("ESOL", False),
-        "ADMET (QED)": ("QED", False),
-        "Synthetic feasibility": ("SA", True),
-        "Binding proxy (heuristic)": ("binding_proxy", False),
+    # ── Tier info banner ────────────────────────────────────────────────────
+    tier_msgs = {
+        "docking":  f"✅ <strong>{n_analogs} analogs generated</strong> — Docking, pKaNET 3D conversion, and SMI download available.",
+        "pkanet":   f"⚡ <strong>{n_analogs} analogs generated</strong> — SMI download and pKaNET protonation/3D conversion available. Docking is available for ≤ 20 analogs.",
+        "smi_only": f"📄 <strong>{n_analogs} analogs generated</strong> — SMI download only. Reduce to ≤ 200 for pKaNET, or ≤ 20 for docking.",
     }
-    col, asc = rank_col_map.get(rank_by, ("balanced", False))
-    df = df.sort_values(col, ascending=asc).head(max_analogs).reset_index(drop=True)
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Pocket residue → fragment suggestion
-# ---------------------------------------------------------------------------
-
-AA_ONE_TO_THREE = {
-    "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS", "Q": "GLN",
-    "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE", "L": "LEU", "K": "LYS",
-    "M": "MET", "F": "PHE", "P": "PRO", "S": "SER", "T": "THR", "W": "TRP",
-    "Y": "TYR", "V": "VAL",
-}
-AA3_TO_ONE = {v: k for k, v in AA_ONE_TO_THREE.items()}
-
-AA_TOKEN_TO_ONE = {
-    **{v: k for k, v in AA_ONE_TO_THREE.items()},
-    **{k: k for k in AA_ONE_TO_THREE},
-    **{v.upper(): k for k, v in AA_ONE_TO_THREE.items()},
-}
-
-AA_TAGS: Dict[str, List[str]] = {
-    "D": ["acidic_negative", "hbond_acceptor"],
-    "E": ["acidic_negative", "hbond_acceptor"],
-    "K": ["basic_positive", "hbond_donor"],
-    "R": ["basic_positive", "hbond_donor"],
-    "H": ["basic_positive", "hbond_donor", "hbond_acceptor", "aromatic"],
-    "S": ["polar_hbond", "hbond_donor", "hbond_acceptor"],
-    "T": ["polar_hbond", "hbond_donor", "hbond_acceptor"],
-    "N": ["polar_hbond", "hbond_donor", "hbond_acceptor"],
-    "Q": ["polar_hbond", "hbond_donor", "hbond_acceptor"],
-    "Y": ["polar_hbond", "hbond_donor", "aromatic", "hydrophobic"],
-    "C": ["polar_hbond", "hbond_donor", "sulfur_polarizable"],
-    "A": ["hydrophobic"], "V": ["hydrophobic"], "L": ["hydrophobic"],
-    "I": ["hydrophobic"], "M": ["hydrophobic", "sulfur_polarizable"],
-    "P": ["hydrophobic", "shape_constraint"],
-    "F": ["hydrophobic", "aromatic"],
-    "W": ["hydrophobic", "aromatic", "hbond_donor"],
-    "G": ["small_flexible"],
-}
-
-TAG_TO_DESIGN: Dict[str, Dict] = {
-    "acidic_negative": {
-        "pocket_property": "acidic / negative residue",
-        "ligand_strategy": "add basic/cationic or H-bond donor groups",
-        "fragment_names": ["amino", "dimethylamino", "piperazine", "morpholine", "piperidine"],
-    },
-    "basic_positive": {
-        "pocket_property": "basic / positive residue",
-        "ligand_strategy": "add acidic/anionic or strong H-bond acceptor groups",
-        "fragment_names": ["carboxyl", "sulfonamide", "tetrazole", "cyano", "methylsulfonyl"],
-    },
-    "polar_hbond": {
-        "pocket_property": "polar H-bond residue",
-        "ligand_strategy": "add H-bond donor/acceptor groups",
-        "fragment_names": ["hydroxyl", "hydroxymethyl", "amide(C(=O)NH2)", "methoxy", "methylsulfonyl"],
-    },
-    "hbond_donor": {
-        "pocket_property": "residue can donate H-bond",
-        "ligand_strategy": "add ligand H-bond acceptor groups",
-        "fragment_names": ["methoxy", "cyano", "methylsulfonyl", "pyridin-3-yl"],
-    },
-    "hbond_acceptor": {
-        "pocket_property": "residue can accept H-bond",
-        "ligand_strategy": "add ligand H-bond donor groups",
-        "fragment_names": ["hydroxyl", "amino", "amide(C(=O)NH2)", "sulfonamide"],
-    },
-    "hydrophobic": {
-        "pocket_property": "hydrophobic residue",
-        "ligand_strategy": "add small hydrophobic, aromatic, or halogen groups",
-        "fragment_names": ["methyl", "ethyl", "isopropyl", "cyclopropyl", "chloro", "trifluoromethyl", "phenyl"],
-    },
-    "aromatic": {
-        "pocket_property": "aromatic residue",
-        "ligand_strategy": "add π-stacking or hydrophobic groups",
-        "fragment_names": ["phenyl", "pyridin-3-yl", "thiophen-2-yl", "pyrazol-1-yl", "chloro"],
-    },
-    "sulfur_polarizable": {
-        "pocket_property": "sulfur / polarizable residue",
-        "ligand_strategy": "add soft hydrophobic/halogen groups",
-        "fragment_names": ["chloro", "trifluoromethyl", "thiophen-2-yl", "phenyl", "methylsulfonyl"],
-    },
-    "shape_constraint": {
-        "pocket_property": "shape-constraining residue",
-        "ligand_strategy": "add compact conformationally restricted groups",
-        "fragment_names": ["cyclopropyl", "oxetan-3-yl", "methyl"],
-    },
-    "small_flexible": {
-        "pocket_property": "small/flexible residue",
-        "ligand_strategy": "space may tolerate small growth",
-        "fragment_names": ["methyl", "fluoro", "hydroxyl", "cyano"],
-    },
-}
-
-
-def parse_pocket_residues(text: str) -> List[str]:
-    found = []
-    for raw in re.findall(r"[A-Za-z]{1,14}\d*", text or ""):
-        letters = re.sub(r"\d+", "", raw).upper()
-        if letters in AA_TOKEN_TO_ONE:
-            found.append(AA_TOKEN_TO_ONE[letters])
-    return found
-
-
-def suggest_fragments_from_residues(
-    residue_codes: List[str],
-    active_library: List[Frag],
-    max_suggestions: int = 6,
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[Frag]]:
-    tag_counts: Dict[str, int] = {}
-    for aa in residue_codes:
-        for tag in AA_TAGS.get(aa, []):
-            tag_counts[tag] = tag_counts.get(tag, 0) + 1
-
-    total_tags = sum(tag_counts.values()) or 1
-    ratios = {k: round(100 * v / total_tags, 1) for k, v in sorted(tag_counts.items(), key=lambda kv: kv[1], reverse=True)}
-
-    ratio_df = pd.DataFrame([{"pocket_property_tag": k, "ratio_%": v} for k, v in ratios.items()])
-
-    frag_score: Dict[str, float] = {}
-    strategy_rows = []
-    for tag, ratio in ratios.items():
-        info = TAG_TO_DESIGN.get(tag)
-        if not info:
-            continue
-        strategy_rows.append({
-            "property_tag": tag,
-            "ratio_%": ratio,
-            "pocket_property": info["pocket_property"],
-            "ligand_strategy": info["ligand_strategy"],
-            "suggested_fragment_examples": ", ".join(info["fragment_names"][:5]),
-        })
-        for fname in info["fragment_names"]:
-            frag_score[fname] = frag_score.get(fname, 0.0) + ratio
-
-    strategy_df = pd.DataFrame(strategy_rows).sort_values("ratio_%", ascending=False) if strategy_rows else pd.DataFrame()
-
-    lib_by_name = {f.name: f for f in active_library}
-    ordered = sorted(frag_score.items(), key=lambda kv: kv[1], reverse=True)
-    pocket_frags: List[Frag] = []
-    seen: set = set()
-    for name, _ in ordered:
-        if name in lib_by_name and name not in seen:
-            pocket_frags.append(lib_by_name[name])
-            seen.add(name)
-    pocket_frags = pocket_frags[:max_suggestions]
-    return strategy_df, ratio_df, pocket_frags
-
-
-# ---------------------------------------------------------------------------
-# PDB / structure helpers
-# ---------------------------------------------------------------------------
-
-AA3_STRUCT = set(
-    "ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL SEC PYL ASX GLX HID HIE HIP".split()
-)
-EXCLUDE_HET = set(
-    "HOH WAT DOD NA CL K MG MN ZN CA FE CU CO NI CD HG SO4 PO4 HPO4 ACT ACE EDO GOL PEG DMS DMSO MPD TRS BME MSE".split()
-)
-
-
-def _safe_file_token(x: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(x).strip() or "file")
-
-
-def _pdb_xyz(line: str) -> np.ndarray:
-    return np.array([float(line[30:38]), float(line[38:46]), float(line[46:54])], dtype=float)
-
-
-def _pdb_is_h(line: str) -> bool:
-    elem = line[76:78].strip().upper()
-    name = line[12:16].strip().upper()
-    return elem == "H" or name.startswith("H")
-
-
-def _pdb_reskey(line: str) -> Tuple:
-    return (line[21].strip() or "_", line[17:20].strip().upper(), line[22:26].strip(), line[26].strip())
-
-
-# ---------------------------------------------------------------------------
-# PubChem PUG REST API
-# ---------------------------------------------------------------------------
-
-def search_pubchem(query: str) -> Dict:
-    query = query.strip()
-    if not query:
-        return {"found": False, "error": "empty query"}
-
-    try:
-        def _get_json(url):
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read())
-
-        def _pick_smiles(prop_dict):
-            for k in ("IsomericSMILES", "CanonicalSMILES", "ConnectivitySMILES", "SMILES"):
-                v = prop_dict.get(k)
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
-            return ""
-
-        data = _get_json(
-            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
-            f"{urllib.request.quote(query)}/cids/JSON"
-        )
-        cids = data.get("IdentifierList", {}).get("CID", [])
-        if not cids:
-            return {"found": False, "error": f"'{query}' not found in PubChem"}
-        cid = cids[0]
-
-        p = {}
-        smiles = ""
-        for prop_block in [
-            "IUPACName,MolecularFormula,MolecularWeight,IsomericSMILES,CanonicalSMILES,ConnectivitySMILES",
-            "IUPACName,MolecularFormula,MolecularWeight,CanonicalSMILES,ConnectivitySMILES",
-            "IUPACName,MolecularFormula,MolecularWeight,ConnectivitySMILES",
-        ]:
-            try:
-                prop_data = _get_json(
-                    f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/"
-                    f"property/{prop_block}/JSON"
-                )
-                props = prop_data.get("PropertyTable", {}).get("Properties", [])
-                if props:
-                    p = props[0]
-                    smiles = _pick_smiles(p)
-                    if smiles:
-                        break
-            except Exception:
-                continue
-
-        if not smiles:
-            try:
-                pc_data = _get_json(
-                    f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/JSON"
-                )
-                pc = pc_data.get("PC_Compounds", [{}])[0]
-                for prop in pc.get("props", []):
-                    urn = prop.get("urn", {})
-                    label = str(urn.get("label", "")).lower()
-                    name2 = str(urn.get("name", "")).lower()
-                    if "smiles" in label or "smiles" in name2:
-                        value = prop.get("value", {})
-                        cand = value.get("sval") or value.get("string") or ""
-                        if cand.strip():
-                            smiles = cand.strip()
-                            break
-            except Exception:
-                pass
-
-        return {
-            "found": True,
-            "cid": cid,
-            "smiles": smiles,
-            "iupac": p.get("IUPACName", query),
-            "formula": p.get("MolecularFormula", ""),
-            "mw": float(p.get("MolecularWeight", 0) or 0),
-            "img_url": (
-                f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/"
-                f"{cid}/PNG?record_type=2d&image_size=300x300"
-            ),
-            "url": f"https://pubchem.ncbi.nlm.nih.gov/compound/{cid}",
-        }
-    except Exception as e:
-        return {"found": False, "error": str(e)}
-
-
-def pubchem_cid_to_smiles(cid: int) -> Optional[str]:
-    url = (
-        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/"
-        f"property/CanonicalSMILES/JSON"
-    )
-    try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        return data["PropertyTable"]["Properties"][0]["CanonicalSMILES"]
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# RCSB PDB Search API
-# ---------------------------------------------------------------------------
-
-def search_rcsb(query: str, max_results: int = 10) -> List[Dict]:
-    query = query.strip()
-    if not query:
-        return []
-
-    search_body = json.dumps({
-        "query": {
-            "type": "terminal",
-            "service": "full_text",
-            "parameters": {"value": query},
-        },
-        "return_type": "entry",
-        "request_options": {
-            "paginate": {"start": 0, "rows": max_results},
-            "results_content_type": ["experimental"],
-            "sort": [{"sort_by": "score", "direction": "desc"}],
-        },
-    })
-    search_url = "https://search.rcsb.org/rcsbsearch/v2/query"
-    try:
-        req = urllib.request.Request(
-            search_url, data=search_body.encode(),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        pdb_ids = [r["identifier"] for r in data.get("result_set", [])][:max_results]
-    except Exception:
-        pdb_ids = []
-
-    if not pdb_ids:
-        return []
-
-    results = []
-    for pdb_id in pdb_ids:
-        summary_url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
-        try:
-            req = urllib.request.Request(summary_url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                entry = json.loads(resp.read())
-            struct = entry.get("struct", {})
-            exptl = entry.get("exptl", [{}])[0] if entry.get("exptl") else {}
-            refine = entry.get("refine", [{}])[0] if entry.get("refine") else {}
-            src = entry.get("rcsb_entity_source_organism", [{}])
-            organism = src[0].get("ncbi_scientific_name", "") if src else ""
-            results.append({
-                "id": pdb_id.upper(),
-                "title": struct.get("title", ""),
-                "resolution": f"{refine.get('ls_d_res_high', '?')} Å",
-                "method": exptl.get("method", ""),
-                "organism": organism,
-            })
-        except Exception:
-            results.append({
-                "id": pdb_id.upper(),
-                "title": "(details unavailable)",
-                "resolution": "?",
-                "method": "",
-                "organism": "",
-            })
-    return results
-
-
-def download_pdb(pdb_id: str, out_dir: Path) -> str:
-    pdb_id = pdb_id.strip().upper()
-    assert re.fullmatch(r"[A-Za-z0-9]{4}", pdb_id), "PDB ID must be 4 characters."
-    out = out_dir / f"{pdb_id}.pdb"
-    if not out.exists() or out.stat().st_size < 1000:
-        url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-        urllib.request.urlretrieve(url, out)
-    return str(out)
-
-
-def cif_to_pdb_if_needed(path: str) -> str:
-    path = Path(path)
-    if path.suffix.lower() not in [".cif", ".mmcif"]:
-        return str(path)
-    out = path.with_suffix(".pdb")
-    try:
-        import gemmi  # type: ignore
-        st = gemmi.read_structure(str(path))
-        st.write_pdb(str(out))
-        return str(out)
-    except Exception as e:
-        raise RuntimeError("Could not convert CIF to PDB. Install gemmi or provide PDB.") from e
-
-
-def detect_ligand_candidates(pdb_path: str) -> Tuple[pd.DataFrame, Dict]:
-    groups: Dict = {}
-    with open(pdb_path, "r", errors="ignore") as fh:
-        for line in fh:
-            if not line.startswith("HETATM"):
-                continue
-            resn = line[17:20].strip().upper()
-            if resn in EXCLUDE_HET or resn in AA3_STRUCT:
-                continue
-            key = _pdb_reskey(line)
-            groups.setdefault(key, {"atoms": 0, "heavy": 0})
-            groups[key]["atoms"] += 1
-            groups[key]["heavy"] += 0 if _pdb_is_h(line) else 1
-    rows = []
-    for (chain, resn, resi, icode), val in groups.items():
-        rows.append({"chain": chain, "resname": resn, "resnum": resi, "icode": icode,
-                     "atoms": val["atoms"], "heavy_atoms": val["heavy"]})
-    df = pd.DataFrame(rows).sort_values(["heavy_atoms", "atoms"], ascending=False) if rows else pd.DataFrame()
-    return df, groups
-
-
-
-def _get_ligand_resname(pdb_path: str) -> str:
-    """Extract 3-letter residue name from HETATM lines in ligand PDB."""
-    try:
-        with open(pdb_path, errors="ignore") as f:
-            for line in f:
-                if line.startswith("HETATM"):
-                    resname = line[17:20].strip()
-                    if resname and resname not in ("HOH", "WAT", ""):
-                        return resname
-    except Exception:
-        pass
-    return ""
-
-
-def _smiles_from_rcsb_ccd(resname: str) -> str:
-    """Fetch canonical SMILES from RCSB Chemical Component Dictionary API."""
-    if not resname or len(resname) > 3:
-        return ""
-    try:
-        import urllib.request as _ur, json as _json
-        url = f"https://data.rcsb.org/rest/v1/core/chemcomp/{resname.upper()}"
-        req = _ur.Request(url, headers={"User-Agent": "AnalogDesigner/1.0"})
-        resp = _ur.urlopen(req, timeout=8)
-        data = _json.loads(resp.read())
-        desc = data.get("rcsb_chem_comp_descriptor", {})
-        # Prefer SMILES with stereo, fall back to canonical
-        for key in ("smiles_stereo", "smiles", "smiles_canonical"):
-            smi = desc.get(key, "")
-            if smi:
-                mol = Chem.MolFromSmiles(smi)
-                if mol and mol.GetNumAtoms() > 2:
-                    return Chem.MolToSmiles(mol)
-    except Exception:
-        pass
-    return ""
-
-
-def _smiles_from_pubchem_name(name: str) -> str:
-    """Fetch canonical SMILES from PubChem by compound name / CID."""
-    if not name:
-        return ""
-    try:
-        import urllib.request as _ur, json as _json
-        url = (f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
-               f"{_ur.quote(name)}/property/CanonicalSMILES/JSON")
-        req = _ur.Request(url, headers={"User-Agent": "AnalogDesigner/1.0"})
-        resp = _ur.urlopen(req, timeout=8)
-        data = _json.loads(resp.read())
-        smi = data["PropertyTable"]["Properties"][0].get("CanonicalSMILES", "")
-        mol = Chem.MolFromSmiles(smi)
-        if mol and mol.GetNumAtoms() > 2:
-            return Chem.MolToSmiles(mol)
-    except Exception:
-        pass
-    return ""
-
-
-def ligand_pdb_to_smiles(pdb_path: str) -> str:
-    """
-    Convert a ligand PDB file to canonical SMILES with correct bond orders.
-
-    Strategy (in order of quality / reliability):
-      1. RCSB CCD API  — lookup 3-letter code → chemically correct SMILES
-      2. OpenBabel     — 3D geometry bond order perception
-      3. RDKit DetermineBonds — RDKit >= 2022.09
-      4. RDKit MolFromPDBFile — last resort (loses aromaticity)
-    """
-    import subprocess as _sub
-
-    # ── Method 1: RCSB CCD API (3-letter code → exact SMILES) ───────────────
-    resname = _get_ligand_resname(pdb_path)
-    if resname:
-        # 1a. RCSB Chemical Component Dictionary
-        smi = _smiles_from_rcsb_ccd(resname)
-        if smi:
-            return smi
-        # 1b. PubChem by ligand 3-letter code
-        smi = _smiles_from_pubchem_name(resname)
-        if smi:
-            return smi
-        # 1c. RCSB ideal SDF download → RDKit SDMolSupplier
-        try:
-            import urllib.request as _ur
-            from rdkit.Chem import SDMolSupplier as _SDMS
-            import io as _io, tempfile as _tf, os as _tos
-            _sdf_url = f"https://files.rcsb.org/ligands/download/{resname.upper()}_ideal.sdf"
-            _req = _ur.Request(_sdf_url, headers={"User-Agent": "AnalogDesigner/1.0"})
-            _resp = _ur.urlopen(_req, timeout=8)
-            _sdf_data = _resp.read().decode(errors="ignore")
-            # Write to temp file and read with RDKit
-            with _tf.NamedTemporaryFile(suffix=".sdf", mode="w", delete=False) as _tf2:
-                _tf2.write(_sdf_data)
-                _tf_path = _tf2.name
-            _suppl = _SDMS(_tf_path, removeHs=True, sanitize=True)
-            _tos.unlink(_tf_path)
-            for _m in _suppl:
-                if _m and _m.GetNumAtoms() > 2:
-                    return Chem.MolToSmiles(_m)
-        except Exception:
-            pass
-
-    # ── Method 2: OpenBabel (3D geometry bond perception) ────────────────────
-    obabel = shutil.which("obabel")
-    if obabel:
-        try:
-            r = _sub.run(
-                [obabel, pdb_path, "-osmi", "-h"],
-                capture_output=True, text=True, timeout=15,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                raw = r.stdout.strip().split()[0]
-                mol = Chem.MolFromSmiles(raw)
-                if mol and mol.GetNumAtoms() > 2:
-                    return Chem.MolToSmiles(mol)
-        except Exception:
-            pass
-
-    # ── Method 3: RDKit DetermineBonds (RDKit >= 2022.09) ───────────────────
-    try:
-        from rdkit.Chem import DetermineBonds as _DB
-        raw = Chem.MolFromPDBFile(str(pdb_path), removeHs=False, sanitize=False)
-        if raw:
-            _DB.DetermineBonds(raw, charge=0)
-            try:
-                Chem.SanitizeMol(raw)
-            except Exception:
-                pass
-            noH = Chem.RemoveHs(raw, sanitize=False)
-            smi = Chem.MolToSmiles(noH)
-            if smi:
-                return smi
-    except Exception:
-        pass
-
-    # ── Method 4: RDKit with proximityBonding off (use CONECT if available) ──
-    for _prox in (False, True):
-        try:
-            mol = Chem.MolFromPDBFile(
-                str(pdb_path), removeHs=True, sanitize=True,
-                proximityBonding=_prox,
-            )
-            if mol and mol.GetNumAtoms() > 2:
-                smi = Chem.MolToSmiles(mol)
-                if smi:
-                    return smi
-        except Exception:
-            pass
-
-    return ""
-
-def split_protein_ligand(
-    pdb_path: str,
-    ligand_resname: str = "",
-    work_dir: Optional[Path] = None,
-) -> Tuple[str, Optional[str], pd.DataFrame]:
-    work_dir = work_dir or Path(".")
-    work_dir.mkdir(parents=True, exist_ok=True)
-    ligand_resname = ligand_resname.strip().upper()
-    candidates, groups = detect_ligand_candidates(pdb_path)
-    chosen_key = None
-    if ligand_resname:
-        for key in groups:
-            if key[1] == ligand_resname:
-                chosen_key = key
-                break
-        if chosen_key is None:
-            raise ValueError(f"Residue {ligand_resname} not found in HETATM candidates.")
-    elif groups:
-        chosen_key = max(groups, key=lambda k: groups[k]["heavy"])
-
-    protein_lines, ligand_lines = [], []
-    conect_lines, all_lines = [], []
-    lig_serial_set = set()
-
-    with open(pdb_path, "r", errors="ignore") as fh:
-        for line in fh:
-            all_lines.append(line)
-            if line.startswith("ATOM"):
-                protein_lines.append(line)
-            elif line.startswith("HETATM") and chosen_key and _pdb_reskey(line) == chosen_key:
-                ligand_lines.append(line)
-                # Collect serial numbers for CONECT filtering
-                try:
-                    lig_serial_set.add(int(line[6:11].strip()))
-                except Exception:
-                    pass
-            elif line.startswith("CONECT"):
-                conect_lines.append(line)
-
-    # Filter CONECT records to those involving ligand atoms only
-    lig_conect = []
-    for cl in conect_lines:
-        parts = cl.split()
-        if len(parts) > 1:
-            try:
-                if int(parts[1]) in lig_serial_set:
-                    lig_conect.append(cl)
-            except Exception:
-                pass
-
-    protein_out = str(work_dir / "protein_only.pdb")
-    with open(protein_out, "w") as f:
-        f.writelines(protein_lines)
-        f.write("END\n")
-
-    ligand_out = None
-    if ligand_lines:
-        ligand_out = str(work_dir / "reference_ligand.pdb")
-        with open(ligand_out, "w") as f:
-            f.writelines(ligand_lines)
-            if lig_conect:
-                f.writelines(lig_conect)  # include bond connectivity
-            f.write("END\n")
-
-    return protein_out, ligand_out, candidates
-
-
-def combine_protein_ligand_pdb(protein_pdb: str, ligand_pdb: str, out_pdb: str) -> str:
-    protein_lines = []
-    with open(protein_pdb, "r", errors="ignore") as f:
-        for line in f:
-            if line.startswith("ATOM"):
-                protein_lines.append(line)
-    ligand_lines = []
-    with open(ligand_pdb, "r", errors="ignore") as f:
-        for line in f:
-            if line.startswith(("ATOM", "HETATM")):
-                newline = "HETATM" + line[6:17] + "LIG A 900" + line[26:]
-                ligand_lines.append(newline)
-    with open(out_pdb, "w") as f:
-        f.writelines(protein_lines)
-        f.writelines(ligand_lines)
-        f.write("END\n")
-    return out_pdb
-
-
-def sdf_first_mol_to_pdb(sdf_path: str, out_pdb: str) -> str:
-    suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
-    mol = next((m for m in suppl if m is not None), None)
-    if mol is None:
-        raise ValueError(f"No readable molecule in SDF: {sdf_path}")
-    Chem.MolToPDBFile(mol, str(out_pdb))
-    return str(out_pdb)
-
-
-# ---------------------------------------------------------------------------
-# Pocket distance-shell analysis
-# ---------------------------------------------------------------------------
-
-def read_complex_atoms_for_pocket(pdb_path: str) -> Tuple[List[Dict], List[Dict]]:
-    protein, ligand = [], []
-    with open(pdb_path, "r", errors="ignore") as f:
-        for line in f:
-            if not line.startswith(("ATOM", "HETATM")):
-                continue
-            if _pdb_is_h(line):
-                continue
-            try:
-                xyz = _pdb_xyz(line)
-            except Exception:
-                continue
-            rec = {
-                "record": line[:6].strip(),
-                "atom_name": line[12:16].strip(),
-                "resname": line[17:20].strip().upper(),
-                "chain": line[21].strip() or "_",
-                "resnum": line[22:26].strip(),
-                "icode": line[26].strip(),
-                "xyz": xyz,
-            }
-            if line.startswith("ATOM"):
-                protein.append(rec)
+    info_card(tier_msgs[tier])
+
+    # ── Metrics row ─────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div class="metric-row">
+      <div class="metric-box"><div class="val">{n_analogs}</div><div class="lbl">Analogs generated</div></div>
+      <div class="metric-box"><div class="val">{df.MW.median():.0f}</div><div class="lbl">Median MW (Da)</div></div>
+      <div class="metric-box"><div class="val">{df.QED.median():.2f}</div><div class="lbl">Median QED</div></div>
+      <div class="metric-box"><div class="val">{df.sim.median():.2f}</div><div class="lbl">Median similarity</div></div>
+      <div class="metric-box"><div class="val">{df.fragment_category.value_counts().index[0]}</div><div class="lbl">Top category</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Filter bar ───────────────────────────────────────────────────────────
+    with st.expander("🔍 Filter results"):
+        fc1, fc2, fc3 = st.columns(3)
+        mw_max  = fc1.slider("Max MW", 200.0, 900.0, float(df.MW.max()), 10.0)
+        qed_min = fc2.slider("Min QED", 0.0, 1.0, 0.0, 0.05)
+        cats_f  = fc3.multiselect("Category", sorted(df.fragment_category.unique()),
+                                   default=sorted(df.fragment_category.unique()))
+
+    df_show = df[(df.MW <= mw_max) & (df.QED >= qed_min) & (df.fragment_category.isin(cats_f))]
+
+    # ── Tabs: table / grid ───────────────────────────────────────────────────
+    tab_tbl, tab_grid = st.tabs(["📋 Table", "🖼️ Structure grid"])
+
+    with tab_tbl:
+        cols_show = ["change", "fragment_category", "MW", "logP", "QED", "ESOL", "SA", "sim", "smiles"]
+        st.dataframe(df_show[[c for c in cols_show if c in df_show.columns]],
+                     width='stretch', height=380, hide_index=True)
+
+    with tab_grid:
+        PAGE_SIZE = 50
+        total_show = len(df_show)
+        if total_show == 0:
+            st.info("No analogs match the current filters.")
+        else:
+            n_pages = max(1, (total_show + PAGE_SIZE - 1) // PAGE_SIZE)
+            page_num = 1   # default
+
+            if n_pages > 1:
+                pg_col, info_col = st.columns([2, 3])
+                with pg_col:
+                    page_num = st.number_input(
+                        "Page", min_value=1, max_value=n_pages,
+                        value=1, step=1, key="grid_page_input",
+                    )
+                with info_col:
+                    start_idx = (int(page_num) - 1) * PAGE_SIZE
+                    end_idx   = min(start_idx + PAGE_SIZE, total_show)
+                    st.markdown(
+                        f'<p style="font-size:0.82rem;color:#8B7355;padding-top:0.45rem;">'
+                        f'Page {int(page_num)} of {n_pages} &nbsp;·&nbsp; '
+                        f'showing compounds {start_idx+1}–{end_idx} of {total_show}</p>',
+                        unsafe_allow_html=True,
+                    )
             else:
-                ligand.append(rec)
-    return protein, ligand
-
-
-def analyze_complex_distance_shell(
-    complex_pdb: str,
-    pocket_cutoff: float = 6.0,
-    contact_cutoff: float = 4.0,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[Dict]]:
-    protein, ligand = read_complex_atoms_for_pocket(complex_pdb)
-    if not protein or not ligand:
-        raise ValueError("Complex must contain protein ATOM records and ligand HETATM records.")
-    lig_xyz = np.array([a["xyz"] for a in ligand], dtype=float)
-    by_res: Dict = {}
-    for a in protein:
-        dmin = float(np.linalg.norm(lig_xyz - a["xyz"], axis=1).min())
-        key = (a["chain"], a["resname"], a["resnum"], a["icode"])
-        if key not in by_res or dmin < by_res[key]["min_dist_to_ligand_A"]:
-            by_res[key] = {
-                "key": key, "resname": a["resname"], "chain": a["chain"],
-                "resnum": a["resnum"], "icode": a["icode"], "min_dist_to_ligand_A": dmin,
-            }
-    prot_rows = []
-    for r in by_res.values():
-        r["is_pocket_residue"] = r["min_dist_to_ligand_A"] <= pocket_cutoff
-        r["is_contacted"] = r["min_dist_to_ligand_A"] <= contact_cutoff
-        r["is_noncontact_growth_residue"] = r["is_pocket_residue"] and not r["is_contacted"]
-        one = AA3_TO_ONE.get(r["resname"], "")
-        r["aa_one"] = one
-        r["property_tags"] = ",".join(AA_TAGS.get(one, [])) if one else ""
-        r["residue_label"] = f"{r['resname']}{r['resnum']}:{r['chain']}"
-        prot_rows.append(r)
-    df = pd.DataFrame(prot_rows).sort_values("min_dist_to_ligand_A")
-    return (
-        df[df["is_pocket_residue"]].copy(),
-        df[df["is_contacted"]].copy(),
-        df[df["is_noncontact_growth_residue"]].copy(),
-        ligand,
-    )
-
-
-# ---------------------------------------------------------------------------
-# ACD docking command builder
-# ---------------------------------------------------------------------------
-
-def build_acd_dock_cmd(
-    receptor: str,
-    smiles: str,
-    center: str = "auto",
-    name: str = "ligand",
-    ph: float = 7.4,
-    output_dir: str = "docking_out",
-    cx: float = 0.0,
-    cy: float = 0.0,
-    cz: float = 0.0,
-    use_pkanet: bool = False,
-    neutral: bool = False,
-    save_poses: bool = True,
-    exhaustiveness: int = 8,
-    num_poses: int = 10,
-    box_x: float = 16.0,
-    box_y: float = 16.0,
-    box_z: float = 16.0,
-    extra_args: str = "",
-) -> List[str]:
-    cmd = ["acd", "dock",
-           "--receptor", receptor,
-           "--smiles", smiles,
-           "--compound", _safe_file_token(name),
-           "--name",     _safe_file_token(name),
-           "--center",   center,
-           "--ph",       str(ph),
-           "--bx",       str(int(box_x)),
-           "--by",       str(int(box_y)),
-           "--bz",       str(int(box_z)),
-           "-e",         str(exhaustiveness),
-           "-n",         str(num_poses),
-           "-o",         output_dir]
-    if center == "manual":
-        cmd.extend(["--cx", str(cx), "--cy", str(cy), "--cz", str(cz)])
-    if use_pkanet:
-        cmd.append("--pkanet")
-    if neutral:
-        cmd.append("--neutral")
-    if save_poses:
-        cmd.append("--save-poses")
-    if extra_args.strip():
-        cmd.extend(shlex.split(extra_args.strip()))
-    return cmd
-
-
-def build_acd_batch_cmd(
-    receptor: str,
-    ligands_smi: str,
-    output_dir: str = "docking_out",
-    center: str = "auto",
-    exhaustiveness: int = 8,
-    num_poses: int = 10,
-    ph: float = 7.4,
-    box_x: float = 16.0,
-    box_y: float = 16.0,
-    box_z: float = 16.0,
-    use_pkanet: bool = False,
-    neutral: bool = False,
-    extra_args: str = "",
-) -> List[str]:
-    cmd = ["acd", "batch",
-           "--receptor", receptor,
-           "--ligands",  ligands_smi,
-           "--output",   output_dir,
-           "--center",   center,
-           "--ph",       str(ph),
-           "--bx",       str(int(box_x)),
-           "--by",       str(int(box_y)),
-           "--bz",       str(int(box_z)),
-           "-e",         str(exhaustiveness),
-           "-n",         str(num_poses)]
-    if use_pkanet:
-        cmd.append("--pkanet")
-    if neutral:
-        cmd.append("--neutral")
-    if extra_args.strip():
-        cmd.extend(shlex.split(extra_args.strip()))
-    return cmd
-
-
-def run_command(cmd: List[str], log_path: Optional[str] = None) -> Tuple[int, str]:
-    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
-    output = (proc.stdout or "") + (proc.stderr or "")
-    if log_path:
-        Path(log_path).write_text(output)
-    return proc.returncode, output
-
-
-def best_score_for_compound(out_dir: str, compound: str) -> Optional[float]:
-    token = _safe_file_token(compound)
-    best = None
-    for csv_path in glob.glob(str(Path(out_dir) / "**" / "*.csv"), recursive=True):
-        if token not in Path(csv_path).name and token not in str(Path(csv_path).parent.name):
-            continue
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception:
-            continue
-        if df.empty:
-            continue
-        score_cols = [c for c in df.columns if re.search(r"score|energy|affinity|binding", c, re.I)]
-        if not score_cols:
-            continue
-        sc = score_cols[0]
-        vals = pd.to_numeric(df[sc], errors="coerce").dropna()
-        if vals.empty:
-            continue
-        m = float(vals.min())
-        best = m if best is None else min(best, m)
-    return best
-
-
-def parse_acd_score_csvs(out_dir: str) -> Optional[Dict]:
-    best_rows = []
-    for csv_path in glob.glob(str(Path(out_dir) / "**" / "*.csv"), recursive=True):
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception:
-            continue
-        if df.empty:
-            continue
-        score_cols = [c for c in df.columns if re.search(r"score|energy|affinity|binding", c, re.I)]
-        if not score_cols:
-            continue
-        sc = score_cols[0]
-        df[sc] = pd.to_numeric(df[sc], errors="coerce")
-        df = df.dropna(subset=[sc])
-        if df.empty:
-            continue
-        idx = df[sc].idxmin()
-        row = df.loc[idx].to_dict()
-        row["_score_csv"] = csv_path
-        row["_score_col"] = sc
-        best_rows.append(row)
-    if not best_rows:
-        return None
-    best_rows.sort(key=lambda r: float(r.get(r.get("_score_col", ""), 9999)))
-    return best_rows[0]
-
-
-def find_pose_sdf(out_dir: str) -> Optional[str]:
-    sdfs = sorted(glob.glob(str(Path(out_dir) / "**" / "*.sdf"), recursive=True))
-    ranked = [p for p in sdfs if re.search(r"out|pose|dock|result", Path(p).name, re.I)] + sdfs
-    return ranked[0] if ranked else None
-
-
-def find_pose_sdfs_for_compound(out_dir: str, compound: str) -> List[str]:
-    token = _safe_file_token(compound)
-    sdfs = sorted(glob.glob(str(Path(out_dir) / "**" / "*.sdf"), recursive=True))
-    matched = [s for s in sdfs if token in Path(s).name or token in str(Path(s).parent.name)]
-    return matched if matched else sdfs[:1]
-
-
-def draw_2d_interaction_svg(
-    mol,
-    selected_atoms=None,
-    contact_atoms=None,
-    width: int = 560,
-    height: int = 380,
-) -> str:
-    """
-    Draw 2D ligand structure with:
-      - Atom indices shown
-      - 🟠 Orange highlight = user-selected attachment atoms
-      - 🔵 Blue highlight   = atoms close to pocket residues (contact)
-
-    Returns SVG string.
-    """
-    from rdkit.Chem import AllChem
-    from rdkit.Chem.Draw import rdMolDraw2D
-
-    mol2 = Chem.RWMol(mol)
-    AllChem.Compute2DCoords(mol2)
-
-    selected_atoms = set(selected_atoms or [])
-    contact_atoms  = set(contact_atoms  or [])
-
-    highlight_atoms = []
-    atom_colors: Dict[int, tuple] = {}
-    atom_radii:  Dict[int, float] = {}
-
-    for i in range(mol2.GetNumAtoms()):
-        if i in selected_atoms:
-            highlight_atoms.append(i)
-            atom_colors[i] = (1.0, 0.55, 0.0)   # orange
-            atom_radii[i]  = 0.38
-        elif i in contact_atoms:
-            highlight_atoms.append(i)
-            atom_colors[i] = (0.2, 0.6, 1.0)    # blue
-            atom_radii[i]  = 0.30
-
-    drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
-    opts = drawer.drawOptions()
-    opts.addAtomIndices          = True
-    opts.addStereoAnnotation     = False
-    opts.padding                 = 0.12
-    opts.atomHighlightsAreCircles = True
-
-    drawer.DrawMolecule(
-        mol2,
-        highlightAtoms      = highlight_atoms,
-        highlightBonds      = [],
-        highlightAtomColors = atom_colors,
-        highlightAtomRadii  = atom_radii,
-    )
-    drawer.FinishDrawing()
-    return drawer.GetDrawingText()
-
-
-def get_ligand_contact_atoms(
-    mol_2d,
-    ref_ligand_pdb: str,
-    plip_df=None,
-    cutoff_A: float = 4.5,
-) -> set:
-    """
-    Return atom indices (2D SMILES space) that are within cutoff_A
-    of any pocket residue — i.e. the atoms involved in protein contacts.
-
-    Uses MCS to map 3D ligand atoms back to 2D indices.
-    If PLIP df is provided, uses PLIP-detected ligand atoms instead.
-
-    Returns set of 2D atom indices.
-    """
-    contact_3d_indices = set()
-
-    # Method 1: from PLIP dataframe (most accurate)
-    if plip_df is not None and "ligand_atom_idx" in plip_df.columns:
-        for val in plip_df["ligand_atom_idx"].dropna():
-            try:
-                contact_3d_indices.add(int(val))
-            except Exception:
-                pass
-
-    # Method 2: distance-based from PDB
-    if not contact_3d_indices and ref_ligand_pdb and os.path.exists(ref_ligand_pdb):
-        try:
-            mol_3d = Chem.MolFromPDBFile(
-                str(ref_ligand_pdb), removeHs=True, sanitize=True)
-            if mol_3d and mol_3d.GetNumConformers() > 0:
-                # All atoms from ligand PDB are "contact" atoms if we have PLIP data
-                # Otherwise mark all as contact (user can see what's interacting)
-                contact_3d_indices = set(range(mol_3d.GetNumAtoms()))
-        except Exception:
-            pass
-
-    if not contact_3d_indices or not ref_ligand_pdb:
-        return set()
-
-    # Map 3D indices → 2D indices via MCS
-    atom_xyz_map = map_attachment_atoms_to_3d(mol_2d, ref_ligand_pdb)
-    # atom_xyz_map keys are 2D indices — we want the inverse for contact mapping
-    # Build: 3D_idx → 2D_idx (approximate via matching order)
-    try:
-        from rdkit.Chem import rdFMCS
-        mol_3d = Chem.MolFromPDBFile(
-            str(ref_ligand_pdb), removeHs=True, sanitize=True)
-        if mol_3d is None:
-            return set()
-        mcs = rdFMCS.FindMCS(
-            [mol_2d, mol_3d],
-            atomCompare=rdFMCS.AtomCompare.CompareElements,
-            bondCompare=rdFMCS.BondCompare.CompareAny,
-            timeout=5,
-        )
-        mcs_mol  = Chem.MolFromSmarts(mcs.smartsString)
-        match_2d = mol_2d.GetSubstructMatch(mcs_mol)
-        match_3d = mol_3d.GetSubstructMatch(mcs_mol)
-        if not match_2d or not match_3d:
-            return set()
-        # Build 3D→2D map
-        d3_to_2d = {match_3d[i]: match_2d[i] for i in range(len(match_2d))}
-        return {d3_to_2d[i] for i in contact_3d_indices if i in d3_to_2d}
-    except Exception:
-        return set()
-
-
-# ---------------------------------------------------------------------------
-# Per-attachment-atom pocket routing
-# ---------------------------------------------------------------------------
-
-def map_attachment_atoms_to_3d(
-    mol_2d: Chem.Mol,
-    ref_ligand_pdb: str,
-) -> Dict[int, np.ndarray]:
-    """
-    Map 2D RDKit atom indices to 3D XYZ coordinates using MCS alignment
-    with the co-crystal ligand PDB.
-
-    Parameters
-    ----------
-    mol_2d          : RDKit mol from parent SMILES (no conformer)
-    ref_ligand_pdb  : path to reference_ligand.pdb (has 3D coordinates)
-
-    Returns
-    -------
-    Dict[atom_2d_idx → xyz_array]  — only for atoms present in MCS match
-    """
-    from rdkit.Chem import rdFMCS
-    mapping: Dict[int, np.ndarray] = {}
-
-    try:
-        mol_3d = Chem.MolFromPDBFile(str(ref_ligand_pdb), removeHs=True,
-                                      sanitize=True)
-        if mol_3d is None or mol_3d.GetNumConformers() == 0:
-            return mapping
-
-        mcs = rdFMCS.FindMCS(
-            [mol_2d, mol_3d],
-            atomCompare=rdFMCS.AtomCompare.CompareElements,
-            bondCompare=rdFMCS.BondCompare.CompareAny,
-            timeout=10,
-        )
-        if mcs.numAtoms < 3:
-            return mapping
-
-        mcs_mol  = Chem.MolFromSmarts(mcs.smartsString)
-        match_2d = mol_2d.GetSubstructMatch(mcs_mol)
-        match_3d = mol_3d.GetSubstructMatch(mcs_mol)
-        if not match_2d or not match_3d:
-            return mapping
-
-        conf = mol_3d.GetConformer()
-        for idx_2d, idx_3d in zip(match_2d, match_3d):
-            pos = conf.GetAtomPosition(idx_3d)
-            mapping[idx_2d] = np.array([pos.x, pos.y, pos.z])
-
-    except Exception:
-        pass
-
-    return mapping
-
-
-def route_atoms_to_subpockets(
-    selected_atoms:  List[int],
-    atom_xyz_map:    Dict[int, np.ndarray],
-    subpockets:      List[Dict],
-    ligand_centroid: np.ndarray,
-) -> Dict[int, Dict]:
-    """
-    For each selected attachment atom, find the sub-pocket that lies
-    most directly in its outward direction from the ligand centroid.
-
-    Scoring per sub-pocket:
-      direction_score = dot(attach_dir_unit, toward_pocket_unit) / (1 + dist * 0.1)
-    Higher = pocket is more aligned with the atom's outward direction AND close.
-
-    Parameters
-    ----------
-    selected_atoms   : list of 2D RDKit atom indices the user selected
-    atom_xyz_map     : from map_attachment_atoms_to_3d()
-    subpockets       : from void_analyzer.analyze_void()
-    ligand_centroid  : mean XYZ of all ligand atoms
-
-    Returns
-    -------
-    Dict[atom_idx → best_subpocket_dict]
-    """
-    result: Dict[int, Dict] = {}
-    if not subpockets:
-        return result
-
-    for atom_idx in selected_atoms:
-        xyz = atom_xyz_map.get(atom_idx)
-        if xyz is None:
-            continue
-
-        # Outward direction from ligand centroid through this atom
-        attach_dir = xyz - ligand_centroid
-        norm = np.linalg.norm(attach_dir)
-        if norm < 1e-6:
-            continue
-        attach_unit = attach_dir / norm
-
-        best_sp    = None
-        best_score = -float("inf")
-
-        for sp in subpockets:
-            sp_center = np.array(sp["centroid_xyz"])
-            to_pocket = sp_center - xyz
-            dist      = float(np.linalg.norm(to_pocket))
-            if dist < 1e-6:
-                continue
-            to_pocket_unit = to_pocket / dist
-
-            # Angular alignment × proximity
-            dot   = float(np.dot(attach_unit, to_pocket_unit))
-            score = dot / (1.0 + dist * 0.1)
-
-            if score > best_score:
-                best_score = score
-                best_sp    = sp
-
-        if best_sp is not None:
-            result[atom_idx] = {
-                **best_sp,
-                "alignment_score": round(best_score, 3),
-                "atom_xyz":        xyz.tolist(),
-            }
-
-    return result
-
-
-def per_atom_fragment_criteria(
-    atom_subpocket_map: Dict[int, Dict],
-    all_frags:          List,
-    tag_counts:         Dict[str, int],
-    pocket_reference_module=None,
-    size_filter_module=None,
-    alpha: float = 0.7,
-) -> Dict[int, Dict]:
-    """
-    For each attachment atom, apply both fragment selection criteria
-    using that atom's specific sub-pocket:
-
-    Criterion A — chemistry (residue contacts):
-        Score fragments by ChemBERTa/rule-based cosine similarity
-        to the property tags of the sub-pocket's residues.
-
-    Criterion B — size (steric fit):
-        Filter fragments to those fitting within the sub-pocket's
-        available radius (size_class).
-
-    Parameters
-    ----------
-    atom_subpocket_map      : from route_atoms_to_subpockets()
-    all_frags               : full fragment library (core.LIBRARY)
-    tag_counts              : global pocket tag counts (from PLIP / distance shell)
-    pocket_reference_module : imported pocket_reference module (or None)
-    size_filter_module      : imported void_analyzer module (or None)
-    alpha                   : ChemBERTa blend weight
-
-    Returns
-    -------
-    Dict[atom_idx → {
-        "sub_pocket": sp_dict,
-        "size_class": str,
-        "ranked_frags": [(Frag, score), ...],  # Criterion A ranked
-        "size_filtered_frags": [Frag, ...],    # Criterion B filtered
-        "combined_frags": [Frag, ...],          # A ∩ B — fits AND compatible
-    }]
-    """
-    results: Dict[int, Dict] = {}
-
-    for atom_idx, sp in atom_subpocket_map.items():
-        size_class = sp.get("size_class", "large")
-
-        # Criterion B: size filter
-        if size_filter_module is not None:
-            try:
-                size_frags = size_filter_module.filter_frags_by_size(
-                    all_frags, size_class, allow_smaller=True)
-            except Exception:
-                size_frags = all_frags
-        else:
-            size_frags = all_frags
-
-        # Criterion A: chemistry ranking
-        # Build per-sub-pocket tag counts from sub-pocket residues if possible
-        sp_tags = {}
-        for member in sp.get("members", []):
-            aa = member.get("aa_one", "")
-            for tag in AA_TAGS.get(aa, []):
-                sp_tags[tag] = sp_tags.get(tag, 0) + 1
-
-        # Fall back to global tag_counts if sub-pocket has no residue info
-        effective_tags = sp_tags if sp_tags else tag_counts
-
-        if pocket_reference_module is not None and effective_tags:
-            try:
-                ranked = pocket_reference_module.score_fragments(
-                    size_frags, effective_tags, alpha=alpha)
-            except Exception:
-                ranked = [(f, 0.5) for f in size_frags]
-        else:
-            ranked = [(f, 0.5) for f in size_frags]
-
-        # Combined: size-filtered AND chemistry-ranked
-        size_names = {f.name for f in size_frags}
-        combined   = [(f, s) for f, s in ranked if f.name in size_names]
-
-        results[atom_idx] = {
-            "sub_pocket":          sp,
-            "size_class":          size_class,
-            "available_radius_A":  sp.get("available_radius_A", 0),
-            "ranked_frags":        ranked,
-            "size_filtered_frags": size_frags,
-            "combined_frags":      combined,
-            "n_chemistry_ranked":  len(ranked),
-            "n_size_filtered":     len(size_frags),
-            "n_combined":          len(combined),
-            "effective_tags":      effective_tags,
-        }
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# RMSD calculation (docked pose vs crystal ligand)
-# ---------------------------------------------------------------------------
-
-def _read_heavy_coords_from_pdb(pdb_path: str) -> np.ndarray:
-    coords = []
-    with open(pdb_path, "r", errors="ignore") as f:
-        for line in f:
-            if not line.startswith(("ATOM", "HETATM")):
-                continue
-            if _pdb_is_h(line):
-                continue
-            try:
-                coords.append(_pdb_xyz(line))
-            except Exception:
-                continue
-    return np.array(coords, dtype=float) if coords else np.empty((0, 3))
-
-
-def _read_heavy_coords_from_sdf(sdf_path: str, mol_index: int = 0) -> Tuple[Optional[Chem.Mol], np.ndarray]:
-    suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=True)
-    idx = 0
-    for mol in suppl:
-        if mol is None:
-            idx += 1
-            continue
-        if idx == mol_index:
-            conf = mol.GetConformer()
-            coords = np.array([
-                list(conf.GetAtomPosition(i))
-                for i in range(mol.GetNumAtoms())
-                if mol.GetAtomWithIdx(i).GetAtomicNum() > 1
-            ], dtype=float)
-            return mol, coords
-        idx += 1
-    return None, np.empty((0, 3))
-
-
-def compute_rmsd_rdkit(mol_ref: Chem.Mol, mol_probe: Chem.Mol) -> Optional[float]:
-    try:
-        from rdkit.Chem import AllChem as _AC
-        rmsd = _AC.GetBestRMS(Chem.RemoveHs(mol_ref), Chem.RemoveHs(mol_probe))
-        return float(rmsd)
-    except Exception:
-        pass
-    try:
-        ref_conf = mol_ref.GetConformer()
-        prb_conf = mol_probe.GetConformer()
-        ref_c = np.array([list(ref_conf.GetAtomPosition(i))
-                          for i in range(mol_ref.GetNumAtoms())
-                          if mol_ref.GetAtomWithIdx(i).GetAtomicNum() > 1])
-        prb_c = np.array([list(prb_conf.GetAtomPosition(i))
-                          for i in range(mol_probe.GetNumAtoms())
-                          if mol_probe.GetAtomWithIdx(i).GetAtomicNum() > 1])
-        if ref_c.shape == prb_c.shape and len(ref_c) > 0:
-            return float(np.sqrt(np.mean(np.sum((ref_c - prb_c) ** 2, axis=1))))
-    except Exception:
-        pass
-    return None
-
-
-def compute_rmsd_coords(ref_coords: np.ndarray, probe_coords: np.ndarray) -> Optional[float]:
-    if ref_coords.shape != probe_coords.shape or len(ref_coords) == 0:
-        return None
-    return float(np.sqrt(np.mean(np.sum((ref_coords - probe_coords) ** 2, axis=1))))
-
-
-def _parse_vina_scores_from_pdbqt(pdbqt_path: str) -> List[float]:
-    """Extract affinity scores from REMARK VINA RESULT lines in PDBQT."""
-    scores = []
-    try:
-        with open(pdbqt_path, "r", errors="ignore") as f:
-            for line in f:
-                if line.strip().startswith("REMARK VINA RESULT:"):
+                st.caption(f"{total_show} compounds")
+
+            start_idx = (int(page_num) - 1) * PAGE_SIZE
+            end_idx   = min(start_idx + PAGE_SIZE, total_show)
+            df_page = df_show.iloc[start_idx:end_idx]
+
+            pairs = []
+            for local_i, (abs_i, row) in enumerate(df_page.iterrows()):
+                m = Chem.MolFromSmiles(str(row["smiles"]))
+                if m is not None:
                     try:
-                        scores.append(float(line.split()[3]))
+                        AllChem.Compute2DCoords(m)
+                        global_n = start_idx + local_i + 1
+                        pairs.append((m, f"{global_n}. {row['change']}"))
                     except Exception:
                         pass
-    except Exception:
-        pass
-    return scores
 
-
-def parse_docked_poses(
-    sdf_path: str,
-    ref_mol: Optional[Chem.Mol] = None,
-    ref_pdb_path: Optional[str] = None,
-) -> List[Dict]:
-    suppl = Chem.SDMolSupplier(str(sdf_path), removeHs=False)
-    ref_mol_noH = None
-    if ref_mol is not None:
-        try:
-            ref_mol_noH = Chem.RemoveHs(ref_mol)
-        except Exception:
-            pass
-    elif ref_pdb_path and os.path.exists(str(ref_pdb_path)):
-        try:
-            ref_mol_noH = Chem.MolFromPDBFile(str(ref_pdb_path), removeHs=True)
-        except Exception:
-            pass
-
-    # Try reading scores from companion PDBQT (ACD output stores scores there)
-    pdbqt_path = str(sdf_path).replace(".sdf", ".pdbqt").replace("_out.sdf", "_out.pdbqt")
-    vina_scores = _parse_vina_scores_from_pdbqt(pdbqt_path)
-
-    poses = []
-    idx = 0
-    for mol in suppl:
-        if mol is None:
-            idx += 1
-            continue
-
-        # 1. Try SDF property (some pipelines inject score here)
-        score = None
-        for prop_name in mol.GetPropsAsDict():
-            if re.search(r"score|energy|affinity|minimizedAffinity|binding", prop_name, re.I):
+            if not pairs:
+                st.info("Could not render any structures on this page.")
+            else:
                 try:
-                    score = float(mol.GetProp(prop_name))
+                    png = Draw.MolsToGridImage(
+                        [p[0] for p in pairs], legends=[p[1] for p in pairs],
+                        molsPerRow=5, subImgSize=(240, 190), returnPNG=True,
+                    )
+                    st.image(png, width='stretch')
+                except Exception as e:
+                    st.warning(f"Structure grid could not be rendered ({e}). See the Table tab.")
+
+    # ── Navigation — TIER LOGIC ──────────────────────────────────────────────
+    st.write("")
+    st.divider()
+
+    parent_name = st.session_state.parent_name or "compound"
+    smi_lines = "\n".join(f"{r.smiles}\t{parent_name}_A{i+1}" for i, r in df.iterrows())
+
+    col_back, col_regen, *col_actions = st.columns([1, 1, 2, 2, 2])
+
+    with col_back:
+        if st.button("← Back"):
+            go(3)
+    with col_regen:
+        if st.button("↺ Regenerate"):
+            st.session_state.analogs_df = None
+            st.rerun()
+
+    # Tier-dependent action buttons
+    if tier == "docking":
+        # Full tier: docking + download SMI
+        with col_actions[0]:
+            next_label = "Docking & cIFP →" if mode == "structure" else "Docking →"
+            if st.button(next_label, type="primary", width='stretch'):
+                go(5)
+        with col_actions[1]:
+            st.download_button(
+                "⬇️ Download SMI",
+                data=smi_lines.encode(),
+                file_name=f"{parent_name}_analogs.smi",
+                mime="text/plain",
+                width='stretch',
+            )
+        with col_actions[2]:
+            if st.button("Export →", width='stretch'):
+                go(len(steps))
+
+    elif tier == "pkanet":
+        # Middle tier: pKaNET 3D + download SMI, no docking
+        with col_actions[0]:
+            st.download_button(
+                "⬇️ Download SMI",
+                data=smi_lines.encode(),
+                file_name=f"{parent_name}_analogs.smi",
+                mime="text/plain",
+                width='stretch',
+            )
+        with col_actions[1]:
+            if st.button("pKaNET: Check protonation & 3D →", type="primary", width='stretch'):
+                go(len(steps))   # goes to export step where 3D gen is available
+        with col_actions[2]:
+            if st.button("Export →", width='stretch'):
+                go(len(steps))
+
+    else:
+        # SMI only tier (>200)
+        with col_actions[0]:
+            st.download_button(
+                "⬇️ Download SMI",
+                data=smi_lines.encode(),
+                file_name=f"{parent_name}_analogs.smi",
+                mime="text/plain",
+                width='stretch',
+            )
+        with col_actions[1]:
+            if st.button("Export →", width='stretch'):
+                go(len(steps))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 – Docking & cIFP
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif step == 5:
+    df_analogs = st.session_state.analogs_df
+    if df_analogs is None or df_analogs.empty:
+        st.warning("No analogs yet. Go back to Step 4.")
+        st.stop()
+
+    # ── Guard: tier check ────────────────────────────────────────────────────
+    n_a = len(df_analogs)
+    if analog_tier(n_a) != "docking":
+        st.warning(
+            f"You have **{n_a} analogs** — docking is only available for ≤ 20 analogs. "
+            f"Go back to Step 3 and reduce the number, or use Download SMI / pKaNET instead."
+        )
+        col_b, col_d = st.columns(2)
+        with col_b:
+            if st.button("← Back to results"):
+                go(4)
+        with col_d:
+            parent_name = st.session_state.parent_name or "compound"
+            smi_lines = "\n".join(f"{r.smiles}\t{parent_name}_A{i+1}" for i, r in df_analogs.iterrows())
+            st.download_button("⬇️ Download SMI", data=smi_lines.encode(),
+                               file_name=f"{parent_name}_analogs.smi", mime="text/plain")
+        st.stop()
+
+    acd_ok    = bool(shutil.which("acd"))
+    obabel_ok = bool(shutil.which("obabel"))
+    work      = get_work_dir()
+    dock_in   = work / "docking_inputs"
+    dock_in.mkdir(parents=True, exist_ok=True)
+
+    info_card("Docking predicts how tightly each designed analog binds to the target protein. "
+              "Requires <strong>Anyone Can Dock</strong> (acd) and <strong>OpenBabel</strong>.")
+
+    bcol1, bcol2 = st.columns(2)
+    bcol1.markdown(
+        f'<div style="padding:0.6rem 1rem;border-radius:8px;'
+        f'background:{"#E6F4EA" if acd_ok else "#FDECEA"};'
+        f'color:{"#1E7E34" if acd_ok else "#B00020"};font-size:0.85rem;">'
+        f'{"✅ acd available" if acd_ok else "❌ acd not found — pip install anyonecandock"}</div>',
+        unsafe_allow_html=True)
+    bcol2.markdown(
+        f'<div style="padding:0.6rem 1rem;border-radius:8px;'
+        f'background:{"#E6F4EA" if obabel_ok else "#FDECEA"};'
+        f'color:{"#1E7E34" if obabel_ok else "#B00020"};font-size:0.85rem;">'
+        f'{"✅ obabel available" if obabel_ok else "❌ obabel not found — apt install openbabel"}</div>',
+        unsafe_allow_html=True)
+
+    # Receptor loader (ligand track)
+    if mode == "ligand" and not st.session_state.receptor_path:
+        st.divider()
+        st.markdown("### Choose a target protein")
+        info_card("You designed analogs without a structure. To dock them, pick the protein they bind to.")
+        rec_src = st.radio("Load receptor from",
+            ["🔍 Search RCSB", "#️⃣ PDB ID", "📁 Upload file"],
+            horizontal=True, key="dock_rec_src")
+        if rec_src == "🔍 Search RCSB":
+            dq = st.text_input("Search RCSB PDB", placeholder="e.g. EGFR kinase, JAK2", key="dock_rcsb_q")
+            if st.button("Search", key="dock_rcsb_btn") and dq.strip():
+                with st.spinner("Searching RCSB PDB…"):
+                    st.session_state["_dock_rcsb_results"] = core.search_rcsb(dq.strip(), max_results=6)
+            for r in st.session_state.get("_dock_rcsb_results", []):
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    st.caption(f"**{r['id']}** — {r['title']}  ({r['resolution']} · {r['organism']})")
+                with c2:
+                    if st.button("Use", key=f"dock_rcsb_{r['id']}"):
+                        with st.spinner(f"Downloading {r['id']}…"):
+                            try:
+                                path = core.download_pdb(r["id"], work)
+                                prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                                st.session_state.receptor_path   = path
+                                st.session_state.protein_path    = prot
+                                st.session_state.complex_path    = path
+                                st.session_state.ref_ligand_path = lig
+                                # Clear cached SMILES so it re-extracts with new ligand
+                                st.session_state["_modeA_extracted_smiles"] = ""
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Could not download: {e}")
+        elif rec_src == "#️⃣ PDB ID":
+            pdb_id = st.text_input("4-letter PDB ID", value="", max_chars=4,
+                                   placeholder="e.g. 1M17", key="dock_pdb_id")
+            if st.button("Load receptor", key="dock_load_rec") and pdb_id.strip():
+                with st.spinner("Downloading from RCSB…"):
+                    try:
+                        path = core.download_pdb(pdb_id.strip().upper(), work)
+                        prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                        st.session_state.receptor_path   = path
+                        st.session_state.protein_path    = prot
+                        st.session_state.complex_path    = path
+                        st.session_state.ref_ligand_path = lig
+                        st.success(f"Receptor loaded ({pdb_id.upper()}) ✅")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not download: {e}")
+        else:
+            up = st.file_uploader("Upload .pdb or .cif file", type=["pdb", "cif"], key="dock_upload")
+            if up:
+                raw = work / up.name
+                raw.write_bytes(up.read())
+                try:
+                    path = core.cif_to_pdb_if_needed(str(raw))
+                    prot, lig, _ = core.split_protein_ligand(path, work_dir=work / "receptor")
+                    st.session_state.receptor_path   = path
+                    st.session_state.protein_path    = prot
+                    st.session_state.complex_path    = path
+                    st.session_state.ref_ligand_path = lig
+                    st.success("Receptor uploaded ✅")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not process file: {e}")
+
+    receptor = st.session_state.receptor_path
+    if receptor:
+        st.success(f"Target receptor: `{Path(receptor).name}`")
+
+    st.divider()
+    rows = [{"compound": "original_ligand", "smiles": st.session_state.parent_smiles}]
+    for i, r in df_analogs.iterrows():
+        rows.append({"compound": f"{st.session_state.parent_name}_A{i+1}", "smiles": r.smiles})
+    lig_df = pd.DataFrame(rows).drop_duplicates("smiles").reset_index(drop=True)
+    st.session_state.docking_ligands = lig_df
+
+    smi_path = dock_in / "compounds.smi"
+    with open(smi_path, "w") as fh:
+        for _, r in lig_df.iterrows():
+            fh.write(f"{r.smiles}\t{r.compound}\n")
+
+    with st.expander(f"Ligand list — {len(lig_df)} compounds (parent + analogs)"):
+        st.dataframe(lig_df, width='stretch', hide_index=True, height=200)
+
+    st.markdown("### Docking settings")
+    d1, d2 = st.columns(2)
+    with d1:
+        exhaustiveness = st.slider("Exhaustiveness", 1, 32, 8)
+        hint("Higher = more thorough but slower.")
+        num_poses = st.slider("Poses per compound", 1, 20, 10)
+    with d2:
+        dock_ph = st.number_input("pH", value=7.4, step=0.1)
+        dock_out_dir = str(work / "docking_out")
+
+    with st.expander("⚙️ Advanced docking options"):
+        bx = st.number_input("Box X (Å)", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_bx")
+        by = st.number_input("Box Y (Å)", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_by")
+        bz = st.number_input("Box Z (Å)", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_bz")
+
+    # ── 3D Receptor + Docking Box Preview ────────────────────────────────────
+    with st.expander("🔭 3D: Receptor + Docking Box", expanded=True):
+        try:
+            import py3Dmol as _py3
+            _v3 = _py3.view(width="100%", height=480)
+            _v3.setBackgroundColor(_viewer_bg())
+            _mi3 = 0
+
+            # Compute docking center from co-crystal ligand
+            _cx3, _cy3, _cz3 = 0.0, 0.0, 0.0
+            _ref_pdb3 = st.session_state.ref_ligand_path or ""
+            if _ref_pdb3 and os.path.exists(str(_ref_pdb3)):
+                try:
+                    import numpy as _np3
+                    _coords3 = []
+                    with open(_ref_pdb3) as _lf3:
+                        for _ll3 in _lf3:
+                            if _ll3.startswith(("ATOM","HETATM")):
+                                try:
+                                    _coords3.append([float(_ll3[30:38]),
+                                                     float(_ll3[38:46]),
+                                                     float(_ll3[46:54])])
+                                except Exception:
+                                    pass
+                    if _coords3:
+                        _ctr3 = _np3.mean(_coords3, axis=0)
+                        _cx3, _cy3, _cz3 = float(_ctr3[0]), float(_ctr3[1]), float(_ctr3[2])
                 except Exception:
                     pass
-                if score is not None:
-                    break
 
-        # 2. Fallback: use PDBQT REMARK VINA RESULT scores (ACD default output)
-        if score is None and idx < len(vina_scores):
-            score = vina_scores[idx]
+            # Protein cartoon
+            _rec3 = st.session_state.protein_path or receptor or ""
+            if _rec3 and os.path.exists(str(_rec3)):
+                _v3.addModel(open(_rec3).read(), "pdb")
+                _v3.setStyle({"model": _mi3}, {
+                    "cartoon": {"color": "spectrum", "opacity": 0.40}
+                })
+                # Highlight residues inside docking box
+                try:
+                    import prody as _pr3
+                    _ra3  = _pr3.parsePDB(str(_rec3))
+                    _hx3, _hy3, _hz3 = bx/2, by/2, bz/2
+                    _ps3 = _ra3.select(
+                        f"protein and "
+                        f"x > {_cx3-_hx3:.2f} and x < {_cx3+_hx3:.2f} and "
+                        f"y > {_cy3-_hy3:.2f} and y < {_cy3+_hy3:.2f} and "
+                        f"z > {_cz3-_hz3:.2f} and z < {_cz3+_hz3:.2f}"
+                    )
+                    if _ps3 is not None and _ps3.numAtoms() > 0:
+                        _rl3 = sorted(set(int(r) for r in _ps3.getResnums()))
+                        _v3.setStyle(
+                            {"model": _mi3, "resi": _rl3},
+                            {"stick":   {"colorscheme": "whiteCarbon", "radius": 0.18},
+                             "cartoon": {"color": "spectrum", "opacity": 0.75}},
+                        )
+                except Exception:
+                    pass
+                _mi3 += 1
 
-        # 3. Last resort: try to parse from mol title/name
-        if score is None:
-            try:
-                title = mol.GetProp("_Name") if mol.HasProp("_Name") else ""
-                m = re.search(r"(-?[0-9]+\.[0-9]+)", title)
-                if m:
-                    score = float(m.group(1))
-            except Exception:
-                pass
+            # Co-crystal / reference ligand (magenta)
+            if _ref_pdb3 and os.path.exists(str(_ref_pdb3)):
+                _v3.addModel(open(_ref_pdb3).read(), "pdb")
+                _v3.setStyle({"model": _mi3}, {
+                    "stick": {"colorscheme": "magentaCarbon", "radius": 0.25}
+                })
+                _mi3 += 1
 
-        rmsd = None
-        if ref_mol_noH is not None:
-            try:
-                probe_noH = Chem.RemoveHs(mol)
-                rmsd = compute_rmsd_rdkit(ref_mol_noH, probe_noH)
-            except Exception:
-                pass
+            # Docking box (blue fill + cyan wireframe)
+            _c3 = {"x": _cx3, "y": _cy3, "z": _cz3}
+            _d3 = {"w": int(bx), "h": int(by), "d": int(bz)}
+            _v3.addBox({"center": _c3, "dimensions": _d3,
+                        "color": "blue", "opacity": 0.07, "wireframe": False})
+            _v3.addBox({"center": _c3, "dimensions": _d3,
+                        "color": "cyan", "opacity": 0.90, "wireframe": True})
 
-        poses.append({
-            "pose_index": idx,
-            "score": score,
-            "rmsd_vs_crystal": round(rmsd, 3) if rmsd is not None else None,
-            "mol": mol,
-        })
-        idx += 1
+            # XYZ axis arrows
+            for _ep3, _col3, _lbl3 in [
+                ({"x": _cx3+8, "y": _cy3,   "z": _cz3},   "red",   "X"),
+                ({"x": _cx3,   "y": _cy3+8,  "z": _cz3},   "green", "Y"),
+                ({"x": _cx3,   "y": _cy3,    "z": _cz3+8}, "blue",  "Z"),
+            ]:
+                _v3.addArrow({"start": {"x":_cx3,"y":_cy3,"z":_cz3},
+                              "end": _ep3, "radius": 0.15,
+                              "color": _col3, "radiusRatio": 3.0})
+                _v3.addLabel(_lbl3, {
+                    "fontSize": 14, "fontColor": _col3,
+                    "backgroundColor": "black", "backgroundOpacity": 0.6,
+                    "inFront": True, "showBackground": True,
+                }, _ep3)
 
-    return poses
-
-
-def summarize_docking_for_compound(
-    out_dir: str,
-    compound: str,
-    smiles: str,
-    ref_mol: Optional[Chem.Mol] = None,
-    ref_pdb_path: Optional[str] = None,
-) -> Dict:
-    result = {
-        "compound": compound,
-        "smiles": smiles,
-        "top_BE": None,
-        "top_RMSD": None,
-        "minRMSD_BE": None,
-        "minRMSD_RMSD": None,
-        "n_poses": 0,
-        "status": "no_sdf",
-    }
-    sdfs = find_pose_sdfs_for_compound(out_dir, compound)
-    if not sdfs:
-        return result
-
-    all_poses = []
-    for sdf in sdfs:
-        all_poses.extend(parse_docked_poses(sdf, ref_mol=ref_mol, ref_pdb_path=ref_pdb_path))
-
-    if not all_poses:
-        result["status"] = "no_poses"
-        return result
-
-    result["n_poses"] = len(all_poses)
-    result["status"] = "ok"
-
-    scored = [p for p in all_poses if p["score"] is not None]
-    if scored:
-        top = min(scored, key=lambda p: p["score"])
-        result["top_BE"] = round(top["score"], 2)
-        result["top_RMSD"] = top["rmsd_vs_crystal"]
-
-    with_rmsd = [p for p in all_poses if p["rmsd_vs_crystal"] is not None]
-    if with_rmsd:
-        best_rmsd = min(with_rmsd, key=lambda p: p["rmsd_vs_crystal"])
-        result["minRMSD_RMSD"] = best_rmsd["rmsd_vs_crystal"]
-        result["minRMSD_BE"] = round(best_rmsd["score"], 2) if best_rmsd["score"] is not None else None
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# 2D molecule image generation (PNG bytes for tables/CSV)
-# ---------------------------------------------------------------------------
-
-def mol_to_png_base64(smiles: str, size: Tuple[int, int] = (250, 180)) -> str:
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return ""
-    try:
-        AllChem.Compute2DCoords(mol)
-        d = rdMolDraw2D.MolDraw2DCairo(*size)
-        rdMolDraw2D.PrepareAndDrawMolecule(d, mol)
-        d.FinishDrawing()
-        import base64
-        return base64.b64encode(d.GetDrawingText()).decode()
-    except Exception:
-        return ""
-
-
-def mol_to_png_bytes(smiles: str, size: Tuple[int, int] = (250, 180)) -> bytes:
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return b""
-    try:
-        AllChem.Compute2DCoords(mol)
-        d = rdMolDraw2D.MolDraw2DCairo(*size)
-        rdMolDraw2D.PrepareAndDrawMolecule(d, mol)
-        d.FinishDrawing()
-        return d.GetDrawingText()
-    except Exception:
-        return b""
-
-
-# ---------------------------------------------------------------------------
-# PLIP / distance-contact cIFP
-# ---------------------------------------------------------------------------
-
-def _parse_pdb_heavy_atoms(pdb_path: str) -> Tuple[List[Dict], List[Dict]]:
-    protein, ligand = [], []
-    with open(pdb_path, "r", errors="ignore") as fh:
-        for line in fh:
-            if not line.startswith(("ATOM", "HETATM")):
-                continue
-            elem = line[76:78].strip().upper() or line[12:16].strip()[0:1].upper()
-            if elem == "H":
-                continue
-            try:
-                x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
-            except Exception:
-                continue
-            rec = {
-                "record": line[:6].strip(),
-                "name": line[12:16].strip(),
-                "resname": line[17:20].strip(),
-                "chain": line[21].strip() or "_",
-                "resnum": line[22:26].strip(),
-                "x": x, "y": y, "z": z,
-            }
-            if line.startswith("ATOM"):
-                protein.append(rec)
-            else:
-                ligand.append(rec)
-    return protein, ligand
-
-
-def distance_contact_cifp(complex_pdb: str, cutoff: float = 4.0) -> List[str]:
-    protein, ligand = _parse_pdb_heavy_atoms(complex_pdb)
-    feats: set = set()
-    c2 = float(cutoff) ** 2
-    for pa in protein:
-        for la in ligand:
-            dx = pa["x"] - la["x"]
-            dy = pa["y"] - la["y"]
-            dz = pa["z"] - la["z"]
-            if dx * dx + dy * dy + dz * dz <= c2:
-                feats.add(f"CONTACT:{pa['chain']}:{pa['resname']}:{pa['resnum']}")
-                break
-    return sorted(feats)
-
-
-def run_plip(complex_pdb: str, out_dir: str, name: str) -> Tuple[Optional[str], Optional[str]]:
-    plip_exe = shutil.which("plipcmd") or shutil.which("plip")
-    if plip_exe is None:
-        return None, "PLIP executable not found"
-    od = Path(out_dir) / name
-    od.mkdir(parents=True, exist_ok=True)
-    cmd = [plip_exe, "-f", str(complex_pdb), "-x", "-o", str(od)]
-    res = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-    (od / "plip_log.txt").write_text(res.stdout)
-    xmls = list(od.glob("*.xml")) + list(od.glob("**/*.xml"))
-    if res.returncode != 0 or not xmls:
-        return None, f"PLIP failed. Return={res.returncode}."
-    return str(xmls[0]), None
-
-
-def parse_plip_xml(xml_path: str) -> List[str]:
-    feats: set = set()
-    if not xml_path or not os.path.exists(xml_path):
-        return []
-    try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-    except Exception:
-        return []
-    type_map = {
-        "hydrophobic_interaction": "HYDROPHOBIC",
-        "hydrogen_bond": "HBOND",
-        "water_bridge": "WATERBRIDGE",
-        "salt_bridge": "SALTBRIDGE",
-        "pi_stack": "PISTACK",
-        "pi_cation_interaction": "PICATION",
-        "halogen_bond": "HALOGEN",
-        "metal_complex": "METAL",
-    }
-    for elem in root.iter():
-        tag = elem.tag.split("}")[-1].lower()
-        itype = next((v for k, v in type_map.items() if k in tag), None)
-        if itype is None:
-            continue
-        vals = {c.tag.split("}")[-1].lower(): (c.text or "").strip() for c in elem.iter() if c.text}
-        resnr = vals.get("resnr") or vals.get("resnum") or "NA"
-        restype = vals.get("restype") or vals.get("resname") or "RES"
-        reschain = vals.get("reschain") or vals.get("chain") or "_"
-        feats.add(f"{itype}:{reschain}:{restype}:{resnr}")
-    return sorted(feats)
-
-
-# ---------------------------------------------------------------------------
-# 3D ligand file generation
-# ---------------------------------------------------------------------------
-
-def build_3d_mol(smiles: str, seed: int = 42, mmff: bool = True) -> Tuple[Optional[Chem.Mol], str]:
-    mol0 = Chem.MolFromSmiles(smiles)
-    if mol0 is None:
-        return None, "invalid_smiles"
-    mol = Chem.AddHs(mol0)
-    params = AllChem.ETKDGv3()
-    params.randomSeed = seed
-    if AllChem.EmbedMolecule(mol, params) != 0:
-        params.useRandomCoords = True
-        if AllChem.EmbedMolecule(mol, params) != 0:
-            return None, "embed_failed"
-    if mmff:
-        try:
-            props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s")
-            if props:
-                AllChem.MMFFOptimizeMolecule(mol, mmffVariant="MMFF94s", maxIters=1000)
-            else:
-                AllChem.UFFOptimizeMolecule(mol, maxIters=1000)
-        except Exception:
-            pass
-    return mol, "ok"
-
-
-def generate_3d_ligand_files(
-    ligand_table: pd.DataFrame,
-    out_dir: Path,
-    formats: List[str] = ["SDF"],
-    mmff: bool = True,
-) -> pd.DataFrame:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    obabel = shutil.which("obabel")
-    combined_sdf = out_dir / "all_ligands_3d.sdf"
-    writer = Chem.SDWriter(str(combined_sdf))
-    rows = []
-    for i, r in ligand_table.iterrows():
-        compound = _safe_file_token(r.get("compound", f"ligand_{i+1}"))
-        smiles = str(r.get("smiles", "")).strip()
-        mol, status = build_3d_mol(smiles, seed=42 + int(i), mmff=mmff)
-        sdf_p = pdb_p = mol2_p = None
-        if mol:
-            mol.SetProp("_Name", compound)
-            if "SDF" in formats:
-                sdf_p = str(out_dir / f"{compound}.sdf")
-                w = Chem.SDWriter(sdf_p)
-                w.write(mol)
-                w.close()
-            if "PDB" in formats:
-                pdb_p = str(out_dir / f"{compound}.pdb")
-                Chem.MolToPDBFile(mol, pdb_p)
-            if "MOL2" in formats and obabel and sdf_p:
-                mol2_p = str(out_dir / f"{compound}.mol2")
-                subprocess.run([obabel, sdf_p, "-O", mol2_p], capture_output=True, check=False)
-                if not os.path.exists(mol2_p):
-                    mol2_p = None
-            writer.write(mol)
-        rows.append({"compound": compound, "smiles": smiles, "status": status,
-                     "sdf": sdf_p, "pdb": pdb_p, "mol2": mol2_p})
-    writer.close()
-    return pd.DataFrame(rows)
-
-# ---------------------------------------------------------------------------
-# 3D Viewer helper — interacting residues for py3Dmol
-# ---------------------------------------------------------------------------
-
-def get_interacting_residues(receptor_pdb: str, lig_mol, cutoff: float = 3.5) -> list:
-    """Return list of {chain, resi, resn} dicts for residues within cutoff of ligand."""
-    try:
-        from rdkit.Chem import AllChem as _AC
-        conf    = lig_mol.GetConformer()
-        lig_xyz = np.array([
-            [conf.GetAtomPosition(i).x,
-             conf.GetAtomPosition(i).y,
-             conf.GetAtomPosition(i).z]
-            for i in range(lig_mol.GetNumAtoms())
-        ])
-        protein, _ = read_complex_atoms_for_pocket(receptor_pdb)
-        seen = {}
-        for a in protein:
-            d = float(np.linalg.norm(lig_xyz - a["xyz"], axis=1).min())
-            if d <= cutoff:
-                key = (a["chain"], a["resnum"])
-                if key not in seen:
-                    seen[key] = a["resname"]
-        return [{"chain": k[0], "resi": k[1], "resn": v} for k, v in seen.items()]
-    except Exception:
-        return []
-
-# ---------------------------------------------------------------------------
-# RMSD calculation — heavy atoms via MCS (adapted from AnyonCanDock)
-# ---------------------------------------------------------------------------
-
-def calc_rmsd_heavy(pose_mol, crystal_pdb_path: str):
-    """RMSD of pose vs co-crystal ligand using maximum common substructure."""
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import rdFMCS
-        import numpy as _np
-        if not os.path.exists(crystal_pdb_path):
-            return None
-        cryst = None
-        for sanitize, removeHs, proxBonding in [
-            (True,  True, True), (False, True, True),
-            (True,  True, False), (False, True, False),
-        ]:
-            try:
-                cryst = Chem.MolFromPDBFile(
-                    crystal_pdb_path, sanitize=sanitize,
-                    removeHs=removeHs, proximityBonding=proxBonding)
-                if cryst is not None and cryst.GetNumConformers() > 0:
-                    if not sanitize:
-                        try: Chem.SanitizeMol(cryst)
-                        except Exception: pass
-                    break
-                cryst = None
-            except Exception:
-                cryst = None
-        if cryst is None or cryst.GetNumConformers() == 0:
-            return None
-        pose = Chem.RemoveHs(pose_mol, sanitize=False)
-        try: Chem.SanitizeMol(pose)
-        except Exception: pass
-        if pose.GetNumConformers() == 0:
-            return None
-        n_smaller = min(pose.GetNumAtoms(), cryst.GetNumAtoms())
-        mcs = rdFMCS.FindMCS(
-            [pose, cryst], timeout=10,
-            bondCompare=rdFMCS.BondCompare.CompareAny,
-            atomCompare=rdFMCS.AtomCompare.CompareElements,
-            completeRingsOnly=False, matchValences=False,
-        )
-        if mcs.numAtoms < 3 or mcs.numAtoms < 0.6 * n_smaller:
-            return None
-        mcs_mol = Chem.MolFromSmarts(mcs.smartsString)
-        if mcs_mol is None:
-            return None
-        pose_matches  = pose.GetSubstructMatches(mcs_mol,  uniquify=False)
-        cryst_matches = cryst.GetSubstructMatches(mcs_mol, uniquify=False)
-        if not pose_matches or not cryst_matches:
-            return None
-        pc = pose.GetConformer()
-        cc = cryst.GetConformer()
-        def _rmsd(pm, cm):
-            sq = sum(
-                (pc.GetAtomPosition(pi).x - cc.GetAtomPosition(ci).x) ** 2 +
-                (pc.GetAtomPosition(pi).y - cc.GetAtomPosition(ci).y) ** 2 +
-                (pc.GetAtomPosition(pi).z - cc.GetAtomPosition(ci).z) ** 2
-                for pi, ci in zip(pm, cm)
+            _v3.zoomTo({"model": 0})
+            _v3.zoom(1.2)
+            show3d(_v3, height=480)
+            st.caption(
+                f"🔵 Cyan wireframe = docking search box ({int(bx)}×{int(by)}×{int(bz)} Å)  ·  "
+                f"🟣 Magenta = co-crystal reference  ·  "
+                f"⬜ White sticks = pocket residues inside box  ·  "
+                f"Center: ({_cx3:.1f}, {_cy3:.1f}, {_cz3:.1f})"
             )
-            return float(_np.sqrt(sq / len(pm)))
-        return min(_rmsd(pm, cm) for pm in pose_matches for cm in cryst_matches)
-    except Exception:
-        return None
+        except ImportError:
+            st.info("Install `py3Dmol` to enable the 3D viewer.")
+        except Exception as _ve3:
+            st.warning(f"3D viewer error: {_ve3}")
+
+    if acd_ok and obabel_ok and receptor:
+        if st.button("Run docking", type="primary"):
+            n = len(lig_df)
+            progress = st.progress(0.0, text=f"Preparing to dock {n} compounds…")
+            status = st.empty()
+            live_table = st.empty()
+            dock_results = []
+            any_fail = False
+            full_log = []
+
+            ref_mol = None
+            ref_pdb = st.session_state.ref_ligand_path
+            if ref_pdb and os.path.exists(str(ref_pdb)):
+                try:
+                    ref_mol = Chem.MolFromPDBFile(str(ref_pdb), removeHs=True)
+                except Exception:
+                    pass
+
+            for i, row in lig_df.iterrows():
+                compound = str(row["compound"])
+                smi = str(row["smiles"])
+                progress.progress(i / n, text=f"Docking {i+1} of {n}:  {compound}")
+                status.markdown(
+                    f'<div style="font-size:0.85rem;color:#8B7355;">'
+                    f'⏳ Running AutoDock Vina on <strong>{compound}</strong>…</div>',
+                    unsafe_allow_html=True)
+                cmd = core.build_acd_dock_cmd(
+                    receptor=receptor, smiles=smi, name=compound,
+                    ph=dock_ph, output_dir=dock_out_dir,
+                    save_poses=True,
+                    exhaustiveness=exhaustiveness,
+                    num_poses=num_poses,
+                    box_x=bx, box_y=by, box_z=bz,
+                )
+                # Show command for first compound (debug)
+                if i == 0:
+                    with st.expander("🔧 Docking command (first compound)", expanded=False):
+                        st.code(" ".join(str(c) for c in cmd), language="bash")
+                rc, output = core.run_command(cmd)
+                full_log.append(f"=== {compound} (exit {rc}) ===\n{output}\n")
+                if rc != 0:
+                    any_fail = True
+                    if i == 0:
+                        st.error(f"❌ First compound failed (exit {rc}):\n```\n{output[-800:]}\n```")
+                summary = core.summarize_docking_for_compound(
+                    out_dir=dock_out_dir, compound=compound, smiles=smi,
+                    ref_mol=ref_mol, ref_pdb_path=ref_pdb)
+                summary["dock_status"] = "✅" if rc == 0 else "❌"
+                dock_results.append(summary)
+                preview_df = pd.DataFrame([{
+                    "compound": r["compound"], "status": r["dock_status"],
+                    "top_BE": r.get("top_BE", "—"), "top_RMSD": r.get("top_RMSD", "—"),
+                } for r in dock_results])
+                live_table.dataframe(preview_df, width='stretch', hide_index=True)
+
+            progress.progress(1.0, text=f"Finished docking {n} compounds")
+            status.empty()
+            (work / "acd_batch.log").write_text("\n".join(full_log))
+
+            if any_fail:
+                st.warning("Docking finished, but some compounds failed.")
+            else:
+                st.success(f"Docking finished — all {n} compounds ✅")
+
+            st.divider()
+            st.markdown("### Docking results")
+            if ref_mol:
+                st.info("RMSD computed against the co-crystal ligand pose.")
+
+            result_rows = []
+            for r in dock_results:
+                result_rows.append({
+                    "compound": r["compound"], "SMILES": r["smiles"],
+                    "status": r["dock_status"], "n_poses": r.get("n_poses", 0),
+                    "top_BE (kcal/mol)": r.get("top_BE"),
+                    "top_RMSD (Å)": r.get("top_RMSD"),
+                    "minRMSD_BE (kcal/mol)": r.get("minRMSD_BE"),
+                    "minRMSD (Å)": r.get("minRMSD_RMSD"),
+                })
+            # ── Build per-compound per-pose RMSD vs co-crystal ─────────────
+            cryst_pdb = st.session_state.ref_ligand_path or ""
+            _has_crystal = bool(cryst_pdb and os.path.exists(cryst_pdb))
+            # Store co-crystal reference BE for plot (from Mode A redocking or manual entry)
+            if "_ref_be_for_plot" not in st.session_state:
+                st.session_state["_ref_be_for_plot"] = None
+
+            # Compute pose-level RMSD and best scores per compound
+            for r in dock_results:
+                cmpd_name = r["compound"]
+                dock_dir  = dock_out_dir
+                # Try to find all pose SDFs for this compound
+                pose_sdfs = core.find_pose_sdfs_for_compound(dock_dir, cmpd_name) if hasattr(core, "find_pose_sdfs_for_compound") else []
+                pose_rows = []
+                if pose_sdfs:
+                    try:
+                        from rdkit.Chem import SDMolSupplier
+                        suppl = SDMolSupplier(pose_sdfs[0], removeHs=False)
+                        scores_list = r.get("scores", [])
+                        for i, mol in enumerate(suppl):
+                            if mol is None:
+                                continue
+                            pose_num = i + 1
+                            be = None
+                            if scores_list and i < len(scores_list):
+                                be = scores_list[i].get("affinity") or scores_list[i].get("score")
+                            rmsd_val = None
+                            if _has_crystal:
+                                rmsd_val = core.calc_rmsd_heavy(mol, cryst_pdb)
+                            pose_rows.append({
+                                "Pose": pose_num,
+                                "Affinity (kcal/mol)": round(float(be), 2) if be is not None else None,
+                                "RMSD vs co-crystal (Å)": round(rmsd_val, 2) if rmsd_val is not None else "—",
+                            })
+                    except Exception:
+                        pass
+                r["_pose_rows"] = pose_rows
+
+            # ── Summary table (one row per compound) ────────────────────────
+            results_df = pd.DataFrame(result_rows)
+            if "top_BE (kcal/mol)" in results_df.columns:
+                results_df = results_df.sort_values("top_BE (kcal/mol)", na_position="last").reset_index(drop=True)
+
+            st.markdown("#### Docking summary")
+            hint("Sorted by best binding energy (most negative = strongest predicted binding).")
+
+            # Colour coding: BE gradient + RMSD flag
+            def _colour_be(val):
+                try:
+                    v = float(val)
+                    if v < -10:   return "background-color:#E6F4EA;color:#1E7E34"
+                    elif v < -8:  return "background-color:#FFF3CD;color:#856404"
+                    elif v < -6:  return "background-color:#FDE8E8;color:#842029"
+                    else:         return "background-color:#F8D7DA;color:#721c24"
+                except Exception:
+                    return ""
+
+            def _colour_rmsd(val):
+                try:
+                    v = float(val)
+                    if v <= 2.0:  return "color:#1E7E34;font-weight:500"
+                    elif v <= 3.0:return "color:#856404"
+                    else:         return "color:#842029"
+                except Exception:
+                    return ""
+
+            be_col   = "top_BE (kcal/mol)"
+            rmsd_col = "top_RMSD (Å)"
+
+            styled = results_df.style
+            if be_col in results_df.columns:
+                styled = styled.map(_colour_be, subset=[be_col])
+            if rmsd_col in results_df.columns and _has_crystal:
+                styled = styled.map(_colour_rmsd, subset=[rmsd_col])
+            if be_col in results_df.columns:
+                fmt = {be_col: lambda x: f"{x:.2f}" if x is not None and str(x) != "nan" else "—"}
+                if rmsd_col in results_df.columns:
+                    fmt[rmsd_col] = lambda x: f"{x:.2f}" if isinstance(x, float) else str(x)
+                styled = styled.format(fmt, na_rep="—")
+
+            st.dataframe(styled, width='stretch', hide_index=True)
+
+            if not _has_crystal:
+                st.caption("ℹ️ RMSD vs co-crystal not shown — no reference ligand available (Mode B or no co-crystal PDB).")
+
+            # ── Batch score plot (ACD-style) ─────────────────────────────────
+            st.markdown("#### Score plot")
+            _plot_df = results_df.dropna(subset=["top_BE (kcal/mol)"]).copy()
+            _plot_df = _plot_df.sort_values("top_BE (kcal/mol)").reset_index(drop=True)
+
+            if not _plot_df.empty:
+                import matplotlib.pyplot as _plt
+                import io as _io
+
+                _n    = len(_plot_df)
+                _names  = _plot_df["compound"].tolist()
+                _scores = _plot_df["top_BE (kcal/mol)"].tolist()
+                _best   = min(_scores)
+
+                # Colour: green = best, blue = others
+                _dot_colors = ["#3fb950" if s == _best else "#58a6ff" for s in _scores]
+
+                # RMSD colour ring: green ≤2Å, amber 2-3Å, red >3Å, gray = no crystal
+                _rmsd_vals = []
+                if _has_crystal and "top_RMSD (Å)" in _plot_df.columns:
+                    for v in _plot_df["top_RMSD (Å)"]:
+                        try:
+                            _rmsd_vals.append(float(v))
+                        except Exception:
+                            _rmsd_vals.append(None)
+                else:
+                    _rmsd_vals = [None] * _n
+
+                _rmsd_ring = []
+                for rv in _rmsd_vals:
+                    if rv is None:     _rmsd_ring.append("#888888")
+                    elif rv <= 2.0:    _rmsd_ring.append("#3fb950")
+                    elif rv <= 3.0:    _rmsd_ring.append("#d29922")
+                    else:              _rmsd_ring.append("#f85149")
+
+                # Reference line = co-crystal BE if redocking was done
+                _ref_be = st.session_state.get("_ref_be_for_plot")
+
+                # Dark/light aware colours
+                _dark = False
+                try:
+                    _dark = st.get_option("theme.base") == "dark"
+                except Exception:
+                    pass
+
+                _bg      = "#0d1117" if _dark else "#ffffff"
+                _bg_sub  = "#161b22" if _dark else "#f6f8fa"
+                _txt     = "#e6edf3" if _dark else "#1f2328"
+                _muted   = "#8b949e" if _dark else "#6e7781"
+                _border  = "#30363d" if _dark else "#d0d7de"
+                _leg_bg  = "#21262d" if _dark else "#f6f8fa"
+
+                _fig_w = max(5, _n * 0.7 + 1.8)
+                _fig, _ax = _plt.subplots(figsize=(_fig_w, 3.8))
+                _fig.patch.set_facecolor(_bg)
+                _ax.set_facecolor(_bg_sub)
+
+                _xs = list(range(_n))
+
+                # Line connecting dots
+                _ax.plot(_xs, _scores, color=_border, linewidth=0.8, zorder=2)
+
+                # Dots with RMSD-coloured edge ring
+                _ax.scatter(_xs, _scores,
+                            color=_dot_colors,
+                            edgecolors=_rmsd_ring,
+                            linewidths=2.2,
+                            s=100, zorder=3)
+
+                # Reference dashed line
+                if _ref_be is not None:
+                    _ax.axhline(_ref_be, color="#f85149", linewidth=1.8,
+                                linestyle="--",
+                                label=f"Co-crystal ref: {_ref_be:.2f} kcal/mol")
+                    _ax.legend(facecolor=_leg_bg, edgecolor=_border,
+                               labelcolor=_txt, fontsize=8)
+
+                _ax.set_xticks(_xs)
+                _ax.set_xticklabels(_names, rotation=40, ha="right", fontsize=7)
+                _ax.set_xlim(-0.5, _n - 0.5)
+                _ax.set_ylabel("Vina score (kcal/mol)", color=_muted, fontsize=9)
+                _ax.set_xlabel("Analog", color=_muted, fontsize=9)
+                _ax.tick_params(colors=_muted, labelsize=7)
+                for _sp in _ax.spines.values():
+                    _sp.set_edgecolor(_border)
+
+                _fig.tight_layout()
+
+                # Render
+                _pbuf = _io.BytesIO()
+                _fig.savefig(_pbuf, format="png", dpi=150,
+                             bbox_inches="tight", facecolor=_fig.get_facecolor())
+                _pbuf.seek(0)
+                st.image(_pbuf.getvalue(), width='stretch')
+                _plt.close(_fig)
+
+                # Legend note
+                _legend_parts = [
+                    "🟢 Best binding energy",
+                    "🔵 Other analogs",
+                ]
+                if _has_crystal:
+                    _legend_parts += [
+                        "Ring colour: 🟢 RMSD ≤2 Å  🟡 2–3 Å  🔴 >3 Å  ⚫ no crystal"
+                    ]
+                st.caption("  ·  ".join(_legend_parts))
+
+            # ── Per-pose detail table (expandable per compound) ─────────────
+            st.markdown("#### Per-pose scores")
+            hint("Expand each compound to see all poses with binding energy and RMSD vs co-crystal.")
+            for r in dock_results:
+                pose_rows = r.get("_pose_rows", [])
+                if not pose_rows:
+                    continue
+                cmpd_name = r["compound"]
+                best_be   = r.get("top_BE")
+                be_str    = f"{best_be:.2f} kcal/mol" if best_be else "—"
+                with st.expander(f"{cmpd_name}  ·  best BE: {be_str}  ·  {len(pose_rows)} poses"):
+                    pose_df = pd.DataFrame(pose_rows)
+                    if "Affinity (kcal/mol)" in pose_df.columns:
+                        pose_df = pose_df.sort_values("Affinity (kcal/mol)", na_position="last")
+
+                    pstyled = pose_df.style.map(_colour_be, subset=["Affinity (kcal/mol)"])
+                    if _has_crystal and "RMSD vs co-crystal (Å)" in pose_df.columns:
+                        pstyled = pstyled.map(_colour_rmsd, subset=["RMSD vs co-crystal (Å)"])
+                    st.dataframe(pstyled, width='stretch', hide_index=True)
+
+                    # Best pose flag
+                    if _has_crystal and "RMSD vs co-crystal (Å)" in pose_df.columns:
+                        try:
+                            best_rmsd_row = pose_df[pose_df["RMSD vs co-crystal (Å)"] != "—"].copy()
+                            best_rmsd_row["_r"] = pd.to_numeric(best_rmsd_row["RMSD vs co-crystal (Å)"], errors="coerce")
+                            best_rmsd_row = best_rmsd_row.dropna(subset=["_r"])
+                            if not best_rmsd_row.empty:
+                                br = best_rmsd_row.loc[best_rmsd_row["_r"].idxmin()]
+                                rmsd_v = float(br["_r"])
+                                icon = "✅" if rmsd_v <= 2.0 else ("⚠️" if rmsd_v <= 3.0 else "❌")
+                                label = "good reproduction" if rmsd_v <= 2.0 else ("moderate" if rmsd_v <= 3.0 else "poor reproduction")
+                                st.caption(
+                                    f"{icon} Best RMSD: **{rmsd_v:.2f} Å** (Pose {int(br['Pose'])}) — {label}  "
+                                    f"{'(≤2 Å = binding mode reproduced)' if rmsd_v <= 2.0 else '(>2 Å = check docking protocol)'}"
+                                )
+                        except Exception:
+                            pass
+
+            st.session_state.docking_summary = results_df
+
+            grid_mols, grid_legs = [], []
+            for r in result_rows:
+                m = Chem.MolFromSmiles(str(r["SMILES"]))
+                if m:
+                    try:
+                        AllChem.Compute2DCoords(m)
+                        be_str   = f"BE={r['top_BE (kcal/mol)']}" if r.get("top_BE (kcal/mol)") else ""
+                        rmsd_str = f"RMSD={r['top_RMSD (Å)']}"   if r.get("top_RMSD (Å)") else ""
+                        grid_mols.append(m)
+                        grid_legs.append(f"{r['compound']}\n{be_str}  {rmsd_str}")
+                    except Exception:
+                        pass
+            if grid_mols:
+                try:
+                    png = Draw.MolsToGridImage(
+                        grid_mols, legends=grid_legs, molsPerRow=4,
+                        subImgSize=(280, 210), returnPNG=True)
+                    st.image(png, width='stretch')
+                except Exception as e:
+                    st.warning(f"Could not render structure grid: {e}")
+
+            # ── 3D Complex Viewer ────────────────────────────────────────────────
+            st.divider()
+            st.markdown("### 🧬 3D Complex Viewer")
+            hint("Select a compound and pose to visualise the docked complex.")
+
+            if result_rows:
+                v3d_compounds = [r["compound"] for r in result_rows if r.get("n_poses", 0) > 0]
+                if v3d_compounds:
+                    v3d_col1, v3d_col2 = st.columns([1, 3])
+                    with v3d_col1:
+                        sel_compound = st.selectbox(
+                            "Compound", v3d_compounds, key="v3d_compound_sel")
+
+                        # Load all poses for selected compound
+                        _v3d_sdfs = core.find_pose_sdfs_for_compound(dock_out_dir, sel_compound)
+                        _all_poses = []
+                        if _v3d_sdfs:
+                            try:
+                                from rdkit.Chem import SDMolSupplier as _SDS
+                                _suppl = _SDS(_v3d_sdfs[0], removeHs=False)
+                                for _pm in _suppl:
+                                    if _pm is not None:
+                                        _all_poses.append(_pm)
+                            except Exception:
+                                pass
+
+                        # Pose picker with BE and RMSD
+                        _pose_labels = []
+                        for _pi, _pm in enumerate(_all_poses):
+                            _sc = None
+                            for _prop in _pm.GetPropsAsDict():
+                                if "score" in _prop.lower() or "affinity" in _prop.lower():
+                                    try: _sc = float(_pm.GetProp(_prop))
+                                    except: pass
+                            _lbl = f"Pose {_pi+1}"
+                            if _sc is not None:
+                                _lbl += f"  {_sc:.2f} kcal/mol"
+                            _pose_labels.append(_lbl)
+
+                        if not _pose_labels:
+                            _pose_labels = ["Pose 1 (best)"]
+
+                        sel_pose_label = st.selectbox(
+                            "Pose", _pose_labels, key="v3d_pose_sel")
+                        sel_pose_idx = _pose_labels.index(sel_pose_label)
+                        pose_mol = _all_poses[sel_pose_idx] if _all_poses else None
+
+                        # Controls
+                        st.markdown("**Display options:**")
+                        show_labels  = st.checkbox("Residue labels", value=True, key="v3d_labels")
+                        show_surface = st.checkbox("Protein surface", value=False, key="v3d_surface")
+                        v3d_cutoff   = st.slider("Pocket cutoff (Å)", 3.0, 8.0, 4.5, 0.5, key="v3d_cutoff")
+                        v3d_height   = st.slider("Height (px)", 350, 700, 500, 50, key="v3d_height")
+
+                        # Colour legend
+                        st.markdown(
+                            '<div style="font-size:0.77rem;line-height:2;margin-top:10px;">'+
+                            '<span style="color:#00FFFF">■</span> Docked pose<br>'+
+                            '<span style="color:#FF00FF">■</span> Co-crystal ref<br>'+
+                            '<span style="color:#FF8C00">■</span> Pocket residues<br>'+
+                            '<span style="color:#AAAAAA">■</span> Protein</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # RMSD for selected pose
+                        _ref_pdb = st.session_state.ref_ligand_path or ""
+                        if pose_mol and _ref_pdb and os.path.exists(_ref_pdb):
+                            try:
+                                _rmsd_val = core.calc_rmsd_heavy(pose_mol, _ref_pdb)
+                                if _rmsd_val is not None:
+                                    _rmsd_col = "🟢" if _rmsd_val <= 2.0 else ("🟡" if _rmsd_val <= 3.0 else "🔴")
+                                    st.metric("RMSD vs co-crystal", f"{_rmsd_val:.2f} Å", delta=None)
+                                    st.caption(f"{_rmsd_col} {'≤2 Å — binding mode reproduced' if _rmsd_val<=2 else ('2–3 Å — moderate' if _rmsd_val<=3 else '>3 Å — poor reproduction')}")
+                            except Exception:
+                                pass
+
+                    with v3d_col2:
+                        if pose_mol:
+                            render_complex_3d(
+                                receptor_pdb  = receptor or "",
+                                pose_mol      = pose_mol,
+                                height        = v3d_height,
+                                cutoff        = v3d_cutoff,
+                                show_labels   = show_labels,
+                                show_surface  = show_surface,
+                                ref_ligand_pdb= _ref_pdb,
+                                key_prefix    = f"v3d_{sel_compound}_{sel_pose_idx}",
+                            )
+                        else:
+                            st.info(f"No poses found for **{sel_compound}**.")
+                else:
+                    st.info("No docked poses to display. Run docking first.")
+
+            st.divider()
+            csv_rows = [{"compound": r["compound"], "SMILES": r["SMILES"],
+                "status": r["status"], "n_poses": r["n_poses"],
+                "top_pose_BE_kcal_mol": r["top_BE (kcal/mol)"],
+                "top_pose_RMSD_vs_crystal_A": r["top_RMSD (Å)"],
+                "min_RMSD_pose_BE_kcal_mol": r["minRMSD_BE (kcal/mol)"],
+                "min_RMSD_vs_crystal_A": r["minRMSD (Å)"],
+            } for r in result_rows]
+            csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode()
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button("⬇️ Docking results CSV", data=csv_bytes,
+                    file_name=f"{st.session_state.parent_name}_docking_results.csv",
+                    mime="text/csv", width='stretch')
+            with dl2:
+                smi_out = "\n".join(f"{r['SMILES']}\t{r['compound']}" for r in result_rows)
+                st.download_button("⬇️ Docked compounds SMILES", data=smi_out.encode(),
+                    file_name=f"{st.session_state.parent_name}_docked.smi",
+                    mime="text/plain", width='stretch')
+            with st.expander("ACD log"):
+                st.text("\n".join(full_log)[-4000:])
+
+    elif not receptor:
+        st.info("Load a target receptor above to enable docking.")
+    else:
+        st.info("ACD or OpenBabel is not installed here. Download the ligand file and dock externally.")
+        st.download_button("⬇️ Download compounds.smi", data=smi_path.read_text(),
+                           file_name="compounds.smi", mime="text/plain")
+
+    if mode == "structure" and st.session_state.protein_path:
+        st.divider()
+        st.markdown("### 🔬 Interaction fingerprints (PLIP / cIFP)")
+        hint("Compare binding interactions of parent vs each docked analog.")
+
+        plip_available = bool(shutil.which("plipcmd") or shutil.which("plip"))
+        if not plip_available:
+            st.caption("PLIP not installed — using distance-based cIFP as fallback.")
+
+        if st.button("Run PLIP / cIFP on all poses", type="primary", key="cifp_run_btn"):
+            cifp_dir = work / "plip_cifp" / "complexes"
+            cifp_dir.mkdir(parents=True, exist_ok=True)
+            pose_dir = work / "docking_out" / "selected_pose_pdbs"
+            pose_pdbs = list(pose_dir.glob("*.pdb")) if pose_dir.exists() else []
+
+            if not pose_pdbs:
+                st.warning("No docked pose PDBs found. Run docking first.")
+            else:
+                rows_c = []
+                analog_feats_map = {}
+                prog = st.progress(0.0, text="Running interaction analysis…")
+
+                for idx_p, p in enumerate(pose_pdbs[:30]):
+                    prog.progress((idx_p+1)/min(len(pose_pdbs),30),
+                                  text=f"Analysing {p.stem}…")
+                    cpx = str(cifp_dir / f"{p.stem}_complex.pdb")
+                    protein_pdb = st.session_state.protein_path
+                    core.combine_protein_ligand_pdb(protein_pdb, str(p), cpx)
+
+                    feats = []
+                    method = "distance"
+                    if plip_available and _PA_OK:
+                        xml_path, err, _ = _pa.run_plip_on_complex(
+                            cpx, str(work / "plip_cifp" / "plip_out"), p.stem)
+                        if xml_path:
+                            plip_tbl = _pa.parse_plip_to_table(xml_path)
+                            feats = [
+                                f"{r['type']}:{r['chain']}:{r['resname']}:{r['resnum']}"
+                                for _, r in plip_tbl.iterrows()
+                            ] if not plip_tbl.empty else []
+                            method = "PLIP"
+
+                    if not feats and _PA_OK:
+                        feats = _pa.distance_cifp_features(cpx, cutoff=4.0)
+
+                    analog_feats_map[p.stem] = feats
+                    rows_c.append({
+                        "compound":        p.stem,
+                        "method":          method,
+                        "n_interactions":  len(feats),
+                        "features":        ";".join(feats[:10]),
+                    })
+
+                prog.progress(1.0, text="Done!")
+                cifp_df = pd.DataFrame(rows_c)
+                st.session_state.cifp_results   = cifp_df
+                st.session_state["_analog_plip"] = analog_feats_map
+
+                # Compare parent vs analogs
+                parent_feats = st.session_state.get("_plip_parent_feats", [])
+                if parent_feats and analog_feats_map and _PA_OK:
+                    cmp_df = _pa.compare_cifp(parent_feats, analog_feats_map)
+                    st.session_state["_cifp_comparison"] = cmp_df
+                    st.success(f"PLIP/cIFP computed for {len(cifp_df)} poses")
+                else:
+                    st.session_state["_cifp_comparison"] = None
+                    st.success(f"cIFP computed for {len(cifp_df)} poses")
+                st.rerun()
+
+        # Show results
+        cifp_df = st.session_state.get("cifp_results")
+        cmp_df  = st.session_state.get("_cifp_comparison")
+
+        if cifp_df is not None and not cifp_df.empty:
+            tab_raw, tab_cmp = st.tabs(["📋 Interaction table", "⚖️ Parent vs Analogs"])
+
+            with tab_raw:
+                st.dataframe(cifp_df, width='stretch', hide_index=True)
+
+            with tab_cmp:
+                if cmp_df is not None and not cmp_df.empty:
+                    st.markdown("**Tanimoto similarity to parent interaction fingerprint**")
+                    st.caption(
+                        "🟢 High tanimoto = similar binding mode  "
+                        "· ⚠️ = lost key interaction  "
+                        "· n_new = potentially new contacts"
+                    )
+
+                    def _cmp_style(val):
+                        try:
+                            v = float(val)
+                            if v >= 0.7:   return "background-color:#E6F4EA;color:#1E7E34"
+                            elif v >= 0.4: return "background-color:#FFF3CD;color:#856404"
+                            else:          return "background-color:#FDE8E8;color:#842029"
+                        except Exception:
+                            return ""
+
+                    styled = cmp_df.style.map(_cmp_style, subset=["tanimoto"])
+                    st.dataframe(styled, width='stretch', hide_index=True)
+
+                    # Highlight warnings
+                    warn_df = cmp_df[cmp_df["warning"] != ""]
+                    if not warn_df.empty:
+                        st.markdown("**⚠️ Analogs with lost key interactions:**")
+                        for _, row in warn_df.iterrows():
+                            st.warning(f"{row['compound']}: {row['warning']}")
+                else:
+                    st.info(
+                        "Run PLIP analysis in Step 3 first to get parent interaction "
+                        "fingerprint for comparison."
+                    )
+
+    st.write("")
+    col_back, col_next = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            go(4)
+    with col_next:
+        if st.button("Export results →", type="primary"):
+            go(len(steps))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 (ligand) / STEP 6 (structure) – Export
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif step == len(steps):
+    df = st.session_state.analogs_df
+    if df is None or df.empty:
+        st.warning("No analogs generated yet. Complete the earlier steps first.")
+        st.stop()
+
+    parent_name = st.session_state.parent_name or "compound"
+    work = get_work_dir()
+    tier = analog_tier(len(df))
+
+    info_card("Your analogs are ready. Download the table, SMILES file, 3D structures, or a full ZIP archive.")
+
+    smi_lines = "\n".join(f"{r.smiles}\t{parent_name}_A{i+1}" for i, r in df.iterrows())
+
+    st.markdown("### Download analogs")
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button("⬇️ Analog table (CSV)",
+            data=df.to_csv(index=False).encode(),
+            file_name=f"{parent_name}_analogs.csv", mime="text/csv",
+            width='stretch')
+    with dl2:
+        st.download_button("⬇️ SMILES file (.smi)",
+            data=smi_lines.encode(),
+            file_name=f"{parent_name}_analogs.smi", mime="text/plain",
+            width='stretch')
+
+    # ── 3D SDF — available for docking and pkanet tiers ─────────────────────
+    if tier in ("docking", "pkanet"):
+        st.divider()
+        if tier == "pkanet":
+            st.markdown("### pKaNET — Check protonation state & Generate 3D structures")
+            info_card(
+                "pKaNET predicts the dominant protonation state at your target pH before building 3D conformers. "
+                "This gives more accurate structures for downstream docking or MD simulation."
+            )
+        else:
+            st.markdown("### Generate 3D structures")
+        hint("Creates a 3D conformer for each analog — useful for visualisation or further docking.")
+
+        g1, g2 = st.columns(2)
+        with g1:
+            fmt_sel = st.multiselect("Output formats", ["SDF", "PDB", "MOL2"], default=["SDF"])
+        with g2:
+            mmff_opt = st.checkbox("MMFF geometry optimisation", value=True)
+
+        if tier == "pkanet":
+            pk1, pk2 = st.columns(2)
+            with pk1:
+                pkanet_ph = st.number_input("Target pH for protonation", value=7.4, step=0.1,
+                                            help="pKaNET will assign the dominant state at this pH.")
+            with pk2:
+                st.markdown('<div style="height:1.4rem;"></div>', unsafe_allow_html=True)
+                use_pkanet = st.checkbox("Use pKaNET protonation", value=True)
+        else:
+            use_pkanet = False
+            pkanet_ph  = 7.4
+
+        if st.button("Generate 3D structures", type="primary"):
+            lig_table = df[["smiles"]].copy()
+            lig_table["compound"] = [f"{parent_name}_A{i+1}" for i in range(len(df))]
+            out_dir = work / "ligands_3d"
+            with st.spinner("Building 3D conformers…"):
+                manifest = core.generate_3d_ligand_files(lig_table, out_dir, formats=fmt_sel, mmff=mmff_opt)
+            ok_count = int((manifest.status == "ok").sum())
+            st.success(f"3D files generated: {ok_count} / {len(manifest)}")
+            st.dataframe(manifest, width='stretch', hide_index=True)
+            combined = out_dir / "all_ligands_3d.sdf"
+            if combined.exists():
+                st.download_button("⬇️ Download combined SDF",
+                    data=combined.read_bytes(),
+                    file_name=f"{parent_name}_3d.sdf",
+                    mime="chemical/x-mdl-sdfile",
+                    width='stretch')
+
+    else:
+        # smi_only tier — show info about upgrading
+        st.divider()
+        st.info(
+            f"You have **{len(df)} analogs**. "
+            "3D generation and pKaNET are available for ≤ 200 analogs, "
+            "and docking for ≤ 20 analogs. "
+            "Go back to Step 3 to reduce the count if needed."
+        )
+
+    # ── Full ZIP ─────────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### Full archive")
+    hint("Everything in one ZIP — analog table, SMILES, 3D files, docking results, and a session summary.")
+
+    if st.button("Build ZIP archive", width='stretch'):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(f"{parent_name}_analogs.csv", df.to_csv(index=False))
+            z.writestr(f"{parent_name}_analogs.smi", smi_lines)
+            for subdir in ["ligands_3d", "docking_out"]:
+                p = work / subdir
+                if p.exists():
+                    for f in p.rglob("*.*"):
+                        if f.is_file():
+                            z.write(f, arcname=f"{subdir}/{f.relative_to(p)}")
+            cifp = st.session_state.cifp_results
+            if cifp is not None and not cifp.empty:
+                z.writestr("cifp_results.csv", cifp.to_csv(index=False))
+            z.writestr("session_info.json", json.dumps({
+                "parent_smiles":  st.session_state.parent_smiles,
+                "parent_name":    parent_name,
+                "mode":           mode,
+                "n_analogs":      len(df),
+                "tier":           tier,
+                "selected_atoms": sorted(st.session_state.selected_atoms),
+                "risk":           st.session_state.risk,
+                "rank_by":        st.session_state.rank_by,
+            }, indent=2))
+        buf.seek(0)
+        st.download_button("⬇️ Download full ZIP",
+            data=buf.getvalue(),
+            file_name=f"{parent_name}_analog_builder_results.zip",
+            mime="application/zip",
+            width='stretch')
+
+    st.divider()
+    with st.expander("Session summary"):
+        st.json({
+            "mode":              mode,
+            "parent_smiles":     st.session_state.parent_smiles,
+            "parent_name":       parent_name,
+            "selected_atoms":    sorted(st.session_state.selected_atoms),
+            "analogs_generated": len(df),
+            "tier":              tier,
+            "top_category":      df.fragment_category.value_counts().index[0] if len(df) else "—",
+            "receptor_loaded":   bool(st.session_state.receptor_path),
+            "docking_run":       st.session_state.docking_ligands is not None,
+        })
+
+    col_back, _ = st.columns([1, 4])
+    with col_back:
+        if st.button("← Back"):
+            go(step - 1)
