@@ -5617,11 +5617,26 @@ def build_acd_dock_cmd(
     use_pkanet: bool = False,
     neutral: bool = False,
     save_poses: bool = True,
+    exhaustiveness: int = 8,
+    num_poses: int = 10,
+    box_x: float = 16.0,
+    box_y: float = 16.0,
+    box_z: float = 16.0,
     extra_args: str = "",
 ) -> List[str]:
-    cmd = ["acd", "dock", "--receptor", receptor, "--smiles", smiles,
-           "--center", center, "--name", _safe_file_token(name),
-           "--ph", str(ph), "-o", output_dir]
+    cmd = ["acd", "dock",
+           "--receptor", receptor,
+           "--smiles", smiles,
+           "--compound", _safe_file_token(name),
+           "--name",     _safe_file_token(name),
+           "--center",   center,
+           "--ph",       str(ph),
+           "--bx",       str(box_x),
+           "--by",       str(box_y),
+           "--bz",       str(box_z),
+           "-e",         str(exhaustiveness),
+           "-n",         str(num_poses),
+           "-o",         output_dir]
     if center == "manual":
         cmd.extend(["--cx", str(cx), "--cy", str(cy), "--cz", str(cz)])
     if use_pkanet:
@@ -5650,9 +5665,17 @@ def build_acd_batch_cmd(
     neutral: bool = False,
     extra_args: str = "",
 ) -> List[str]:
-    cmd = ["acd", "batch", "--receptor", receptor, "--ligands", ligands_smi,
-           "--output", output_dir, "--center", center,
-           "-e", str(exhaustiveness), "-n", str(num_poses), "--ph", str(ph)]
+    cmd = ["acd", "batch",
+           "--receptor", receptor,
+           "--ligands",  ligands_smi,
+           "--output",   output_dir,
+           "--center",   center,
+           "--ph",       str(ph),
+           "--bx",       str(box_x),
+           "--by",       str(box_y),
+           "--bz",       str(box_z),
+           "-e",         str(exhaustiveness),
+           "-n",         str(num_poses)]
     if use_pkanet:
         cmd.append("--pkanet")
     if neutral:
