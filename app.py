@@ -1450,7 +1450,13 @@ elif step == 3 and mode == "structure":
                         output_dir=dock_out,
                         use_pkanet=bool(use_pkanet),
                         save_poses=True,
+                        exhaustiveness=8,
+                        num_poses=10,
+                        box_x=16.0, box_y=16.0, box_z=16.0,
                     )
+                    # Show command for debugging
+                    with st.expander("🔧 ACD command", expanded=False):
+                        st.code(" ".join(str(c) for c in cmd), language="bash")
                     rc, log = core.run_command(cmd)
                     (work / "modeB_acd.log").write_text(log)
 
@@ -1477,13 +1483,20 @@ elif step == 3 and mode == "structure":
                             st.session_state.modeB_complex_path = complex_pdb
 
                             # Parse best score
-                            best = core.parse_acd_score_csvs(dock_out)
-                            be_str = ""
-                            if best:
-                                sc_col = best.get("_score_col","")
-                                be_val = best.get(sc_col)
-                                if be_val is not None:
-                                    be_str = f"  ·  BE = {float(be_val):.2f} kcal/mol"
+                            # Read best BE directly from PDBQT REMARK lines
+                            best_be = None
+                            import glob as _glob
+                            for _pdbqt in _glob.glob(str(Path(dock_out) / "**" / "*.pdbqt"), recursive=True):
+                                for _line in open(_pdbqt, errors="ignore"):
+                                    if _line.strip().startswith("REMARK VINA RESULT:"):
+                                        try:
+                                            best_be = float(_line.split()[3])
+                                        except Exception:
+                                            pass
+                                        break
+                                if best_be is not None:
+                                    break
+                            be_str = f"  ·  BE = {best_be:.2f} kcal/mol" if best_be is not None else ""
 
                             st.success(f"✅ Docking complete{be_str} — proceeding to pocket analysis")
                             st.rerun()
@@ -2506,11 +2519,22 @@ elif step == 5:
                     unsafe_allow_html=True)
                 cmd = core.build_acd_dock_cmd(
                     receptor=receptor, smiles=smi, name=compound,
-                    ph=dock_ph, output_dir=dock_out_dir, save_poses=True)
+                    ph=dock_ph, output_dir=dock_out_dir,
+                    save_poses=True,
+                    exhaustiveness=exhaustiveness,
+                    num_poses=num_poses,
+                    box_x=bx, box_y=by, box_z=bz,
+                )
+                # Show command for first compound (debug)
+                if i == 0:
+                    with st.expander("🔧 Docking command (first compound)", expanded=False):
+                        st.code(" ".join(str(c) for c in cmd), language="bash")
                 rc, output = core.run_command(cmd)
                 full_log.append(f"=== {compound} (exit {rc}) ===\n{output}\n")
                 if rc != 0:
                     any_fail = True
+                    if i == 0:
+                        st.error(f"❌ First compound failed (exit {rc}):\n```\n{output[-800:]}\n```")
                 summary = core.summarize_docking_for_compound(
                     out_dir=dock_out_dir, compound=compound, smiles=smi,
                     ref_mol=ref_mol, ref_pdb_path=ref_pdb)
