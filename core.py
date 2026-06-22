@@ -5460,6 +5460,61 @@ def detect_ligand_candidates(pdb_path: str) -> Tuple[pd.DataFrame, Dict]:
     return df, groups
 
 
+
+def ligand_pdb_to_smiles(pdb_path: str) -> str:
+    """
+    Convert a ligand PDB file to a canonical SMILES string with correct bond orders.
+
+    Strategy (in order of quality):
+      1. OpenBabel  — 3D geometry-based bond order perception (best)
+      2. RDKit DetermineBonds — available in RDKit >= 2022.09
+      3. RDKit MolFromPDBFile — last resort (may lose aromaticity)
+    """
+    import subprocess as _sub
+
+    # ── Method 1: OpenBabel ──────────────────────────────────────────────────
+    obabel = shutil.which("obabel")
+    if obabel:
+        try:
+            r = _sub.run(
+                [obabel, pdb_path, "-osmi", "-h"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                raw = r.stdout.strip().split()[0]
+                mol = Chem.MolFromSmiles(raw)
+                if mol and mol.GetNumAtoms() > 2:
+                    return Chem.MolToSmiles(mol)
+        except Exception:
+            pass
+
+    # ── Method 2: RDKit DetermineBonds (RDKit >= 2022.09) ───────────────────
+    try:
+        from rdkit.Chem import DetermineBonds as _DB
+        raw = Chem.MolFromPDBFile(str(pdb_path), removeHs=False, sanitize=False)
+        if raw:
+            _DB.DetermineBonds(raw, charge=0)
+            try:
+                Chem.SanitizeMol(raw)
+            except Exception:
+                pass
+            noH = Chem.RemoveHs(raw, sanitize=False)
+            smi = Chem.MolToSmiles(noH)
+            if smi:
+                return smi
+    except Exception:
+        pass
+
+    # ── Method 3: RDKit MolFromPDBFile fallback ──────────────────────────────
+    try:
+        mol = Chem.MolFromPDBFile(str(pdb_path), removeHs=True, sanitize=True)
+        if mol:
+            return Chem.MolToSmiles(mol)
+    except Exception:
+        pass
+
+    return ""
+
 def split_protein_ligand(
     pdb_path: str,
     ligand_resname: str = "",
