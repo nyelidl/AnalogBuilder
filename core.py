@@ -5933,6 +5933,130 @@ def find_pose_sdfs_for_compound(out_dir: str, compound: str) -> List[str]:
     return matched if matched else sdfs[:1]
 
 
+def draw_2d_interaction_svg(
+    mol,
+    selected_atoms=None,
+    contact_atoms=None,
+    width: int = 560,
+    height: int = 380,
+) -> str:
+    """
+    Draw 2D ligand structure with:
+      - Atom indices shown
+      - 🟠 Orange highlight = user-selected attachment atoms
+      - 🔵 Blue highlight   = atoms close to pocket residues (contact)
+
+    Returns SVG string.
+    """
+    from rdkit.Chem import AllChem
+    from rdkit.Chem.Draw import rdMolDraw2D
+
+    mol2 = Chem.RWMol(mol)
+    AllChem.Compute2DCoords(mol2)
+
+    selected_atoms = set(selected_atoms or [])
+    contact_atoms  = set(contact_atoms  or [])
+
+    highlight_atoms = []
+    atom_colors: Dict[int, tuple] = {}
+    atom_radii:  Dict[int, float] = {}
+
+    for i in range(mol2.GetNumAtoms()):
+        if i in selected_atoms:
+            highlight_atoms.append(i)
+            atom_colors[i] = (1.0, 0.55, 0.0)   # orange
+            atom_radii[i]  = 0.38
+        elif i in contact_atoms:
+            highlight_atoms.append(i)
+            atom_colors[i] = (0.2, 0.6, 1.0)    # blue
+            atom_radii[i]  = 0.30
+
+    drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
+    opts = drawer.drawOptions()
+    opts.addAtomIndices          = True
+    opts.addStereoAnnotation     = False
+    opts.padding                 = 0.12
+    opts.atomHighlightsAreCircles = True
+
+    drawer.DrawMolecule(
+        mol2,
+        highlightAtoms      = highlight_atoms,
+        highlightBonds      = [],
+        highlightAtomColors = atom_colors,
+        highlightAtomRadii  = atom_radii,
+    )
+    drawer.FinishDrawing()
+    return drawer.GetDrawingText()
+
+
+def get_ligand_contact_atoms(
+    mol_2d,
+    ref_ligand_pdb: str,
+    plip_df=None,
+    cutoff_A: float = 4.5,
+) -> set:
+    """
+    Return atom indices (2D SMILES space) that are within cutoff_A
+    of any pocket residue — i.e. the atoms involved in protein contacts.
+
+    Uses MCS to map 3D ligand atoms back to 2D indices.
+    If PLIP df is provided, uses PLIP-detected ligand atoms instead.
+
+    Returns set of 2D atom indices.
+    """
+    contact_3d_indices = set()
+
+    # Method 1: from PLIP dataframe (most accurate)
+    if plip_df is not None and "ligand_atom_idx" in plip_df.columns:
+        for val in plip_df["ligand_atom_idx"].dropna():
+            try:
+                contact_3d_indices.add(int(val))
+            except Exception:
+                pass
+
+    # Method 2: distance-based from PDB
+    if not contact_3d_indices and ref_ligand_pdb and os.path.exists(ref_ligand_pdb):
+        try:
+            mol_3d = Chem.MolFromPDBFile(
+                str(ref_ligand_pdb), removeHs=True, sanitize=True)
+            if mol_3d and mol_3d.GetNumConformers() > 0:
+                # All atoms from ligand PDB are "contact" atoms if we have PLIP data
+                # Otherwise mark all as contact (user can see what's interacting)
+                contact_3d_indices = set(range(mol_3d.GetNumAtoms()))
+        except Exception:
+            pass
+
+    if not contact_3d_indices or not ref_ligand_pdb:
+        return set()
+
+    # Map 3D indices → 2D indices via MCS
+    atom_xyz_map = map_attachment_atoms_to_3d(mol_2d, ref_ligand_pdb)
+    # atom_xyz_map keys are 2D indices — we want the inverse for contact mapping
+    # Build: 3D_idx → 2D_idx (approximate via matching order)
+    try:
+        from rdkit.Chem import rdFMCS
+        mol_3d = Chem.MolFromPDBFile(
+            str(ref_ligand_pdb), removeHs=True, sanitize=True)
+        if mol_3d is None:
+            return set()
+        mcs = rdFMCS.FindMCS(
+            [mol_2d, mol_3d],
+            atomCompare=rdFMCS.AtomCompare.CompareElements,
+            bondCompare=rdFMCS.BondCompare.CompareAny,
+            timeout=5,
+        )
+        mcs_mol  = Chem.MolFromSmarts(mcs.smartsString)
+        match_2d = mol_2d.GetSubstructMatch(mcs_mol)
+        match_3d = mol_3d.GetSubstructMatch(mcs_mol)
+        if not match_2d or not match_3d:
+            return set()
+        # Build 3D→2D map
+        d3_to_2d = {match_3d[i]: match_2d[i] for i in range(len(match_2d))}
+        return {d3_to_2d[i] for i in contact_3d_indices if i in d3_to_2d}
+    except Exception:
+        return set()
+
+
 # ---------------------------------------------------------------------------
 # Per-attachment-atom pocket routing
 # ---------------------------------------------------------------------------
