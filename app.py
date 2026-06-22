@@ -23,7 +23,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
 
 import core
-import streamlit.components.v1 as components
+# components imported via st.iframe
 
 # Module 2: ChemBERTa pocket-aware fragment ranker
 try:
@@ -459,7 +459,7 @@ def show3d(view, height: int = 480):
     try:
         raw  = view._make_html()
         resp = _re.sub(r'(width\s*[:=]\s*)["\'\']?\d+px?["\'\']?', r'\g<1>100%', raw)
-        components.html(
+        st.iframe(
             f'<div style="width:100%;overflow:hidden">{resp}</div>',
             height=height, scrolling=False,
         )
@@ -566,7 +566,7 @@ def tier_badge_html(tier: str) -> str:
         return '<span class="tier-badge tier-smi-only">📄 SMI only</span>'
 
 
-def show_mol(mol, highlight=None, size=(400, 300), use_container_width=True, atom_indices=False):
+def show_mol(mol, highlight=None, size=(400, 300), width='stretch', atom_indices=False):
     if mol is None:
         return
     try:
@@ -591,7 +591,7 @@ def show_mol(mol, highlight=None, size=(400, 300), use_container_width=True, ato
                 highlightAtomLists=[list(highlight or [])],
                 returnPNG=True,
             )
-        st.image(png, use_container_width=use_container_width)
+        st.image(png, width='stretch')
     except Exception:
         st.caption("(Could not render structure)")
 
@@ -766,7 +766,7 @@ def render_sidebar():
         if st.sidebar.button(
             f"{'●' if i == current else ('✓' if i < current else str(i))}  {label}",
             key=f"nav_{i}",
-            use_container_width=True,
+            width='stretch',
             type="primary" if i == current else "secondary",
         ):
             if i < current or (i == current + 1 and _step_complete(current)):
@@ -791,7 +791,7 @@ def render_sidebar():
             unsafe_allow_html=True,
         )
 
-    if st.sidebar.button("↩ Change mode", use_container_width=True):
+    if st.sidebar.button("↩ Change mode", width='stretch'):
         st.session_state.mode = None
         st.session_state.step = 1
         st.session_state.parent_mol = None
@@ -853,7 +853,7 @@ if st.session_state.mode is None:
             f'</div>',
             unsafe_allow_html=True,
         )
-        if st.button("Select Ligand-based →", key="pick_ligand", use_container_width=True, type="primary"):
+        if st.button("Select Ligand-based →", key="pick_ligand", width='stretch', type="primary"):
             st.session_state.mode = "ligand"
             st.session_state.step = 1
             st.rerun()
@@ -869,7 +869,7 @@ if st.session_state.mode is None:
             f'</div>',
             unsafe_allow_html=True,
         )
-        if st.button("Select Structure-based →", key="pick_struct", use_container_width=True, type="primary"):
+        if st.button("Select Structure-based →", key="pick_struct", width='stretch', type="primary"):
             st.session_state.mode = "structure"
             st.session_state.step = 1
             st.rerun()
@@ -901,7 +901,7 @@ with tab_l:
         f'<img src="{LB_URL}" width="70" style="opacity:{1.0 if mode=="ligand" else 0.4};"/></div>',
         unsafe_allow_html=True,
     )
-    if st.button("Ligand-based", key="tab_ligand", use_container_width=True,
+    if st.button("Ligand-based", key="tab_ligand", width='stretch',
                  type="primary" if mode == "ligand" else "secondary"):
         switch_mode("ligand")
 with tab_r:
@@ -910,7 +910,7 @@ with tab_r:
         f'<img src="{SB_URL}" width="70" style="opacity:{1.0 if mode=="structure" else 0.4};"/></div>',
         unsafe_allow_html=True,
     )
-    if st.button("Structure-based", key="tab_structure", use_container_width=True,
+    if st.button("Structure-based", key="tab_structure", width='stretch',
                  type="primary" if mode == "structure" else "secondary"):
         switch_mode("structure")
 
@@ -1342,7 +1342,7 @@ elif step == 3 and mode == "ligand":
 
                     st.dataframe(
                         lb_df.style.map(_lb_colour, subset=["ML score"]),
-                        use_container_width=True, hide_index=True, height=340,
+                        width='stretch', hide_index=True, height=340,
                     )
 
                     with st.expander("🔍 Score breakdown for top fragment"):
@@ -1674,7 +1674,7 @@ elif step == 3 and mode == "structure":
                             return ""
 
                     styled = fdf.style.map(_score_colour, subset=["ML score"])
-                    st.dataframe(styled, use_container_width=True, hide_index=True, height=320)
+                    st.dataframe(styled, width='stretch', hide_index=True, height=320)
 
                     # Update pocket_frags order to ML-ranked order
                     st.session_state.pocket_frags = [f for f, _ in scored]
@@ -1701,7 +1701,7 @@ elif step == 3 and mode == "structure":
                         {"Group": f.name, "Category": f.category, "Why": f.notes or f.category}
                         for f in st.session_state.pocket_frags
                     ])
-                    st.dataframe(fdf, use_container_width=True, hide_index=True)
+                    st.dataframe(fdf, width='stretch', hide_index=True)
                     if not _PR_OK:
                         st.caption("ℹ️ Install `pocket_reference.py` to enable ML scoring.")
             else:
@@ -1802,7 +1802,7 @@ elif step == 3 and mode == "structure":
                 show_cols = [c for c in ["type","residue","distance_A","is_key"] if c in plip_df.columns]
                 styled = plip_df[show_cols].style.map(
                     _style_plip, subset=["type"] if "type" in show_cols else [])
-                st.dataframe(styled, use_container_width=True, hide_index=True)
+                st.dataframe(styled, width='stretch', hide_index=True)
 
             with tab_rec:
                 rec = st.session_state.get("_plip_rec")
@@ -1941,7 +1941,7 @@ elif step == 3 and mode == "structure":
 
             # Detailed table
             sp_df = _va.subpockets_to_df(subpockets)
-            st.dataframe(sp_df, use_container_width=True, hide_index=True)
+            st.dataframe(sp_df, width='stretch', hide_index=True)
 
             # Per sub-pocket fragment size filter
             st.markdown("#### Apply size filter to fragment generation")
@@ -2293,7 +2293,7 @@ elif step == 4:
     with tab_tbl:
         cols_show = ["change", "fragment_category", "MW", "logP", "QED", "ESOL", "SA", "sim", "smiles"]
         st.dataframe(df_show[[c for c in cols_show if c in df_show.columns]],
-                     use_container_width=True, height=380, hide_index=True)
+                     width='stretch', height=380, hide_index=True)
 
     with tab_grid:
         PAGE_SIZE = 50
@@ -2346,7 +2346,7 @@ elif step == 4:
                         [p[0] for p in pairs], legends=[p[1] for p in pairs],
                         molsPerRow=5, subImgSize=(240, 190), returnPNG=True,
                     )
-                    st.image(png, use_container_width=True)
+                    st.image(png, width='stretch')
                 except Exception as e:
                     st.warning(f"Structure grid could not be rendered ({e}). See the Table tab.")
 
@@ -2372,7 +2372,7 @@ elif step == 4:
         # Full tier: docking + download SMI
         with col_actions[0]:
             next_label = "Docking & cIFP →" if mode == "structure" else "Docking →"
-            if st.button(next_label, type="primary", use_container_width=True):
+            if st.button(next_label, type="primary", width='stretch'):
                 go(5)
         with col_actions[1]:
             st.download_button(
@@ -2380,10 +2380,10 @@ elif step == 4:
                 data=smi_lines.encode(),
                 file_name=f"{parent_name}_analogs.smi",
                 mime="text/plain",
-                use_container_width=True,
+                width='stretch',
             )
         with col_actions[2]:
-            if st.button("Export →", use_container_width=True):
+            if st.button("Export →", width='stretch'):
                 go(len(steps))
 
     elif tier == "pkanet":
@@ -2394,13 +2394,13 @@ elif step == 4:
                 data=smi_lines.encode(),
                 file_name=f"{parent_name}_analogs.smi",
                 mime="text/plain",
-                use_container_width=True,
+                width='stretch',
             )
         with col_actions[1]:
-            if st.button("pKaNET: Check protonation & 3D →", type="primary", use_container_width=True):
+            if st.button("pKaNET: Check protonation & 3D →", type="primary", width='stretch'):
                 go(len(steps))   # goes to export step where 3D gen is available
         with col_actions[2]:
-            if st.button("Export →", use_container_width=True):
+            if st.button("Export →", width='stretch'):
                 go(len(steps))
 
     else:
@@ -2411,10 +2411,10 @@ elif step == 4:
                 data=smi_lines.encode(),
                 file_name=f"{parent_name}_analogs.smi",
                 mime="text/plain",
-                use_container_width=True,
+                width='stretch',
             )
         with col_actions[1]:
-            if st.button("Export →", use_container_width=True):
+            if st.button("Export →", width='stretch'):
                 go(len(steps))
 
 
@@ -2551,7 +2551,7 @@ elif step == 5:
             fh.write(f"{r.smiles}\t{r.compound}\n")
 
     with st.expander(f"Ligand list — {len(lig_df)} compounds (parent + analogs)"):
-        st.dataframe(lig_df, use_container_width=True, hide_index=True, height=200)
+        st.dataframe(lig_df, width='stretch', hide_index=True, height=200)
 
     st.markdown("### Docking settings")
     d1, d2 = st.columns(2)
@@ -2725,7 +2725,7 @@ elif step == 5:
                     "compound": r["compound"], "status": r["dock_status"],
                     "top_BE": r.get("top_BE", "—"), "top_RMSD": r.get("top_RMSD", "—"),
                 } for r in dock_results])
-                live_table.dataframe(preview_df, use_container_width=True, hide_index=True)
+                live_table.dataframe(preview_df, width='stretch', hide_index=True)
 
             progress.progress(1.0, text=f"Finished docking {n} compounds")
             status.empty()
@@ -2831,7 +2831,7 @@ elif step == 5:
                     fmt[rmsd_col] = lambda x: f"{x:.2f}" if isinstance(x, float) else str(x)
                 styled = styled.format(fmt, na_rep="—")
 
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.dataframe(styled, width='stretch', hide_index=True)
 
             if not _has_crystal:
                 st.caption("ℹ️ RMSD vs co-crystal not shown — no reference ligand available (Mode B or no co-crystal PDB).")
@@ -2929,7 +2929,7 @@ elif step == 5:
                 _fig.savefig(_pbuf, format="png", dpi=150,
                              bbox_inches="tight", facecolor=_fig.get_facecolor())
                 _pbuf.seek(0)
-                st.image(_pbuf.getvalue(), use_container_width=True)
+                st.image(_pbuf.getvalue(), width='stretch')
                 _plt.close(_fig)
 
                 # Legend note
@@ -2961,7 +2961,7 @@ elif step == 5:
                     pstyled = pose_df.style.map(_colour_be, subset=["Affinity (kcal/mol)"])
                     if _has_crystal and "RMSD vs co-crystal (Å)" in pose_df.columns:
                         pstyled = pstyled.map(_colour_rmsd, subset=["RMSD vs co-crystal (Å)"])
-                    st.dataframe(pstyled, use_container_width=True, hide_index=True)
+                    st.dataframe(pstyled, width='stretch', hide_index=True)
 
                     # Best pose flag
                     if _has_crystal and "RMSD vs co-crystal (Å)" in pose_df.columns:
@@ -3000,7 +3000,7 @@ elif step == 5:
                     png = Draw.MolsToGridImage(
                         grid_mols, legends=grid_legs, molsPerRow=4,
                         subImgSize=(280, 210), returnPNG=True)
-                    st.image(png, use_container_width=True)
+                    st.image(png, width='stretch')
                 except Exception as e:
                     st.warning(f"Could not render structure grid: {e}")
 
@@ -3110,12 +3110,12 @@ elif step == 5:
             with dl1:
                 st.download_button("⬇️ Docking results CSV", data=csv_bytes,
                     file_name=f"{st.session_state.parent_name}_docking_results.csv",
-                    mime="text/csv", use_container_width=True)
+                    mime="text/csv", width='stretch')
             with dl2:
                 smi_out = "\n".join(f"{r['SMILES']}\t{r['compound']}" for r in result_rows)
                 st.download_button("⬇️ Docked compounds SMILES", data=smi_out.encode(),
                     file_name=f"{st.session_state.parent_name}_docked.smi",
-                    mime="text/plain", use_container_width=True)
+                    mime="text/plain", width='stretch')
             with st.expander("ACD log"):
                 st.text("\n".join(full_log)[-4000:])
 
@@ -3203,7 +3203,7 @@ elif step == 5:
             tab_raw, tab_cmp = st.tabs(["📋 Interaction table", "⚖️ Parent vs Analogs"])
 
             with tab_raw:
-                st.dataframe(cifp_df, use_container_width=True, hide_index=True)
+                st.dataframe(cifp_df, width='stretch', hide_index=True)
 
             with tab_cmp:
                 if cmp_df is not None and not cmp_df.empty:
@@ -3224,7 +3224,7 @@ elif step == 5:
                             return ""
 
                     styled = cmp_df.style.map(_cmp_style, subset=["tanimoto"])
-                    st.dataframe(styled, use_container_width=True, hide_index=True)
+                    st.dataframe(styled, width='stretch', hide_index=True)
 
                     # Highlight warnings
                     warn_df = cmp_df[cmp_df["warning"] != ""]
@@ -3272,12 +3272,12 @@ elif step == len(steps):
         st.download_button("⬇️ Analog table (CSV)",
             data=df.to_csv(index=False).encode(),
             file_name=f"{parent_name}_analogs.csv", mime="text/csv",
-            use_container_width=True)
+            width='stretch')
     with dl2:
         st.download_button("⬇️ SMILES file (.smi)",
             data=smi_lines.encode(),
             file_name=f"{parent_name}_analogs.smi", mime="text/plain",
-            use_container_width=True)
+            width='stretch')
 
     # ── 3D SDF — available for docking and pkanet tiers ─────────────────────
     if tier in ("docking", "pkanet"):
@@ -3318,14 +3318,14 @@ elif step == len(steps):
                 manifest = core.generate_3d_ligand_files(lig_table, out_dir, formats=fmt_sel, mmff=mmff_opt)
             ok_count = int((manifest.status == "ok").sum())
             st.success(f"3D files generated: {ok_count} / {len(manifest)}")
-            st.dataframe(manifest, use_container_width=True, hide_index=True)
+            st.dataframe(manifest, width='stretch', hide_index=True)
             combined = out_dir / "all_ligands_3d.sdf"
             if combined.exists():
                 st.download_button("⬇️ Download combined SDF",
                     data=combined.read_bytes(),
                     file_name=f"{parent_name}_3d.sdf",
                     mime="chemical/x-mdl-sdfile",
-                    use_container_width=True)
+                    width='stretch')
 
     else:
         # smi_only tier — show info about upgrading
@@ -3342,7 +3342,7 @@ elif step == len(steps):
     st.markdown("### Full archive")
     hint("Everything in one ZIP — analog table, SMILES, 3D files, docking results, and a session summary.")
 
-    if st.button("Build ZIP archive", use_container_width=True):
+    if st.button("Build ZIP archive", width='stretch'):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr(f"{parent_name}_analogs.csv", df.to_csv(index=False))
@@ -3371,7 +3371,7 @@ elif step == len(steps):
             data=buf.getvalue(),
             file_name=f"{parent_name}_analog_builder_results.zip",
             mime="application/zip",
-            use_container_width=True)
+            width='stretch')
 
     st.divider()
     with st.expander("Session summary"):
