@@ -127,11 +127,34 @@ def run_plip_on_complex(
     od = Path(out_dir) / name
     od.mkdir(parents=True, exist_ok=True)
 
+    # Verify complex has both protein (ATOM) and ligand (HETATM)
+    _has_atom   = False
+    _has_hetatm = False
+    _hetatm_names = []
+    try:
+        with open(complex_pdb, errors="ignore") as _cf:
+            for _cl in _cf:
+                if _cl.startswith("ATOM"):    _has_atom = True
+                elif _cl.startswith("HETATM"):
+                    _has_hetatm = True
+                    _rn = _cl[17:20].strip()
+                    if _rn not in ("HOH","WAT","") and _rn not in _hetatm_names:
+                        _hetatm_names.append(_rn)
+    except Exception:
+        pass
+
+    if not _has_atom or not _has_hetatm:
+        return None, (
+            f"Complex PDB missing {'ATOM' if not _has_atom else 'HETATM'} records. "
+            "PLIP needs a protein-ligand complex (both ATOM and HETATM lines)."
+        ), ""
+
     import subprocess
-    cmd = [plip_exe, "-f", str(complex_pdb), "-x", "-o", str(od)]
+    cmd = [plip_exe, "-f", str(complex_pdb), "-x", "-o", str(od), "--nohydro"]
     res = subprocess.run(
         cmd, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=120,
         check=False,
     )
     log = res.stdout or ""
@@ -139,7 +162,10 @@ def run_plip_on_complex(
 
     xmls = sorted(od.glob("*.xml")) + sorted(od.glob("**/*.xml"))
     if res.returncode != 0 or not xmls:
-        return None, f"PLIP failed (exit {res.returncode})", log
+        # Extract meaningful error from log
+        _err_lines = [l for l in log.split("\n") if "ERROR" in l or "error" in l.lower()]
+        _err_hint  = _err_lines[-1] if _err_lines else f"exit {res.returncode}"
+        return None, f"PLIP failed: {_err_hint}", log
 
     return str(xmls[0]), None, log
 
