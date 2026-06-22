@@ -22,6 +22,51 @@ import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+# ── Auto-patch PLIP supplemental.py for numpy≥2 compatibility ────────────────
+def _patch_plip_supplemental():
+    """Fix OverflowError: np.uint32(negative) on numpy≥2 in PLIP 2.3.x."""
+    try:
+        import plip.basic.supplemental as _sup
+        import inspect as _insp
+        _src = _insp.getsourcefile(_sup)
+        if _src is None:
+            return
+        with open(_src) as _f:
+            _txt = _f.read()
+        _old = (
+            "    dct = {}\n"
+            "    if int32 == 4294967295:  # Special case in some structures (note, this is just a workaround)\n"
+            "        return -1\n"
+            "    for i in range(-1000, -1):\n"
+            "        dct[np.uint32(i)] = i\n"
+            "    if int32 in dct:\n"
+            "        return dct[int32]\n"
+            "    else:\n"
+            "        return int32"
+        )
+        _new = (
+            "    if int32 == 4294967295:\n"
+            "        return -1\n"
+            "    try:\n"
+            "        if int32 >= 2**31:\n"
+            "            return int(int32) - 2**32\n"
+            "        return int(int32)\n"
+            "    except Exception:\n"
+            "        return int(int32)"
+        )
+        if _old in _txt:
+            with open(_src, 'w') as _f:
+                _f.write(_txt.replace(_old, _new))
+            # Reload the module
+            import importlib as _imp
+            _imp.reload(_sup)
+    except Exception:
+        pass
+
+_patch_plip_supplemental()
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 
 import numpy as np
 import pandas as pd
