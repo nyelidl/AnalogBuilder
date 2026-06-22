@@ -64,6 +64,14 @@ try:
 except Exception:
     _KETCHER_OK = False
 
+# fpocket pocket detection
+try:
+    import fpocket_analyzer as _fpa
+    _FPA_OK = _fpa.FPOCKET_OK
+except ImportError:
+    _fpa    = None
+    _FPA_OK = False
+
 # Logo
 LOGO_URL = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/AB.svg"
 LB_URL   = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/LB.svg"
@@ -1884,6 +1892,92 @@ elif step == 3 and mode == "structure":
                 key_prefix     = "s3_viewer",
             )
 
+    # ── fpocket real pocket detection ────────────────────────────────────
+    _prot_pdb_fp = (st.session_state.protein_path or
+                    st.session_state.receptor_path or "")
+    _fpocket_available = _FPA_OK if _fpa else False
+
+    if _prot_pdb_fp and os.path.exists(str(_prot_pdb_fp)):
+        st.divider()
+        st.markdown("### 🕳️ Real pocket detection (fpocket)")
+
+        if not _fpocket_available:
+            info_card(
+                "<strong>fpocket not installed.</strong> "
+                "Install with <code>sudo apt install fpocket</code> (Linux) "
+                "or <code>brew install fpocket</code> (macOS). "
+                "Until then, pocket residues are detected by distance from ligand only."
+            )
+        else:
+            info_card(
+                "fpocket uses <strong>Voronoi tessellation + alpha-sphere algorithm</strong> "
+                "to detect all druggable pockets — no ligand needed. "
+                "The pocket <strong>nearest to the co-crystal ligand</strong> is auto-selected "
+                "for void analysis and ML fragment ranking."
+            )
+
+            _fp_c1, _fp_c2 = st.columns([3, 1])
+            with _fp_c1:
+                _fp_min = st.slider("Min alpha-sphere radius (Å)", 2, 5, 3, 1, key="fp_min")
+                _fp_max = st.slider("Max alpha-sphere radius (Å)", 4, 10, 6, 1, key="fp_max")
+            with _fp_c2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🔍 Run fpocket", type="primary", key="fpocket_run_btn"):
+                    _lig_atoms_fp = st.session_state.get("_ligand_atoms_for_void", [])
+                    with st.spinner("Running fpocket pocket detection…"):
+                        _fp_res_df, _fp_all, _fp_sel, _fp_msg = _fpa.fpocket_pocket_analysis(
+                            _prot_pdb_fp,
+                            ligand_atoms=_lig_atoms_fp,
+                            work_dir=str(get_work_dir() / "fpocket"),
+                            min_sphere=_fp_min,
+                            max_sphere=_fp_max,
+                        )
+                    if _fp_res_df is not None and not _fp_res_df.empty:
+                        st.session_state["_fpocket_pockets"]    = _fp_all
+                        st.session_state["_fpocket_selected"]   = _fp_sel
+                        st.session_state["_pocket_df_override"] = _fp_res_df
+                        st.success(
+                            f"✅ {len(_fp_all)} pockets found. "
+                            f"Pocket {_fp_sel.get('pocket_id',1)} selected — "
+                            f"dist to ligand: {_fp_sel.get('dist_to_ligand_centroid_A','?')} Å · "
+                            f"druggability: {_fp_sel.get('druggability_score',0):.2f} · "
+                            f"volume: {_fp_sel.get('volume_A3',0):.0f} ų"
+                        )
+                    else:
+                        st.warning(f"fpocket: {_fp_msg or 'no pockets found'}")
+
+            _fp_cached = st.session_state.get("_fpocket_pockets", [])
+            if _fp_cached:
+                _fp_sel_id = st.session_state.get("_fpocket_selected", {}).get("pocket_id")
+                _fp_rows = [{
+                    "Pocket":           p["pocket_id"],
+                    "Score":            round(p.get("fpocket_score", 0), 2),
+                    "Druggability":     round(p.get("druggability_score", 0), 2),
+                    "Volume (ų)":       int(p.get("volume_A3", 0)),
+                    "α-spheres":        int(p.get("n_alpha_spheres", 0)),
+                    "Residues":         p.get("n_residues", 0),
+                    "Dist to ligand (Å)": p.get("dist_to_ligand_centroid_A", "—"),
+                    "":                  "✅ selected" if p.get("pocket_id") == _fp_sel_id else "",
+                } for p in _fp_cached]
+                st.dataframe(pd.DataFrame(_fp_rows), hide_index=True, width='stretch')
+                hint("Druggability ≥ 0.5 indicates a well-defined druggable pocket. "
+                     "The selected pocket's residues are used for void analysis and ChemBERTa ML ranking.")
+
+                # Override button — let user pick a different pocket
+                _alt_ids = [f"Pocket {p['pocket_id']}" for p in _fp_cached]
+                _cur_idx = next((i for i, p in enumerate(_fp_cached)
+                                 if p.get("pocket_id") == _fp_sel_id), 0)
+                _sel_label = st.selectbox("Override selection:", _alt_ids,
+                                          index=_cur_idx, key="fp_override_sel")
+                _override_id = int(_sel_label.split()[1])
+                if _override_id != _fp_sel_id:
+                    if st.button("Use this pocket instead", key="fp_override_btn"):
+                        _new_sel = next(p for p in _fp_cached
+                                        if p["pocket_id"] == _override_id)
+                        st.session_state["_fpocket_selected"]   = _new_sel
+                        st.session_state["_pocket_df_override"] = _fpa.pocket_residues_df(_new_sel)
+                        st.rerun()
+
     # ── Void / unoccupied space analysis ─────────────────────────────────
     if _VA_OK and st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
         st.divider()
@@ -1908,6 +2002,15 @@ elif step == 3 and mode == "structure":
                         pocket_cutoff=va_cutoff,
                         contact_cutoff=4.0,
                     )
+                    # Override with fpocket residues if available
+                    _fp_ov = st.session_state.get("_pocket_df_override")
+                    if _fp_ov is not None and not _fp_ov.empty:
+                        p_df = _fp_ov.copy()
+                        g_df = _fp_ov.copy()
+                        st.caption("ℹ️ Using fpocket-detected pocket residues for void analysis.")
+                    # Store ligand atoms for fpocket (used if fpocket runs later)
+                    if lig_atoms:
+                        st.session_state["_ligand_atoms_for_void"] = lig_atoms
                     subpockets, va_mode = _va.analyze_void(
                         prot_atoms, lig_atoms if lig_atoms else None,
                         p_df, g_df,
