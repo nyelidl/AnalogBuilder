@@ -5461,18 +5461,83 @@ def detect_ligand_candidates(pdb_path: str) -> Tuple[pd.DataFrame, Dict]:
 
 
 
+def _get_ligand_resname(pdb_path: str) -> str:
+    """Extract 3-letter residue name from HETATM lines in ligand PDB."""
+    try:
+        with open(pdb_path, errors="ignore") as f:
+            for line in f:
+                if line.startswith("HETATM"):
+                    resname = line[17:20].strip()
+                    if resname and resname not in ("HOH", "WAT", ""):
+                        return resname
+    except Exception:
+        pass
+    return ""
+
+
+def _smiles_from_rcsb_ccd(resname: str) -> str:
+    """Fetch canonical SMILES from RCSB Chemical Component Dictionary API."""
+    if not resname or len(resname) > 3:
+        return ""
+    try:
+        import urllib.request as _ur, json as _json
+        url = f"https://data.rcsb.org/rest/v1/core/chemcomp/{resname.upper()}"
+        req = _ur.Request(url, headers={"User-Agent": "AnalogDesigner/1.0"})
+        resp = _ur.urlopen(req, timeout=8)
+        data = _json.loads(resp.read())
+        desc = data.get("rcsb_chem_comp_descriptor", {})
+        # Prefer SMILES with stereo, fall back to canonical
+        for key in ("smiles_stereo", "smiles", "smiles_canonical"):
+            smi = desc.get(key, "")
+            if smi:
+                mol = Chem.MolFromSmiles(smi)
+                if mol and mol.GetNumAtoms() > 2:
+                    return Chem.MolToSmiles(mol)
+    except Exception:
+        pass
+    return ""
+
+
+def _smiles_from_pubchem_name(name: str) -> str:
+    """Fetch canonical SMILES from PubChem by compound name / CID."""
+    if not name:
+        return ""
+    try:
+        import urllib.request as _ur, json as _json
+        url = (f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+               f"{_ur.quote(name)}/property/CanonicalSMILES/JSON")
+        req = _ur.Request(url, headers={"User-Agent": "AnalogDesigner/1.0"})
+        resp = _ur.urlopen(req, timeout=8)
+        data = _json.loads(resp.read())
+        smi = data["PropertyTable"]["Properties"][0].get("CanonicalSMILES", "")
+        mol = Chem.MolFromSmiles(smi)
+        if mol and mol.GetNumAtoms() > 2:
+            return Chem.MolToSmiles(mol)
+    except Exception:
+        pass
+    return ""
+
+
 def ligand_pdb_to_smiles(pdb_path: str) -> str:
     """
-    Convert a ligand PDB file to a canonical SMILES string with correct bond orders.
+    Convert a ligand PDB file to canonical SMILES with correct bond orders.
 
-    Strategy (in order of quality):
-      1. OpenBabel  — 3D geometry-based bond order perception (best)
-      2. RDKit DetermineBonds — available in RDKit >= 2022.09
-      3. RDKit MolFromPDBFile — last resort (may lose aromaticity)
+    Strategy (in order of quality / reliability):
+      1. RCSB CCD API  — lookup 3-letter code → chemically correct SMILES
+      2. OpenBabel     — 3D geometry bond order perception
+      3. RDKit DetermineBonds — RDKit >= 2022.09
+      4. RDKit MolFromPDBFile — last resort (loses aromaticity)
     """
     import subprocess as _sub
 
-    # ── Method 1: OpenBabel ──────────────────────────────────────────────────
+    # ── Method 1: RCSB CCD lookup (best — exact chemical definition) ─────────
+    resname = _get_ligand_resname(pdb_path)
+    if resname:
+        smi = _smiles_from_rcsb_ccd(resname)
+        if smi:
+            return smi
+
+    # ── Method 2: OpenBabel (3D geometry bond perception) ────────────────────
     obabel = shutil.which("obabel")
     if obabel:
         try:
@@ -5488,7 +5553,7 @@ def ligand_pdb_to_smiles(pdb_path: str) -> str:
         except Exception:
             pass
 
-    # ── Method 2: RDKit DetermineBonds (RDKit >= 2022.09) ───────────────────
+    # ── Method 3: RDKit DetermineBonds (RDKit >= 2022.09) ───────────────────
     try:
         from rdkit.Chem import DetermineBonds as _DB
         raw = Chem.MolFromPDBFile(str(pdb_path), removeHs=False, sanitize=False)
@@ -5505,7 +5570,7 @@ def ligand_pdb_to_smiles(pdb_path: str) -> str:
     except Exception:
         pass
 
-    # ── Method 3: RDKit MolFromPDBFile fallback ──────────────────────────────
+    # ── Method 4: RDKit MolFromPDBFile (last resort) ─────────────────────────
     try:
         mol = Chem.MolFromPDBFile(str(pdb_path), removeHs=True, sanitize=True)
         if mol:
