@@ -2496,6 +2496,8 @@ elif step == 5:
                                 st.session_state.protein_path    = prot
                                 st.session_state.complex_path    = path
                                 st.session_state.ref_ligand_path = lig
+                                # Clear cached SMILES so it re-extracts with new ligand
+                                st.session_state["_modeA_extracted_smiles"] = ""
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Could not download: {e}")
