@@ -5934,6 +5934,226 @@ def find_pose_sdfs_for_compound(out_dir: str, compound: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Per-attachment-atom pocket routing
+# ---------------------------------------------------------------------------
+
+def map_attachment_atoms_to_3d(
+    mol_2d: Chem.Mol,
+    ref_ligand_pdb: str,
+) -> Dict[int, np.ndarray]:
+    """
+    Map 2D RDKit atom indices to 3D XYZ coordinates using MCS alignment
+    with the co-crystal ligand PDB.
+
+    Parameters
+    ----------
+    mol_2d          : RDKit mol from parent SMILES (no conformer)
+    ref_ligand_pdb  : path to reference_ligand.pdb (has 3D coordinates)
+
+    Returns
+    -------
+    Dict[atom_2d_idx → xyz_array]  — only for atoms present in MCS match
+    """
+    from rdkit.Chem import rdFMCS
+    mapping: Dict[int, np.ndarray] = {}
+
+    try:
+        mol_3d = Chem.MolFromPDBFile(str(ref_ligand_pdb), removeHs=True,
+                                      sanitize=True)
+        if mol_3d is None or mol_3d.GetNumConformers() == 0:
+            return mapping
+
+        mcs = rdFMCS.FindMCS(
+            [mol_2d, mol_3d],
+            atomCompare=rdFMCS.AtomCompare.CompareElements,
+            bondCompare=rdFMCS.BondCompare.CompareAny,
+            timeout=10,
+        )
+        if mcs.numAtoms < 3:
+            return mapping
+
+        mcs_mol  = Chem.MolFromSmarts(mcs.smartsString)
+        match_2d = mol_2d.GetSubstructMatch(mcs_mol)
+        match_3d = mol_3d.GetSubstructMatch(mcs_mol)
+        if not match_2d or not match_3d:
+            return mapping
+
+        conf = mol_3d.GetConformer()
+        for idx_2d, idx_3d in zip(match_2d, match_3d):
+            pos = conf.GetAtomPosition(idx_3d)
+            mapping[idx_2d] = np.array([pos.x, pos.y, pos.z])
+
+    except Exception:
+        pass
+
+    return mapping
+
+
+def route_atoms_to_subpockets(
+    selected_atoms:  List[int],
+    atom_xyz_map:    Dict[int, np.ndarray],
+    subpockets:      List[Dict],
+    ligand_centroid: np.ndarray,
+) -> Dict[int, Dict]:
+    """
+    For each selected attachment atom, find the sub-pocket that lies
+    most directly in its outward direction from the ligand centroid.
+
+    Scoring per sub-pocket:
+      direction_score = dot(attach_dir_unit, toward_pocket_unit) / (1 + dist * 0.1)
+    Higher = pocket is more aligned with the atom's outward direction AND close.
+
+    Parameters
+    ----------
+    selected_atoms   : list of 2D RDKit atom indices the user selected
+    atom_xyz_map     : from map_attachment_atoms_to_3d()
+    subpockets       : from void_analyzer.analyze_void()
+    ligand_centroid  : mean XYZ of all ligand atoms
+
+    Returns
+    -------
+    Dict[atom_idx → best_subpocket_dict]
+    """
+    result: Dict[int, Dict] = {}
+    if not subpockets:
+        return result
+
+    for atom_idx in selected_atoms:
+        xyz = atom_xyz_map.get(atom_idx)
+        if xyz is None:
+            continue
+
+        # Outward direction from ligand centroid through this atom
+        attach_dir = xyz - ligand_centroid
+        norm = np.linalg.norm(attach_dir)
+        if norm < 1e-6:
+            continue
+        attach_unit = attach_dir / norm
+
+        best_sp    = None
+        best_score = -float("inf")
+
+        for sp in subpockets:
+            sp_center = np.array(sp["centroid_xyz"])
+            to_pocket = sp_center - xyz
+            dist      = float(np.linalg.norm(to_pocket))
+            if dist < 1e-6:
+                continue
+            to_pocket_unit = to_pocket / dist
+
+            # Angular alignment × proximity
+            dot   = float(np.dot(attach_unit, to_pocket_unit))
+            score = dot / (1.0 + dist * 0.1)
+
+            if score > best_score:
+                best_score = score
+                best_sp    = sp
+
+        if best_sp is not None:
+            result[atom_idx] = {
+                **best_sp,
+                "alignment_score": round(best_score, 3),
+                "atom_xyz":        xyz.tolist(),
+            }
+
+    return result
+
+
+def per_atom_fragment_criteria(
+    atom_subpocket_map: Dict[int, Dict],
+    all_frags:          List,
+    tag_counts:         Dict[str, int],
+    pocket_reference_module=None,
+    size_filter_module=None,
+    alpha: float = 0.7,
+) -> Dict[int, Dict]:
+    """
+    For each attachment atom, apply both fragment selection criteria
+    using that atom's specific sub-pocket:
+
+    Criterion A — chemistry (residue contacts):
+        Score fragments by ChemBERTa/rule-based cosine similarity
+        to the property tags of the sub-pocket's residues.
+
+    Criterion B — size (steric fit):
+        Filter fragments to those fitting within the sub-pocket's
+        available radius (size_class).
+
+    Parameters
+    ----------
+    atom_subpocket_map      : from route_atoms_to_subpockets()
+    all_frags               : full fragment library (core.LIBRARY)
+    tag_counts              : global pocket tag counts (from PLIP / distance shell)
+    pocket_reference_module : imported pocket_reference module (or None)
+    size_filter_module      : imported void_analyzer module (or None)
+    alpha                   : ChemBERTa blend weight
+
+    Returns
+    -------
+    Dict[atom_idx → {
+        "sub_pocket": sp_dict,
+        "size_class": str,
+        "ranked_frags": [(Frag, score), ...],  # Criterion A ranked
+        "size_filtered_frags": [Frag, ...],    # Criterion B filtered
+        "combined_frags": [Frag, ...],          # A ∩ B — fits AND compatible
+    }]
+    """
+    results: Dict[int, Dict] = {}
+
+    for atom_idx, sp in atom_subpocket_map.items():
+        size_class = sp.get("size_class", "large")
+
+        # Criterion B: size filter
+        if size_filter_module is not None:
+            try:
+                size_frags = size_filter_module.filter_frags_by_size(
+                    all_frags, size_class, allow_smaller=True)
+            except Exception:
+                size_frags = all_frags
+        else:
+            size_frags = all_frags
+
+        # Criterion A: chemistry ranking
+        # Build per-sub-pocket tag counts from sub-pocket residues if possible
+        sp_tags = {}
+        for member in sp.get("members", []):
+            aa = member.get("aa_one", "")
+            for tag in AA_TAGS.get(aa, []):
+                sp_tags[tag] = sp_tags.get(tag, 0) + 1
+
+        # Fall back to global tag_counts if sub-pocket has no residue info
+        effective_tags = sp_tags if sp_tags else tag_counts
+
+        if pocket_reference_module is not None and effective_tags:
+            try:
+                ranked = pocket_reference_module.score_fragments(
+                    size_frags, effective_tags, alpha=alpha)
+            except Exception:
+                ranked = [(f, 0.5) for f in size_frags]
+        else:
+            ranked = [(f, 0.5) for f in size_frags]
+
+        # Combined: size-filtered AND chemistry-ranked
+        size_names = {f.name for f in size_frags}
+        combined   = [(f, s) for f, s in ranked if f.name in size_names]
+
+        results[atom_idx] = {
+            "sub_pocket":          sp,
+            "size_class":          size_class,
+            "available_radius_A":  sp.get("available_radius_A", 0),
+            "ranked_frags":        ranked,
+            "size_filtered_frags": size_frags,
+            "combined_frags":      combined,
+            "n_chemistry_ranked":  len(ranked),
+            "n_size_filtered":     len(size_frags),
+            "n_combined":          len(combined),
+            "effective_tags":      effective_tags,
+        }
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # RMSD calculation (docked pose vs crystal ligand)
 # ---------------------------------------------------------------------------
 
