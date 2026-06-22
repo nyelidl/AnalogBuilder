@@ -2019,6 +2019,50 @@ elif step == 3 and mode == "structure":
                     )
                     st.session_state["_void_subpockets"] = subpockets
                     st.session_state["_void_mode"] = va_mode
+
+                    # ── Per-atom sub-pocket routing ──────────────────────────
+                    # Map each selected attachment atom → its directional sub-pocket
+                    _sel_atoms   = list(st.session_state.selected_atoms)
+                    _ref_lig     = st.session_state.ref_ligand_path or ""
+                    _parent_mol  = st.session_state.parent_mol
+
+                    if _sel_atoms and _parent_mol and _ref_lig and os.path.exists(_ref_lig):
+                        # 1. Map 2D atom indices → 3D XYZ
+                        _atom_xyz = core.map_attachment_atoms_to_3d(_parent_mol, _ref_lig)
+
+                        # 2. Compute ligand centroid
+                        _lig_xyz_list = [a["xyz"] for a in lig_atoms] if lig_atoms else []
+                        if _lig_xyz_list:
+                            import numpy as _np2
+                            _lig_ctr = _np2.mean(_lig_xyz_list, axis=0)
+                        else:
+                            _lig_ctr = _np2.zeros(3)
+
+                        # 3. Route each atom to its directional sub-pocket
+                        _atom_sp_map = core.route_atoms_to_subpockets(
+                            _sel_atoms, _atom_xyz, subpockets, _lig_ctr
+                        )
+                        st.session_state["_atom_subpocket_map"] = _atom_sp_map
+
+                        # 4. Apply both criteria per atom
+                        _atom_criteria = core.per_atom_fragment_criteria(
+                            _atom_sp_map,
+                            list(core.LIBRARY),
+                            st.session_state.get("_plip_tag_counts") or
+                            st.session_state.get("_pocket_tag_counts") or {},
+                            pocket_reference_module=_pr if _PR_OK else None,
+                            size_filter_module=_va if _VA_OK else None,
+                        )
+                        st.session_state["_atom_criteria"] = _atom_criteria
+
+                        if _atom_sp_map:
+                            _sp_summary = "  ".join(
+                                f"Atom {a} → SP{v['sub_pocket_id']} "
+                                f"[{v['size_class']}, r={v['available_radius_A']:.1f}Å]"
+                                for a, v in _atom_sp_map.items()
+                            )
+                            st.success(f"✅ Per-atom pocket routing: {_sp_summary}")
+
                     # Store all pocket residue resnums for viewer grey-out
                     try:
                         _all_resnums = [
@@ -2264,7 +2308,49 @@ elif step == 4:
             f"Change in Step 3 → Unoccupied space analysis."
         )
     pocket_frags = st.session_state.pocket_frags or []
-    if mode == "structure" and pocket_frags and st.session_state.accept_pocket_suggestions:
+    _atom_criteria = st.session_state.get("_atom_criteria", {})
+
+    if mode == "structure" and _atom_criteria and st.session_state.selected_atoms:
+        # ── Per-atom routing: build chosen pool from per-atom criteria ────────
+        # Each selected atom has its own ranked + size-filtered fragment list.
+        # Merge: union of all atoms' combined_frags, sorted by mean score.
+        from collections import defaultdict as _dd
+        _frag_scores: dict = _dd(list)
+        for atom_idx, criteria in _atom_criteria.items():
+            for frag, score in criteria.get("combined_frags", []):
+                _frag_scores[frag.name].append(score)
+
+        if _frag_scores:
+            # Mean score across atoms; sort descending
+            _merged = sorted(
+                [(name, sum(scores)/len(scores))
+                 for name, scores in _frag_scores.items()],
+                key=lambda x: -x[1]
+            )
+            _merged_names = {name for name, _ in _merged}
+            # Re-order active_lib to match merged ranking
+            _lib_by_name  = {f.name: f for f in active_lib}
+            chosen = (
+                [_lib_by_name[n] for n, _ in _merged if n in _lib_by_name] +
+                [f for f in active_lib if f.name not in _merged_names]
+            )
+            # Show per-atom summary in Step 4
+            with st.expander("🎯 Per-atom fragment criteria", expanded=False):
+                for atom_idx, crit in _atom_criteria.items():
+                    sp = crit["sub_pocket"]
+                    st.markdown(
+                        f"**Atom {atom_idx}** → Sub-pocket {sp.get('sub_pocket_id','?')}  "
+                        f"[{crit['size_class']}, r={crit['available_radius_A']:.1f} Å]  "
+                        f"· {crit['n_combined']} fragments fit both criteria"
+                    )
+                    if crit.get("combined_frags"):
+                        top5 = [(f.name, round(s,3)) for f,s in crit["combined_frags"][:5]]
+                        st.caption("Top 5: " + "  ".join(f"`{n}` ({s})" for n,s in top5))
+        else:
+            # Fallback to global pocket_frags
+            chosen = pocket_frags + [f for f in active_lib if f.name not in {g.name for g in pocket_frags}]
+
+    elif mode == "structure" and pocket_frags and st.session_state.accept_pocket_suggestions:
         chosen = pocket_frags + [f for f in active_lib if f.name not in {g.name for g in pocket_frags}]
     else:
         chosen = active_lib
