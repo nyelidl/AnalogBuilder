@@ -1804,6 +1804,88 @@ elif step == 3 and mode == "structure":
                 go(1)
             st.stop()
 
+    # ── 3D Binding Pocket View (auto-shown) ─────────────────────────────────
+    if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
+        st.markdown("### 🧬 Binding Pocket 3D View")
+        hint("Ligand (cyan) in the protein pocket. Orange sticks = pocket residues within cutoff.")
+        _s3_c1, _s3_c2 = st.columns([1, 3])
+        with _s3_c1:
+            s3_labels  = st.checkbox("Residue labels",  value=True,  key="s3_labels")
+            s3_surface = st.checkbox("Protein surface", value=False, key="s3_surface")
+            s3_cutoff  = st.slider("Pocket cutoff (Å)", 3.0, 8.0, 5.0, 0.5, key="s3_cutoff")
+            s3_height  = st.slider("Height (px)", 350, 700, 500, 50, key="s3_height")
+            st.markdown(
+                '<div style="font-size:0.75rem;line-height:2;margin-top:6px;">'+
+                '<span style="color:#00FFFF">■</span> Ligand &nbsp;'+
+                '<span style="color:#FF8C00">■</span> Pocket residues<br>'+
+                '<span style="color:#FF00FF">■</span> Reference &nbsp;'+
+                '<span style="color:#888">■</span> Protein</div>',
+                unsafe_allow_html=True,
+            )
+        with _s3_c2:
+            ref_pdb  = st.session_state.ref_ligand_path or ""
+            prot_pdb = st.session_state.protein_path or st.session_state.receptor_path or ""
+            cpx_pdb  = st.session_state.complex_path or ""
+            pose_mol_s3 = None
+            if ref_pdb and os.path.exists(ref_pdb):
+                try:
+                    pose_mol_s3 = Chem.MolFromPDBFile(ref_pdb, removeHs=False)
+                except Exception:
+                    pass
+            try:
+                import py3Dmol as _py3_s3
+                _vs3 = _py3_s3.view(width="100%", height=s3_height)
+                _vs3.setBackgroundColor(_viewer_bg())
+                _mi_s3 = 0
+                if prot_pdb and os.path.exists(prot_pdb):
+                    _vs3.addModel(open(prot_pdb).read(), "pdb")
+                    _vs3.setStyle({"model": _mi_s3}, {
+                        "cartoon": {"color": "spectrum", "opacity": 0.40}})
+                    if s3_surface:
+                        _vs3.addSurface(_py3_s3.SAS, {"opacity": 0.18, "color": "white"}, {"model": _mi_s3})
+                    _mi_s3 += 1
+                if pose_mol_s3 is not None:
+                    from rdkit.Chem import MolToMolBlock as _MB
+                    _vs3.addModel(_MB(pose_mol_s3), "mol")
+                    _lig_mi_s3 = _mi_s3
+                    _vs3.setStyle({"model": _lig_mi_s3}, {
+                        "stick": {"colorscheme": "cyanCarbon", "radius": 0.28}})
+                    _mi_s3 += 1
+                # Pocket residues — compute from complex
+                _pocket_pdb = cpx_pdb if os.path.exists(str(cpx_pdb)) else prot_pdb
+                if _pocket_pdb and pose_mol_s3 is not None and os.path.exists(_pocket_pdb):
+                    try:
+                        _pocket_res = core.get_interacting_residues(_pocket_pdb, pose_mol_s3, cutoff=s3_cutoff)
+                        for _rb in _pocket_res:
+                            _sel_r = {"model": 0, "resi": _rb["resi"]}
+                            if _rb.get("chain","").strip(): _sel_r["chain"] = _rb["chain"]
+                            _vs3.setStyle(_sel_r, {
+                                "stick":   {"colorscheme": "orangeCarbon", "radius": 0.20},
+                                "cartoon": {"color": "spectrum", "opacity": 0.75},
+                            })
+                            if s3_labels:
+                                _vs3.addLabel(f"{_rb['resn']}{_rb['resi']}",
+                                    {"fontSize": 11, "fontColor": "yellow",
+                                     "backgroundColor": "black", "backgroundOpacity": 0.65,
+                                     "inFront": True, "showBackground": True}, _sel_r)
+                    except Exception:
+                        pass
+                elif pose_mol_s3 is None:
+                    for _rn in st.session_state.get("_void_all_pocket_resnums", []):
+                        _vs3.setStyle({"model": 0, "resi": _rn},
+                            {"stick": {"colorscheme": "orangeCarbon", "radius": 0.18},
+                             "cartoon": {"color": "spectrum", "opacity": 0.70}})
+                if pose_mol_s3 is not None:
+                    _vs3.zoomTo({"model": _lig_mi_s3})
+                else:
+                    _vs3.zoomTo({"model": 0})
+                show3d(_vs3, height=s3_height)
+            except ImportError:
+                st.info("Install `py3Dmol` to enable 3D viewer.")
+            except Exception as _s3e:
+                st.warning(f"3D viewer error: {_s3e}")
+        st.divider()
+
     # ── Pocket analysis (Mode A or Mode B after docking) ─────────────────────
     if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
         col_analysis, col_result = st.columns([1, 1], gap="large")
@@ -1830,7 +1912,14 @@ elif step == 3 and mode == "structure":
                             for _tag in core.AA_TAGS.get(_aa, []):
                                 _tag_counts[_tag] = _tag_counts.get(_tag, 0) + 1
                         st.session_state["_pocket_tag_counts"] = _tag_counts
-                        st.success(f"Found {len(pocket_df)} pocket residues, {len(growth_df)} growth opportunities")
+                        _n_pocket_res = pocket_df["residue_label"].nunique() if "residue_label" in pocket_df.columns else len(pocket_df)
+                        _n_contact_res = contact_df["residue_label"].nunique() if "residue_label" in contact_df.columns else len(contact_df)
+                        _n_growth_res  = growth_df["residue_label"].nunique() if "residue_label" in growth_df.columns else len(growth_df)
+                        st.success(
+                            f"Found **{_n_pocket_res}** pocket residues "
+                            f"({_n_contact_res} direct contacts ≤4 Å, "
+                            f"{_n_growth_res} growth residues 4–6 Å)"
+                        )
                     except Exception as e:
                         st.error(f"Analysis failed: {e}")
 
@@ -1859,15 +1948,25 @@ elif step == 3 and mode == "structure":
                 if _PR_OK and st.session_state.get("_pocket_tag_counts"):
                     # Show model status badge
                     _mstatus = _pr.model_status()
-                    _badge_col = "🟢" if _mstatus["chemberta_loaded"] else "🟡"
-                    st.markdown(
-                        f'<div style="font-size:0.78rem;color:#5A4A35;margin-bottom:6px;">'
-                        f'{_badge_col} <strong>{_mstatus["mode"]}</strong>'
-                        f'{" · cache: " + str(_mstatus["cache_size"]) + " SMILES" if _mstatus["chemberta_loaded"] else ""}'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-                    hint("Ranked by ChemBERTa semantic similarity + PDB co-occurrence (blended).")
+                    _cb_loaded = _mstatus["chemberta_loaded"]
+                    if _cb_loaded:
+                        st.markdown(
+                            f'<div style="font-size:0.78rem;color:#1E7E34;margin-bottom:6px;">'
+                            f'🟢 <strong>ChemBERTa ML</strong> · {_mstatus.get("cache_size",0)} embeddings cached</div>',
+                            unsafe_allow_html=True,
+                        )
+                        hint("Ranked by ChemBERTa semantic similarity + PDB co-occurrence (blended).")
+                    else:
+                        st.markdown(
+                            '<div style="background:#FFF3CD;border-left:3px solid #E8A020;'
+                            'border-radius:0 6px 6px 0;padding:0.5rem 0.75rem;'
+                            'font-size:0.82rem;color:#5A4A35;margin-bottom:8px;">'
+                            '🟡 <strong>Rule-based scoring</strong> — ChemBERTa not available on this server '
+                            '(Python 3.14 incompatible with torch/tokenizers). '
+                            'Scores use residue co-occurrence patterns. '
+                            'Run the <strong>local version</strong> for full ML ranking.</div>',
+                            unsafe_allow_html=True,
+                        )
                     tag_counts = st.session_state["_pocket_tag_counts"]
                     alpha = st.slider(
                         "Category vs fragment-level weight",
@@ -2065,121 +2164,6 @@ elif step == 3 and mode == "structure":
                 else:
                     st.info("Run PLIP analysis above to get design recommendations.")
 
-    # ── 3D Complex Viewer (parent ligand in pocket) ─────────────────────
-    if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
-        st.divider()
-        st.markdown("### 🧬 Binding Pocket 3D View")
-        hint("Parent ligand (cyan) in the protein pocket. Orange = interacting residues. Magenta = reference ligand (if available).")
-
-        v3d_s_col1, v3d_s_col2 = st.columns([1, 3])
-        with v3d_s_col1:
-            s3_labels  = st.checkbox("Residue labels",  value=True,  key="s3_labels")
-            s3_surface = st.checkbox("Protein surface", value=False, key="s3_surface")
-            s3_cutoff  = st.slider("Pocket cutoff (Å)", 3.0, 6.0, 4.0, 0.5, key="s3_cutoff")
-            s3_height  = st.slider("Height (px)", 300, 600, 460, 50, key="s3_height")
-            st.markdown("""
-<div style="font-size:0.75rem;line-height:1.8;margin-top:6px;">
-<span style="color:#00FFFF">■</span> Ligand &nbsp;
-<span style="color:#FF8C00">■</span> Pocket residues<br>
-<span style="color:#FF00FF">■</span> Reference &nbsp;
-<span style="color:#888">■</span> Protein
-</div>""", unsafe_allow_html=True)
-
-        with v3d_s_col2:
-            # Load ref ligand mol from PDB if available
-            ref_pdb  = st.session_state.ref_ligand_path or ""
-            prot_pdb = st.session_state.protein_path or st.session_state.receptor_path or ""
-            cpx_pdb  = st.session_state.complex_path or ""
-
-            pose_mol_s3 = None
-            if ref_pdb and os.path.exists(ref_pdb):
-                try:
-                    from rdkit import Chem as _Chem_s3
-                    pose_mol_s3 = _Chem_s3.MolFromPDBFile(ref_pdb, removeHs=False)
-                except Exception:
-                    pass
-
-            # Build viewer manually for full control over pocket display
-            try:
-                import py3Dmol as _py3_s3
-                _vs3 = _py3_s3.view(width="100%", height=s3_height)
-                _vs3.setBackgroundColor(_viewer_bg())
-                _mi_s3 = 0
-
-                # Protein cartoon
-                if prot_pdb and os.path.exists(prot_pdb):
-                    _vs3.addModel(open(prot_pdb).read(), "pdb")
-                    _vs3.setStyle({"model": _mi_s3}, {
-                        "cartoon": {"color": "spectrum", "opacity": 0.40}
-                    })
-                    if s3_surface:
-                        _vs3.addSurface(_py3_s3.SAS,
-                                        {"opacity": 0.18, "color": "white"},
-                                        {"model": _mi_s3})
-                    _mi_s3 += 1
-
-                # Co-crystal ligand (cyan) — this IS the pose
-                if pose_mol_s3 is not None:
-                    from rdkit.Chem import MolToMolBlock as _MB
-                    _vs3.addModel(_MB(pose_mol_s3), "mol")
-                    _lig_mi = _mi_s3
-                    _vs3.setStyle({"model": _lig_mi}, {
-                        "stick": {"colorscheme": "cyanCarbon", "radius": 0.28}
-                    })
-                    _mi_s3 += 1
-
-                # Pocket residues from distance shell or fpocket
-                # Use complex_path (protein+ligand together) for distance calc
-                _pocket_pdb = cpx_pdb if (cpx_pdb and os.path.exists(str(cpx_pdb))) else prot_pdb
-                if _pocket_pdb and pose_mol_s3 is not None and os.path.exists(_pocket_pdb):
-                    try:
-                        _pocket_res = core.get_interacting_residues(
-                            _pocket_pdb, pose_mol_s3, cutoff=s3_cutoff)
-                        for _rb in _pocket_res:
-                            _sel_s3 = {"model": 0, "resi": _rb["resi"]}
-                            if _rb.get("chain", "").strip():
-                                _sel_s3["chain"] = _rb["chain"]
-                            _vs3.setStyle(_sel_s3, {
-                                "stick":   {"colorscheme": "orangeCarbon", "radius": 0.20},
-                                "cartoon": {"color": "spectrum", "opacity": 0.70},
-                            })
-                            if s3_labels:
-                                _vs3.addLabel(
-                                    f"{_rb['resn']}{_rb['resi']}",
-                                    {"fontSize": 11, "fontColor": "yellow",
-                                     "backgroundColor": "black",
-                                     "backgroundOpacity": 0.65,
-                                     "inFront": True, "showBackground": True},
-                                    _sel_s3,
-                                )
-                    except Exception as _pe:
-                        pass  # pocket detection failed silently
-
-                # If no mol (can't read PDB), show pocket from session state
-                if pose_mol_s3 is None:
-                    # Draw pocket residues from distance shell data stored in session
-                    _pd = st.session_state.get("_void_all_pocket_resnums", [])
-                    for _rn in _pd:
-                        _vs3.setStyle(
-                            {"model": 0, "resi": _rn},
-                            {"stick":   {"colorscheme": "orangeCarbon", "radius": 0.20},
-                             "cartoon": {"color": "spectrum", "opacity": 0.75}},
-                        )
-
-                # Zoom to ligand or pocket
-                if pose_mol_s3 is not None:
-                    _vs3.zoomTo({"model": _lig_mi})
-                elif st.session_state.get("_void_all_pocket_resnums"):
-                    _vs3.zoomTo({"resi": st.session_state["_void_all_pocket_resnums"][:5]})
-                else:
-                    _vs3.zoomTo({"model": 0})
-
-                show3d(_vs3, height=s3_height)
-
-            except ImportError:
-                st.info("Install `py3Dmol` to enable 3D viewer.")
-            except Exception as _s3e:
-                st.warning(f"3D viewer error: {_s3e}")
 
     # ── fpocket real pocket detection ────────────────────────────────────
     _prot_pdb_fp = (st.session_state.protein_path or
