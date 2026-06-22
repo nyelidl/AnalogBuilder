@@ -5530,12 +5530,37 @@ def ligand_pdb_to_smiles(pdb_path: str) -> str:
     """
     import subprocess as _sub
 
-    # ── Method 1: RCSB CCD lookup (best — exact chemical definition) ─────────
+    # ── Method 1: RCSB CCD API (3-letter code → exact SMILES) ───────────────
     resname = _get_ligand_resname(pdb_path)
     if resname:
+        # 1a. RCSB Chemical Component Dictionary
         smi = _smiles_from_rcsb_ccd(resname)
         if smi:
             return smi
+        # 1b. PubChem by ligand 3-letter code
+        smi = _smiles_from_pubchem_name(resname)
+        if smi:
+            return smi
+        # 1c. RCSB ideal SDF download → RDKit SDMolSupplier
+        try:
+            import urllib.request as _ur
+            from rdkit.Chem import SDMolSupplier as _SDMS
+            import io as _io, tempfile as _tf, os as _tos
+            _sdf_url = f"https://files.rcsb.org/ligands/download/{resname.upper()}_ideal.sdf"
+            _req = _ur.Request(_sdf_url, headers={"User-Agent": "AnalogDesigner/1.0"})
+            _resp = _ur.urlopen(_req, timeout=8)
+            _sdf_data = _resp.read().decode(errors="ignore")
+            # Write to temp file and read with RDKit
+            with _tf.NamedTemporaryFile(suffix=".sdf", mode="w", delete=False) as _tf2:
+                _tf2.write(_sdf_data)
+                _tf_path = _tf2.name
+            _suppl = _SDMS(_tf_path, removeHs=True, sanitize=True)
+            _tos.unlink(_tf_path)
+            for _m in _suppl:
+                if _m and _m.GetNumAtoms() > 2:
+                    return Chem.MolToSmiles(_m)
+        except Exception:
+            pass
 
     # ── Method 2: OpenBabel (3D geometry bond perception) ────────────────────
     obabel = shutil.which("obabel")
@@ -5570,13 +5595,19 @@ def ligand_pdb_to_smiles(pdb_path: str) -> str:
     except Exception:
         pass
 
-    # ── Method 4: RDKit MolFromPDBFile (last resort) ─────────────────────────
-    try:
-        mol = Chem.MolFromPDBFile(str(pdb_path), removeHs=True, sanitize=True)
-        if mol:
-            return Chem.MolToSmiles(mol)
-    except Exception:
-        pass
+    # ── Method 4: RDKit with proximityBonding off (use CONECT if available) ──
+    for _prox in (False, True):
+        try:
+            mol = Chem.MolFromPDBFile(
+                str(pdb_path), removeHs=True, sanitize=True,
+                proximityBonding=_prox,
+            )
+            if mol and mol.GetNumAtoms() > 2:
+                smi = Chem.MolToSmiles(mol)
+                if smi:
+                    return smi
+        except Exception:
+            pass
 
     return ""
 
@@ -5601,12 +5632,34 @@ def split_protein_ligand(
         chosen_key = max(groups, key=lambda k: groups[k]["heavy"])
 
     protein_lines, ligand_lines = [], []
+    conect_lines, all_lines = [], []
+    lig_serial_set = set()
+
     with open(pdb_path, "r", errors="ignore") as fh:
         for line in fh:
+            all_lines.append(line)
             if line.startswith("ATOM"):
                 protein_lines.append(line)
             elif line.startswith("HETATM") and chosen_key and _pdb_reskey(line) == chosen_key:
                 ligand_lines.append(line)
+                # Collect serial numbers for CONECT filtering
+                try:
+                    lig_serial_set.add(int(line[6:11].strip()))
+                except Exception:
+                    pass
+            elif line.startswith("CONECT"):
+                conect_lines.append(line)
+
+    # Filter CONECT records to those involving ligand atoms only
+    lig_conect = []
+    for cl in conect_lines:
+        parts = cl.split()
+        if len(parts) > 1:
+            try:
+                if int(parts[1]) in lig_serial_set:
+                    lig_conect.append(cl)
+            except Exception:
+                pass
 
     protein_out = str(work_dir / "protein_only.pdb")
     with open(protein_out, "w") as f:
@@ -5618,6 +5671,8 @@ def split_protein_ligand(
         ligand_out = str(work_dir / "reference_ligand.pdb")
         with open(ligand_out, "w") as f:
             f.writelines(ligand_lines)
+            if lig_conect:
+                f.writelines(lig_conect)  # include bond connectivity
             f.write("END\n")
 
     return protein_out, ligand_out, candidates
