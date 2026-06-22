@@ -6668,6 +6668,27 @@ def _render_ligand_svg(mol2d, svg_coords):
         if fc!=0:
             fcs="+" if fc==1 else "\u2212" if fc==-1 else f"{fc:+d}"
             parts.append(f'<text x="{ax+hw:.1f}" y="{ay-hw+2:.1f}" font-family="Arial,sans-serif" font-size="10" fill="{clr}">{fcs}</text>')
+    # ── Atom index numbers (small, grey, offset from atom center) ────────────
+    for i in range(mol2d.GetNumAtoms()):
+        atom = mol2d.GetAtomWithIdx(i)
+        sym  = atom.GetSymbol()
+        ax, ay = svg_coords.get(i, (0, 0))
+        # Offset index away from center of molecule to avoid overlapping bonds
+        # Compute direction from rough molecule centroid
+        _all_xy = list(svg_coords.values())
+        _mcx = sum(x for x,y in _all_xy) / max(len(_all_xy), 1)
+        _mcy = sum(y for x,y in _all_xy) / max(len(_all_xy), 1)
+        _dx = ax - _mcx; _dy = ay - _mcy
+        _L  = _math.sqrt(_dx*_dx + _dy*_dy) + 1e-9
+        _off = 13 if sym == "C" else 20   # push further for heteroatom labels
+        _nx  = ax + _dx / _L * _off
+        _ny  = ay + _dy / _L * _off
+        # Small white halo + dark index label
+        parts.append(
+            f'<text x="{_nx:.1f}" y="{_ny:.1f}" text-anchor="middle" dominant-baseline="central" '
+            f'font-family="Arial,sans-serif" font-size="10" font-weight="400" '
+            f'stroke="white" stroke-width="3" paint-order="stroke" fill="#444">{i}</text>'
+        )
     return "".join(parts)
 
 
