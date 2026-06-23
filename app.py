@@ -1647,16 +1647,31 @@ elif step == 3 and mode == "ligand":
                                 )
                                 st.session_state["_efl_fragments"] = _fetched
                                 _prog.empty()
-                                from collections import Counter as _C
-                                _bs = _C(f["source"] for f in _fetched)
-                                _bc = _C(f["category"] for f in _fetched)
-                                st.success(f"✅ {len(_fetched)} fragments — " +
-                                           "  ".join(f"{s}:{n}" for s,n in _bs.items()))
-                                st.caption("Categories: " +
-                                           "  ".join(f"{c}({n})" for c,n in _bc.most_common(6)))
+                                if _fetched:
+                                    from collections import Counter as _C
+                                    _bs = _C(f["source"] for f in _fetched)
+                                    _bc = _C(f["category"] for f in _fetched)
+                                    st.success(f"✅ {len(_fetched)} fragments fetched — " +
+                                               "  ".join(f"{s}:{n}" for s,n in _bs.items()))
+                                    st.caption("Categories: " +
+                                               "  ".join(f"{c}({n})" for c,n in _bc.most_common(6)))
+                                else:
+                                    st.warning(
+                                        "⚠️ No fragments returned. "
+                                        "ChEMBL and ZINC APIs may be blocked on this server. "
+                                        "Try the **local version** where network access is available."
+                                    )
                             except Exception as _ee:
                                 _prog.empty()
-                                st.error(f"Fetch failed: {_ee}")
+                                _err_str = str(_ee)
+                                if "403" in _err_str or "Forbidden" in _err_str or "timeout" in _err_str.lower():
+                                    st.warning(
+                                        "⚠️ External API blocked (403 Forbidden). "
+                                        "ChEMBL/ZINC are not reachable from this Streamlit Cloud server. "
+                                        "Run the **local version** to fetch external fragments."
+                                    )
+                                else:
+                                    st.error(f"Fetch failed: {_ee}")
             with _ef2:
                 _cached_efl = st.session_state.get("_efl_fragments", [])
                 if _cached_efl:
@@ -3015,9 +3030,15 @@ elif step == 5:
                 except Exception as e:
                     st.error(f"Could not process file: {e}")
 
-    receptor = st.session_state.receptor_path
+    # Use protein-only PDB for docking (no HETATM — ACD needs clean protein)
+    receptor = st.session_state.protein_path or st.session_state.receptor_path
     if receptor:
-        st.success(f"Target receptor: `{Path(receptor).name}`")
+        _rec_label = Path(receptor).name
+        _is_protein_only = bool(st.session_state.protein_path)
+        st.success(
+            f"Target receptor: `{_rec_label}` "
+            f"({'protein-only ✅' if _is_protein_only else '⚠️ full complex — protein-only recommended'})"
+        )
 
     st.divider()
     rows = [{"compound": "original_ligand", "smiles": st.session_state.parent_smiles}]
@@ -3050,6 +3071,9 @@ elif step == 5:
         bz = st.number_input("Box Z (Å)", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_bz")
 
     # ── 3D Receptor + Docking Box Preview ────────────────────────────────────
+    _rec3_path = st.session_state.protein_path or st.session_state.receptor_path or ""
+    if not _rec3_path or not os.path.exists(_rec3_path):
+        st.info("Load a receptor above to see the 3D docking setup.")
     with st.expander("🔭 3D: Receptor + Docking Box", expanded=True):
         try:
             import py3Dmol as _py3
@@ -3080,7 +3104,7 @@ elif step == 5:
                     pass
 
             # Protein cartoon
-            _rec3 = st.session_state.protein_path or receptor or ""
+            _rec3 = _rec3_path or st.session_state.protein_path or receptor or ""
             if _rec3 and os.path.exists(str(_rec3)):
                 _v3.addModel(open(_rec3).read(), "pdb")
                 _v3.setStyle({"model": _mi3}, {
