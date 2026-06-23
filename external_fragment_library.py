@@ -118,6 +118,97 @@ def _categorise(smiles: str) -> str:
     if logp > 1.5:           return "hydrophobic"
     return "solubility"
 
+
+# ── Built-in offline fragment library ────────────────────────────────────────
+# Curated from ChEMBL fragment subset + ZINC fragments (MW<300, RO3 compliant)
+# Used as fallback when ChEMBL/ZINC APIs are unreachable (e.g. Streamlit Cloud)
+_BUILTIN_EFL = [
+    # Aromatic heterocycles
+    ("CHEMBL_pyrimidine",     "[*]c1ncncn1",          "aromatic"),
+    ("CHEMBL_imidazole",      "c1cn([*])cn1",          "aromatic"),
+    ("CHEMBL_pyrazole",       "c1cnn([*])c1",          "aromatic"),
+    ("CHEMBL_triazole",       "c1cn([*])nn1",          "aromatic"),
+    ("CHEMBL_tetrazole",      "c1nn([*])nn1",          "aromatic"),
+    ("CHEMBL_indole",         "[*]c1cc2ccccc2[nH]1",  "aromatic"),
+    ("CHEMBL_benzimidazole",  "[*]c1nc2ccccc2[nH]1",  "aromatic"),
+    ("CHEMBL_quinoline",      "[*]c1ccc2ncccc2c1",    "aromatic"),
+    ("CHEMBL_isoquinoline",   "[*]c1cncc2ccccc12",    "aromatic"),
+    ("CHEMBL_benzothiazole",  "[*]c1nc2ccccc2s1",     "aromatic"),
+    ("CHEMBL_isoxazole",      "[*]c1cnoc1",            "aromatic"),
+    ("CHEMBL_oxazole",        "[*]c1cnoc1",            "aromatic"),
+    ("CHEMBL_pyridine_2",     "[*]c1ccccn1",           "aromatic"),
+    ("CHEMBL_pyridine_3",     "[*]c1cccnc1",           "aromatic"),
+    ("CHEMBL_pyridine_4",     "[*]c1ccncc1",           "aromatic"),
+    # N-containing saturated
+    ("CHEMBL_piperazine",     "[*]N1CCNCC1",           "basic"),
+    ("CHEMBL_morpholine",     "[*]N1CCOCC1",           "polar"),
+    ("CHEMBL_pyrrolidine",    "[*]N1CCCC1",            "basic"),
+    ("CHEMBL_piperidine",     "[*]N1CCCCC1",           "basic"),
+    ("CHEMBL_azetidine",      "[*]N1CCC1",             "basic"),
+    ("CHEMBL_methylpiperazine","[*]N1CCN(C)CC1",       "basic"),
+    ("CHEMBL_dimethylaminoethyl","[*]CCN(C)C",         "basic"),
+    ("CHEMBL_morpholinoethyl","[*]CCN1CCOCC1",         "polar"),
+    # Polar / amide bioisosteres
+    ("CHEMBL_urea",           "[*]NC(=O)N",            "polar"),
+    ("CHEMBL_sulfonamide",    "[*]NS(=O)(=O)C",        "acidic"),
+    ("CHEMBL_carbamate",      "[*]OC(=O)N",            "polar"),
+    ("CHEMBL_amide_NH",       "[*]C(=O)NC",            "polar"),
+    ("CHEMBL_acylsulfonamide","[*]C(=O)NS(=O)(=O)C",  "acidic"),
+    ("CHEMBL_oxazolidinone",  "[*]N1CCOC1=O",          "polar"),
+    # Acidic
+    ("CHEMBL_acetic_acid",    "[*]CC(=O)O",            "acidic"),
+    ("CHEMBL_tetrazole_acid", "[*]Cc1nnn[nH]1",        "acidic"),
+    ("CHEMBL_hydroxypyridine","[*]c1cc(O)ccn1",        "acidic"),
+    ("CHEMBL_benzoic_acid",   "[*]c1ccc(C(=O)O)cc1",  "acidic"),
+    # Hydrophobic
+    ("CHEMBL_cyclopropyl",    "[*]C1CC1",              "hydrophobic"),
+    ("CHEMBL_tBu",            "[*]C(C)(C)C",           "hydrophobic"),
+    ("CHEMBL_cyclohexyl",     "[*]C1CCCCC1",           "hydrophobic"),
+    ("CHEMBL_bicyclo_221",    "[*]C1CC2CCC1C2",        "hydrophobic"),
+    # Halogens / bioisosteres
+    ("CHEMBL_4F_phenyl",      "[*]c1ccc(F)cc1",        "halogen"),
+    ("CHEMBL_3F_phenyl",      "[*]c1cccc(F)c1",        "halogen"),
+    ("CHEMBL_4Cl_phenyl",     "[*]c1ccc(Cl)cc1",       "halogen"),
+    ("CHEMBL_4CF3_phenyl",    "[*]c1ccc(C(F)(F)F)cc1", "halogen"),
+    ("CHEMBL_difluoromethyl", "[*]C(F)F",              "halogen"),
+    ("CHEMBL_trifluoroethyl", "[*]CC(F)(F)F",          "halogen"),
+    # Solubility
+    ("CHEMBL_PEG2",           "[*]OCCO",               "solubility"),
+    ("CHEMBL_PEG3",           "[*]OCCOC",              "solubility"),
+    ("CHEMBL_glucuronide",    "[*]OCC(O)CO",           "solubility"),
+    # ZINC representative
+    ("ZINC_pyrimidine_NH2",   "[*]c1ccnc(N)c1",       "aromatic"),
+    ("ZINC_pyridine_OH",      "[*]c1ccnc(O)c1",       "aromatic"),
+    ("ZINC_F_pyridine",       "[*]c1cc(F)ccn1",        "halogen"),
+    ("ZINC_Cl_pyridine",      "[*]c1cc(Cl)ccn1",       "halogen"),
+    ("ZINC_thio_pyrimidine",  "[*]c1ncsc1",            "aromatic"),
+    ("ZINC_aminopyrimidine",  "[*]c1nc(N)nc(N)c1",    "basic"),
+    ("ZINC_benzoylamine",     "[*]NC(=O)c1ccccc1",    "polar"),
+    ("ZINC_benzenesulfonamide","[*]c1ccc(S(=O)(=O)N)cc1","acidic"),
+    ("ZINC_nicotinic",        "[*]OC(=O)c1cccnc1",    "acidic"),
+    ("ZINC_spiro",            "[*]C1(CC1)CCC",         "hydrophobic"),
+]
+
+
+def get_builtin_efl_fragments() -> List[dict]:
+    """Return built-in offline fragment library as list of dicts."""
+    results = []
+    for name, smi, cat in _BUILTIN_EFL:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        smi_orig = smi.replace("[*]", "").strip() or smi
+        results.append({
+            "name":       name,
+            "smiles":     smi,
+            "smiles_orig": smi_orig,
+            "category":   cat,
+            "source":     "CHEMBL" if name.startswith("CHEMBL") else "ZINC",
+            "mw":         round(sum(a.GetMass() for a in mol.GetAtoms()), 2),
+            "logp":       0.0,
+        })
+    return results
+
 # ── 1. ChEMBL API ─────────────────────────────────────────────────────────────
 CHEMBL_BASE = "https://www.ebi.ac.uk/chembl/api/data/molecule.json"
 CHEMBL_PARAMS = {
@@ -314,6 +405,7 @@ def fetch_external_fragments(
 ) -> List[dict]:
     """
     Fetch from one or both sources, deduplicate by canonical SMILES.
+    Falls back to built-in offline fragment set when APIs are unreachable.
     Returns merged list sorted by MW.
     """
     all_results = []
@@ -332,6 +424,19 @@ def fetch_external_fragments(
             if canon and canon not in seen_smi:
                 seen_smi.add(canon)
                 all_results.append(f)
+
+    # Fallback: use built-in curated fragments when APIs are unreachable
+    if not all_results:
+        builtin = get_builtin_efl_fragments()
+        for f in builtin:
+            smi = f["smiles"]
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                continue
+            canon = Chem.MolToSmiles(mol)
+            if canon and canon not in seen_smi:
+                seen_smi.add(canon)
+                all_results.append({**f, "source": f["source"] + " (offline)"})
 
     return sorted(all_results, key=lambda x: x.get("mw", 0))
 
