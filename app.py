@@ -1651,16 +1651,20 @@ elif step == 3 and mode == "ligand":
                                     from collections import Counter as _C
                                     _bs = _C(f["source"] for f in _fetched)
                                     _bc = _C(f["category"] for f in _fetched)
-                                    st.success(f"✅ {len(_fetched)} fragments fetched — " +
-                                               "  ".join(f"{s}:{n}" for s,n in _bs.items()))
+                                    _is_offline = any("offline" in s for s in _bs)
+                                    if _is_offline:
+                                        st.info(
+                                            f"📦 Using **built-in offline library**: {len(_fetched)} curated fragments "
+                                            f"(ChEMBL/ZINC APIs blocked on this server). "
+                                            f"Run local version for live API access."
+                                        )
+                                    else:
+                                        st.success(f"✅ {len(_fetched)} fragments fetched — " +
+                                                   "  ".join(f"{s}:{n}" for s,n in _bs.items()))
                                     st.caption("Categories: " +
                                                "  ".join(f"{c}({n})" for c,n in _bc.most_common(6)))
                                 else:
-                                    st.warning(
-                                        "⚠️ No fragments returned. "
-                                        "ChEMBL and ZINC APIs may be blocked on this server. "
-                                        "Try the **local version** where network access is available."
-                                    )
+                                    st.warning("⚠️ No fragments available.")
                             except Exception as _ee:
                                 _prog.empty()
                                 _err_str = str(_ee)
