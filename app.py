@@ -3202,55 +3202,88 @@ elif step == 5:
         dock_ph = st.number_input("pH", value=7.4, step=0.1)
         dock_out_dir = str(work / "docking_out")
 
-    with st.expander("⚙️ Advanced docking options"):
-        bx = st.number_input("Box X (Å)", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_bx")
-        by = st.number_input("Box Y (Å)", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_by")
-        bz = st.number_input("Box Z (Å)", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_bz")
+    # Box dimensions already set in 3D viewer controls above
+    # bx/by/bz read from session state (set by dock_bx2/dock_by2/dock_bz2 widgets)
+    bx = st.session_state.get("dock_bx2", 16.0)
+    by = st.session_state.get("dock_by2", 16.0)
+    bz = st.session_state.get("dock_bz2", 16.0)
 
-    # ── 3D Receptor + Docking Box Preview ────────────────────────────────────
+    # ── 3D Receptor + Docking Box (ACD-style: always shown) ─────────────────
+    st.markdown("### 🔭 Receptor + Docking Box")
     _rec3_path = st.session_state.protein_path or st.session_state.receptor_path or ""
-    if not _rec3_path or not os.path.exists(_rec3_path):
-        st.info("Load a receptor above to see the 3D docking setup.")
-    with st.expander("🔭 3D: Receptor + Docking Box", expanded=True):
-        try:
-            import py3Dmol as _py3
-            _v3 = _py3.view(width="100%", height=480)
-            _v3.setBackgroundColor(_viewer_bg())
-            _mi3 = 0
+    _ref_pdb3  = st.session_state.ref_ligand_path or ""
 
-            # Compute docking center from co-crystal ligand
-            _cx3, _cy3, _cz3 = 0.0, 0.0, 0.0
-            _ref_pdb3 = st.session_state.ref_ligand_path or ""
-            if _ref_pdb3 and os.path.exists(str(_ref_pdb3)):
-                try:
-                    import numpy as _np3
-                    _coords3 = []
-                    with open(_ref_pdb3) as _lf3:
-                        for _ll3 in _lf3:
-                            if _ll3.startswith(("ATOM","HETATM")):
-                                try:
-                                    _coords3.append([float(_ll3[30:38]),
-                                                     float(_ll3[38:46]),
-                                                     float(_ll3[46:54])])
-                                except Exception:
-                                    pass
-                    if _coords3:
-                        _ctr3 = _np3.mean(_coords3, axis=0)
-                        _cx3, _cy3, _cz3 = float(_ctr3[0]), float(_ctr3[1]), float(_ctr3[2])
-                except Exception:
-                    pass
+    _d3_ctrl, _d3_view = st.columns([1, 3], gap="large")
+    with _d3_ctrl:
+        st.markdown("**Box dimensions (Å)**")
+        bx = st.number_input("Box X", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_bx2")
+        by = st.number_input("Box Y", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_by2")
+        bz = st.number_input("Box Z", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_bz2")
+        _d3_surface = st.checkbox("Protein surface", value=False, key="d3_surf")
+        _d3_height  = st.slider("Height (px)", 350, 700, 500, 50, key="d3_h")
+        st.markdown(
+            '<div style="font-size:0.75rem;line-height:1.9;margin-top:6px;">'
+            '<span style="color:#00FFFF">■</span> Docking box<br>'
+            '<span style="color:#FF00FF">■</span> Reference ligand<br>'
+            '<span style="color:#FFFFFF">■</span> Pocket residues in box<br>'
+            '<span style="color:#888">■</span> Protein</div>',
+            unsafe_allow_html=True,
+        )
 
-            # Protein cartoon
-            _rec3 = _rec3_path or st.session_state.protein_path or receptor or ""
-            if _rec3 and os.path.exists(str(_rec3)):
-                _v3.addModel(open(_rec3).read(), "pdb")
+    with _d3_view:
+        if not _rec3_path or not os.path.exists(str(_rec3_path)):
+            st.markdown(
+                '<div style="background:#F0EAE0;border-radius:12px;height:420px;'
+                'display:flex;align-items:center;justify-content:center;color:#A89070;">'
+                '<div style="text-align:center;">'
+                '<div style="font-size:2rem;margin-bottom:8px;">🧬</div>'
+                '<div>Load a receptor above to see the 3D docking setup</div>'
+                '</div></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            try:
+                import py3Dmol as _py3
+                import numpy as _np3
+
+                _v3 = _py3.view(width="100%", height=_d3_height)
+                _v3.setBackgroundColor(_viewer_bg())
+                _mi3 = 0
+
+                # ── Docking center from co-crystal ligand ────────────────────
+                _cx3, _cy3, _cz3 = 0.0, 0.0, 0.0
+                if _ref_pdb3 and os.path.exists(str(_ref_pdb3)):
+                    try:
+                        _coords3 = []
+                        with open(_ref_pdb3) as _lf3:
+                            for _ll3 in _lf3:
+                                if _ll3.startswith(("ATOM","HETATM")):
+                                    try:
+                                        _coords3.append([float(_ll3[30:38]),
+                                                         float(_ll3[38:46]),
+                                                         float(_ll3[46:54])])
+                                    except Exception:
+                                        pass
+                        if _coords3:
+                            _ctr3 = _np3.mean(_coords3, axis=0)
+                            _cx3, _cy3, _cz3 = float(_ctr3[0]), float(_ctr3[1]), float(_ctr3[2])
+                    except Exception:
+                        pass
+
+                # ── Protein cartoon ──────────────────────────────────────────
+                _v3.addModel(open(_rec3_path).read(), "pdb")
                 _v3.setStyle({"model": _mi3}, {
-                    "cartoon": {"color": "spectrum", "opacity": 0.40}
+                    "cartoon": {"color": "spectrum", "opacity": 0.45}
                 })
-                # Highlight residues inside docking box
+                if _d3_surface:
+                    _v3.addSurface(_py3.SAS,
+                                   {"opacity": 0.15, "color": "white"},
+                                   {"model": _mi3})
+
+                # ── Highlight pocket residues inside box ─────────────────────
                 try:
-                    import prody as _pr3
-                    _ra3  = _pr3.parsePDB(str(_rec3))
+                    import prody as _pr3d
+                    _ra3  = _pr3d.parsePDB(str(_rec3_path))
                     _hx3, _hy3, _hz3 = bx/2, by/2, bz/2
                     _ps3 = _ra3.select(
                         f"protein and "
@@ -3262,57 +3295,76 @@ elif step == 5:
                         _rl3 = sorted(set(int(r) for r in _ps3.getResnums()))
                         _v3.setStyle(
                             {"model": _mi3, "resi": _rl3},
-                            {"stick":   {"colorscheme": "whiteCarbon", "radius": 0.18},
-                             "cartoon": {"color": "spectrum", "opacity": 0.75}},
+                            {"stick":   {"colorscheme": "whiteCarbon", "radius": 0.20},
+                             "cartoon": {"color": "spectrum", "opacity": 0.80}},
                         )
+                        # Label pocket residues
+                        _ra3_res = _ra3.select(
+                            f"protein and ca and "
+                            f"x > {_cx3-_hx3:.2f} and x < {_cx3+_hx3:.2f} and "
+                            f"y > {_cy3-_hy3:.2f} and y < {_cy3+_hy3:.2f} and "
+                            f"z > {_cz3-_hz3:.2f} and z < {_cz3+_hz3:.2f}"
+                        )
+                        if _ra3_res is not None:
+                            for _ai in range(min(20, _ra3_res.numAtoms())):
+                                _rn  = _ra3_res.getResnames()[_ai]
+                                _rid = int(_ra3_res.getResnums()[_ai])
+                                _axyz = _ra3_res.getCoords()[_ai]
+                                _v3.addLabel(
+                                    f"{_rn}{_rid}",
+                                    {"fontSize": 10, "fontColor": "yellow",
+                                     "backgroundColor": "black", "backgroundOpacity": 0.55,
+                                     "inFront": True, "showBackground": True},
+                                    {"x": float(_axyz[0]), "y": float(_axyz[1]), "z": float(_axyz[2])},
+                                )
                 except Exception:
                     pass
                 _mi3 += 1
 
-            # Co-crystal / reference ligand (magenta)
-            if _ref_pdb3 and os.path.exists(str(_ref_pdb3)):
-                _v3.addModel(open(_ref_pdb3).read(), "pdb")
-                _v3.setStyle({"model": _mi3}, {
-                    "stick": {"colorscheme": "magentaCarbon", "radius": 0.25}
-                })
-                _mi3 += 1
+                # ── Reference ligand (magenta) ───────────────────────────────
+                if _ref_pdb3 and os.path.exists(str(_ref_pdb3)):
+                    _v3.addModel(open(_ref_pdb3).read(), "pdb")
+                    _v3.setStyle({"model": _mi3}, {
+                        "stick": {"colorscheme": "magentaCarbon", "radius": 0.28}
+                    })
+                    _mi3 += 1
 
-            # Docking box (blue fill + cyan wireframe)
-            _c3 = {"x": _cx3, "y": _cy3, "z": _cz3}
-            _d3 = {"w": int(bx), "h": int(by), "d": int(bz)}
-            _v3.addBox({"center": _c3, "dimensions": _d3,
-                        "color": "blue", "opacity": 0.07, "wireframe": False})
-            _v3.addBox({"center": _c3, "dimensions": _d3,
-                        "color": "cyan", "opacity": 0.90, "wireframe": True})
+                # ── Docking box ──────────────────────────────────────────────
+                _c3 = {"x": _cx3, "y": _cy3, "z": _cz3}
+                _d3d = {"w": int(bx), "h": int(by), "d": int(bz)}
+                _v3.addBox({"center": _c3, "dimensions": _d3d,
+                            "color": "blue", "opacity": 0.06})
+                _v3.addBox({"center": _c3, "dimensions": _d3d,
+                            "color": "cyan", "opacity": 0.95, "wireframe": True})
 
-            # XYZ axis arrows
-            for _ep3, _col3, _lbl3 in [
-                ({"x": _cx3+8, "y": _cy3,   "z": _cz3},   "red",   "X"),
-                ({"x": _cx3,   "y": _cy3+8,  "z": _cz3},   "green", "Y"),
-                ({"x": _cx3,   "y": _cy3,    "z": _cz3+8}, "blue",  "Z"),
-            ]:
-                _v3.addArrow({"start": {"x":_cx3,"y":_cy3,"z":_cz3},
-                              "end": _ep3, "radius": 0.15,
-                              "color": _col3, "radiusRatio": 3.0})
-                _v3.addLabel(_lbl3, {
-                    "fontSize": 14, "fontColor": _col3,
-                    "backgroundColor": "black", "backgroundOpacity": 0.6,
-                    "inFront": True, "showBackground": True,
-                }, _ep3)
+                # ── XYZ axis arrows ──────────────────────────────────────────
+                for _ep3, _col3, _lbl3 in [
+                    ({"x": _cx3+8, "y": _cy3,   "z": _cz3},   "red",   "X"),
+                    ({"x": _cx3,   "y": _cy3+8,  "z": _cz3},   "green", "Y"),
+                    ({"x": _cx3,   "y": _cy3,    "z": _cz3+8}, "blue",  "Z"),
+                ]:
+                    _v3.addArrow({"start": {"x":_cx3,"y":_cy3,"z":_cz3},
+                                  "end": _ep3, "radius": 0.12, "color": _col3, "radiusRatio": 3.5})
+                    _v3.addLabel(_lbl3, {
+                        "fontSize": 13, "fontColor": _col3,
+                        "backgroundColor": "black", "backgroundOpacity": 0.6,
+                        "inFront": True, "showBackground": True,
+                    }, _ep3)
 
-            _v3.zoomTo({"model": 0})
-            _v3.zoom(1.2)
-            show3d(_v3, height=480)
-            st.caption(
-                f"🔵 Cyan wireframe = docking search box ({int(bx)}×{int(by)}×{int(bz)} Å)  ·  "
-                f"🟣 Magenta = co-crystal reference  ·  "
-                f"⬜ White sticks = pocket residues inside box  ·  "
-                f"Center: ({_cx3:.1f}, {_cy3:.1f}, {_cz3:.1f})"
-            )
-        except ImportError:
-            st.info("Install `py3Dmol` to enable the 3D viewer.")
-        except Exception as _ve3:
-            st.warning(f"3D viewer error: {_ve3}")
+                _v3.zoomTo({"model": 0})
+                _v3.zoom(1.1)
+                show3d(_v3, height=_d3_height)
+                st.caption(
+                    f"🔵 Cyan box = search space ({int(bx)}×{int(by)}×{int(bz)} Å)  ·  "
+                    f"🟣 Magenta = reference ligand  ·  "
+                    f"⬜ White = pocket residues inside box  ·  "
+                    f"Center ({_cx3:.1f}, {_cy3:.1f}, {_cz3:.1f})"
+                )
+            except ImportError:
+                st.info("Install `py3Dmol` to enable the 3D viewer.")
+            except Exception as _ve3:
+                st.warning(f"3D viewer error: {_ve3}")
+    st.divider()
 
     if acd_ok and obabel_ok and receptor:
         if st.button("Run docking", type="primary"):
