@@ -5661,10 +5661,49 @@ def split_protein_ligand(
             except Exception:
                 pass
 
+    # ── Fallback: no PDB-style ATOM lines (e.g. mmCIF upload) ────────────
+    # If the input has no ATOM records we cannot split by string matching.
+    # Re-parse with ProDy (handles both PDB and CIF) and write a clean
+    # PDB so that ACD's receptor prep does not receive an empty stream.
+    if not protein_lines:
+        try:
+            import prody as _pr
+            _atoms = _pr.parsePDB(pdb_path) if pdb_path.lower().endswith((".pdb", ".ent")) \
+                else _pr.parseMMCIF(pdb_path)
+            if _atoms is None:
+                raise ValueError("ProDy could not parse the structure.")
+            _protein = _atoms.select("protein")
+            if _protein is None or _protein.numAtoms() == 0:
+                raise ValueError("No protein atoms found in the structure.")
+            protein_out = str(work_dir / "protein_only.pdb")
+            _pr.writePDB(protein_out, _protein)
+
+            # Try to recover a reference ligand (largest hetero group)
+            ligand_out = None
+            _het = _atoms.select("hetero and not water")
+            if _het is not None and _het.numAtoms() > 0:
+                ligand_out = str(work_dir / "reference_ligand.pdb")
+                _pr.writePDB(ligand_out, _het)
+            return protein_out, ligand_out, candidates
+        except Exception as _e:
+            raise ValueError(
+                f"No ATOM records found in '{os.path.basename(pdb_path)}' and "
+                f"ProDy fallback failed ({_e}). Please upload a standard PDB "
+                f"file containing protein ATOM records."
+            )
+
     protein_out = str(work_dir / "protein_only.pdb")
     with open(protein_out, "w") as f:
         f.writelines(protein_lines)
         f.write("END\n")
+
+    # Guard: protein file must not be empty (otherwise ACD reports
+    # "empty PDB file or stream" and the docking exits with code 1).
+    if os.path.getsize(protein_out) <= len("END\n"):
+        raise ValueError(
+            f"Receptor '{os.path.basename(pdb_path)}' produced an empty "
+            f"protein file. Make sure it contains protein ATOM records."
+        )
 
     ligand_out = None
     if ligand_lines:
