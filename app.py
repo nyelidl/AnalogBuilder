@@ -1114,7 +1114,11 @@ if step == 1:
         elif _sr and not _sr.get("found"):
             st.error(f"Not found: {_sr.get('error', 'Unknown error')}")
 
-        smiles = st.text_input("SMILES string", value=st.session_state.parent_smiles,
+        # Initialise the widget's value via session_state only (do NOT pass
+        # both `value=` and `key=` — Streamlit warns and ignores one of them).
+        if "smiles_in_pc" not in st.session_state:
+            st.session_state["smiles_in_pc"] = st.session_state.parent_smiles or ""
+        smiles = st.text_input("SMILES string",
             key="smiles_in_pc", help="Auto-filled from PubChem search, or paste your own SMILES here.")
         st.session_state.parent_smiles = smiles
         name = st.text_input("Compound name", value=st.session_state.parent_name, key="pc_compound_name")
@@ -1864,6 +1868,33 @@ elif step == 3 and mode == "structure":
                 smiles   = st.session_state.parent_smiles
 
                 with st.spinner(f"Docking {compound} into {Path(receptor).name}…"):
+                    # Mode B has no co-crystal ligand, so ACD's --center auto
+                    # would default to the origin (0,0,0) and dock outside the
+                    # protein. Compute the protein geometric centroid and dock
+                    # with an explicit manual centre (blind docking).
+                    _mb_cx = _mb_cy = _mb_cz = 0.0
+                    _mb_have_center = False
+                    try:
+                        import numpy as _mbnp
+                        _mb_coords = []
+                        with open(receptor) as _mbf:
+                            for _mbl in _mbf:
+                                if _mbl.startswith(("ATOM", "HETATM")):
+                                    try:
+                                        _mb_coords.append([float(_mbl[30:38]),
+                                                           float(_mbl[38:46]),
+                                                           float(_mbl[46:54])])
+                                    except Exception:
+                                        pass
+                        if _mb_coords:
+                            _mbc = _mbnp.mean(_mb_coords, axis=0)
+                            _mb_cx, _mb_cy, _mb_cz = (float(_mbc[0]),
+                                                      float(_mbc[1]),
+                                                      float(_mbc[2]))
+                            _mb_have_center = True
+                    except Exception:
+                        pass
+
                     cmd = core.build_acd_dock_cmd(
                         receptor=receptor,
                         smiles=smiles,
@@ -1875,6 +1906,8 @@ elif step == 3 and mode == "structure":
                         exhaustiveness=8,
                         num_poses=10,
                         box_x=16.0, box_y=16.0, box_z=16.0,
+                        center="manual" if _mb_have_center else "auto",
+                        cx=_mb_cx, cy=_mb_cy, cz=_mb_cz,
                     )
                     # Show command for debugging
                     with st.expander("🔧 ACD command", expanded=False):
@@ -3219,6 +3252,22 @@ elif step == 5:
         bx = st.number_input("Box X", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_bx2")
         by = st.number_input("Box Y", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_by2")
         bz = st.number_input("Box Z", value=16.0, min_value=8.0, max_value=40.0, step=2.0, key="dock_bz2")
+
+        # ── Centre mode ──────────────────────────────────────────────────
+        _has_ref_lig = bool(_ref_pdb3 and os.path.exists(str(_ref_pdb3)))
+        _center_opts = (["Reference ligand", "Protein centre", "Manual"]
+                        if _has_ref_lig else ["Protein centre", "Manual"])
+        _center_mode = st.radio("Box centre", _center_opts, key="dock_center_mode",
+                                help="Where to place the search box. "
+                                     "Reference ligand = co-crystal pocket; "
+                                     "Protein centre = whole-protein centroid (blind docking); "
+                                     "Manual = type coordinates.")
+        _man_cx = _man_cy = _man_cz = None
+        if _center_mode == "Manual":
+            _man_cx = st.number_input("Center X", value=0.0, step=1.0, key="dock_man_cx")
+            _man_cy = st.number_input("Center Y", value=0.0, step=1.0, key="dock_man_cy")
+            _man_cz = st.number_input("Center Z", value=0.0, step=1.0, key="dock_man_cz")
+
         _d3_surface = st.checkbox("Protein surface", value=False, key="d3_surf")
         _d3_height  = st.slider("Height (px)", 350, 700, 500, 50, key="d3_h")
         st.markdown(
@@ -3250,25 +3299,52 @@ elif step == 5:
                 _v3.setBackgroundColor(_viewer_bg())
                 _mi3 = 0
 
-                # ── Docking center from co-crystal ligand ────────────────────
+                # ── Docking centre (mode-aware) ──────────────────────────────
                 _cx3, _cy3, _cz3 = 0.0, 0.0, 0.0
-                if _ref_pdb3 and os.path.exists(str(_ref_pdb3)):
+                _mode = st.session_state.get("dock_center_mode", "Protein centre")
+
+                def _centroid_of_pdb(_p, _het_only=False):
+                    _cc = []
                     try:
-                        _coords3 = []
-                        with open(_ref_pdb3) as _lf3:
-                            for _ll3 in _lf3:
-                                if _ll3.startswith(("ATOM","HETATM")):
-                                    try:
-                                        _coords3.append([float(_ll3[30:38]),
-                                                         float(_ll3[38:46]),
-                                                         float(_ll3[46:54])])
-                                    except Exception:
-                                        pass
-                        if _coords3:
-                            _ctr3 = _np3.mean(_coords3, axis=0)
-                            _cx3, _cy3, _cz3 = float(_ctr3[0]), float(_ctr3[1]), float(_ctr3[2])
+                        with open(_p) as _lf:
+                            for _ll in _lf:
+                                if _het_only and not _ll.startswith("HETATM"):
+                                    continue
+                                if (not _het_only) and not _ll.startswith(("ATOM", "HETATM")):
+                                    continue
+                                try:
+                                    _cc.append([float(_ll[30:38]),
+                                                float(_ll[38:46]),
+                                                float(_ll[46:54])])
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
+                    if _cc:
+                        _m = _np3.mean(_cc, axis=0)
+                        return float(_m[0]), float(_m[1]), float(_m[2])
+                    return None
+
+                if _mode == "Manual":
+                    _cx3 = float(st.session_state.get("dock_man_cx", 0.0))
+                    _cy3 = float(st.session_state.get("dock_man_cy", 0.0))
+                    _cz3 = float(st.session_state.get("dock_man_cz", 0.0))
+                elif _mode == "Reference ligand" and _ref_pdb3 and os.path.exists(str(_ref_pdb3)):
+                    _ctr = _centroid_of_pdb(_ref_pdb3)
+                    if _ctr:
+                        _cx3, _cy3, _cz3 = _ctr
+                else:
+                    # Protein centre (blind docking) — geometric centroid of receptor
+                    _ctr = _centroid_of_pdb(_rec3_path)
+                    if _ctr:
+                        _cx3, _cy3, _cz3 = _ctr
+
+                # Persist the resolved centre so the docking command can use it.
+                st.session_state["_dock_center"] = (_cx3, _cy3, _cz3)
+                # Any resolved centre (ref / protein / manual) is now valid —
+                # only fall back to ACD auto when we truly have nothing.
+                st.session_state["_dock_has_ref"] = any(
+                    abs(v) > 1e-6 for v in (_cx3, _cy3, _cz3))
 
                 # ── Protein cartoon ──────────────────────────────────────────
                 _v3.addModel(open(_rec3_path).read(), "pdb")
@@ -3358,7 +3434,7 @@ elif step == 5:
                     f"🔵 Cyan box = search space ({int(bx)}×{int(by)}×{int(bz)} Å)  ·  "
                     f"🟣 Magenta = reference ligand  ·  "
                     f"⬜ White = pocket residues inside box  ·  "
-                    f"Center ({_cx3:.1f}, {_cy3:.1f}, {_cz3:.1f})"
+                    f"Centre [{_mode}] ({_cx3:.1f}, {_cy3:.1f}, {_cz3:.1f})"
                 )
             except ImportError:
                 st.info("Install `py3Dmol` to enable the 3D viewer.")
@@ -3392,6 +3468,14 @@ elif step == 5:
                     f'<div style="font-size:0.85rem;color:#8B7355;">'
                     f'⏳ Running AutoDock Vina on <strong>{compound}</strong>…</div>',
                     unsafe_allow_html=True)
+                # Resolve docking centre. The setup viewer stores a resolved
+                # centre (reference ligand, protein centroid, or manual). Dock
+                # with an explicit manual centre when we have one; otherwise
+                # let ACD auto-detect.
+                _dc = st.session_state.get("_dock_center", (0.0, 0.0, 0.0))
+                _dc_valid = st.session_state.get("_dock_has_ref", False) \
+                    and any(abs(v) > 1e-6 for v in _dc)
+
                 cmd = core.build_acd_dock_cmd(
                     receptor=receptor, smiles=smi, name=compound,
                     ph=dock_ph, output_dir=dock_out_dir,
@@ -3399,6 +3483,8 @@ elif step == 5:
                     exhaustiveness=exhaustiveness,
                     num_poses=num_poses,
                     box_x=bx, box_y=by, box_z=bz,
+                    center="manual" if _dc_valid else "auto",
+                    cx=_dc[0], cy=_dc[1], cz=_dc[2],
                 )
                 # Show command for first compound (debug)
                 if i == 0:
