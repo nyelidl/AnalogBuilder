@@ -22,6 +22,39 @@ import streamlit as st
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
 
+# ── Make the pip-bundled OpenBabel binary discoverable ───────────────────────
+# The openbabel pip wheel ships its own `obabel` binary + data files under
+# site-packages/openbabel/bin (and the matching _openbabel.so).  Unlike the
+# apt package it is NOT placed on PATH, so shutil.which("obabel") would miss
+# it.  Add that bin dir to PATH and point BABEL_* at the wheel's data so the
+# binary and the Python binding use one consistent OpenBabel 3.2.0 install
+# (mixing apt 3.1.1 + pip 3.2.0 previously aborted with a glibc malloc error).
+def _setup_bundled_openbabel() -> None:
+    try:
+        import glob as _glob
+        import openbabel as _ob
+        _ob_root = os.path.dirname(_ob.__file__)
+        _ob_bin  = os.path.join(_ob_root, "bin")
+        if os.path.isdir(_ob_bin) and _ob_bin not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = _ob_bin + os.pathsep + os.environ.get("PATH", "")
+
+        # Data lives in a versioned subdir, e.g. share/openbabel/3.2.0
+        _data_globs = _glob.glob(os.path.join(_ob_root, "share", "openbabel", "*"))
+        _data_dirs  = [d for d in _data_globs if os.path.isdir(d)]
+        if _data_dirs:
+            os.environ.setdefault("BABEL_DATADIR", sorted(_data_dirs)[-1])
+
+        # Format/plugin .so files live in lib/openbabel/<ver>
+        _lib_globs = _glob.glob(os.path.join(_ob_root, "lib", "openbabel", "*"))
+        _lib_dirs  = [d for d in _lib_globs if os.path.isdir(d)]
+        if _lib_dirs:
+            os.environ.setdefault("BABEL_LIBDIR", sorted(_lib_dirs)[-1])
+    except Exception:
+        # openbabel python binding not importable — obabel may still be on PATH
+        pass
+
+_setup_bundled_openbabel()
+
 # ── Version guard: ensure Analog Designer core.py is loaded, not ACD core ────
 import importlib.util as _iutil, sys as _sys
 _core_spec = _iutil.find_spec("core")
