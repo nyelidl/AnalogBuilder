@@ -30,27 +30,43 @@ from rdkit.Chem import AllChem, Draw
 # binary and the Python binding use one consistent OpenBabel 3.2.0 install
 # (mixing apt 3.1.1 + pip 3.2.0 previously aborted with a glibc malloc error).
 def _setup_bundled_openbabel() -> None:
+    """Put the pip-bundled `obabel` binary on PATH and point BABEL_* at its
+    matching data, WITHOUT importing the openbabel Python module.
+
+    Importing `openbabel` here would load its shared libs into the same
+    process as RDKit and break `rdkit.Chem.Draw` on Python 3.14.  We only
+    need the binary (for `acd`) and the env vars (inherited by subprocesses
+    such as `acd` and `plipcmd`), so we resolve the package directory from
+    the filesystem via importlib's spec — which does not execute/import it.
+    """
     try:
         import glob as _glob
-        import openbabel as _ob
-        _ob_root = os.path.dirname(_ob.__file__)
-        _ob_bin  = os.path.join(_ob_root, "bin")
+        import importlib.util as _ilu
+        _spec = _ilu.find_spec("openbabel")
+        if _spec is None:
+            return
+        # spec.origin -> .../openbabel/__init__.py ; take its parent dir.
+        if _spec.origin and os.path.basename(_spec.origin) == "__init__.py":
+            _ob_root = os.path.dirname(_spec.origin)
+        elif _spec.submodule_search_locations:
+            _ob_root = list(_spec.submodule_search_locations)[0]
+        else:
+            return
+
+        _ob_bin = os.path.join(_ob_root, "bin")
         if os.path.isdir(_ob_bin) and _ob_bin not in os.environ.get("PATH", "").split(os.pathsep):
             os.environ["PATH"] = _ob_bin + os.pathsep + os.environ.get("PATH", "")
 
-        # Data lives in a versioned subdir, e.g. share/openbabel/3.2.0
-        _data_globs = _glob.glob(os.path.join(_ob_root, "share", "openbabel", "*"))
-        _data_dirs  = [d for d in _data_globs if os.path.isdir(d)]
+        _data_dirs = sorted(d for d in _glob.glob(os.path.join(_ob_root, "share", "openbabel", "*"))
+                            if os.path.isdir(d))
         if _data_dirs:
-            os.environ.setdefault("BABEL_DATADIR", sorted(_data_dirs)[-1])
+            os.environ.setdefault("BABEL_DATADIR", _data_dirs[-1])
 
-        # Format/plugin .so files live in lib/openbabel/<ver>
-        _lib_globs = _glob.glob(os.path.join(_ob_root, "lib", "openbabel", "*"))
-        _lib_dirs  = [d for d in _lib_globs if os.path.isdir(d)]
+        _lib_dirs = sorted(d for d in _glob.glob(os.path.join(_ob_root, "lib", "openbabel", "*"))
+                           if os.path.isdir(d))
         if _lib_dirs:
-            os.environ.setdefault("BABEL_LIBDIR", sorted(_lib_dirs)[-1])
+            os.environ.setdefault("BABEL_LIBDIR", _lib_dirs[-1])
     except Exception:
-        # openbabel python binding not importable — obabel may still be on PATH
         pass
 
 _setup_bundled_openbabel()
@@ -3661,8 +3677,19 @@ elif step == 5:
             _plot_df = _plot_df.sort_values("top_BE (kcal/mol)").reset_index(drop=True)
 
             if not _plot_df.empty:
-                import matplotlib.pyplot as _plt
-                import io as _io
+                try:
+                    import matplotlib
+                    matplotlib.use("Agg")  # headless backend for Streamlit Cloud
+                    import matplotlib.pyplot as _plt
+                    import io as _io
+                    _mpl_ok = True
+                except Exception as _mpl_err:
+                    _mpl_ok = False
+                    st.info("📊 Score plot needs matplotlib (add `matplotlib` to "
+                            "requirements.txt). Showing the table above instead — "
+                            f"({_mpl_err}).")
+
+            if not _plot_df.empty and _mpl_ok:
 
                 _n    = len(_plot_df)
                 _names  = _plot_df["compound"].tolist()
