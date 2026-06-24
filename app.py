@@ -1121,7 +1121,10 @@ if step == 1:
         smiles = st.text_input("SMILES string",
             key="smiles_in_pc", help="Auto-filled from PubChem search, or paste your own SMILES here.")
         st.session_state.parent_smiles = smiles
-        name = st.text_input("Compound name", value=st.session_state.parent_name, key="pc_compound_name")
+        # Same pattern as smiles_in_pc: initialise via session_state only.
+        if "pc_compound_name" not in st.session_state:
+            st.session_state["pc_compound_name"] = st.session_state.parent_name or ""
+        name = st.text_input("Compound name", key="pc_compound_name")
         hint("Used to label your output files.")
         _render_step1_receptor_and_continue(smiles, name)
 
@@ -3495,7 +3498,10 @@ elif step == 5:
                 if rc != 0:
                     any_fail = True
                     if i == 0:
-                        st.error(f"❌ First compound failed (exit {rc}):\n```\n{output[-800:]}\n```")
+                        st.error(f"❌ First compound failed (exit {rc}). "
+                                 f"Full ACD log below.")
+                        with st.expander("🪵 Full ACD log (first compound)", expanded=True):
+                            st.code(output or "(no output captured)", language="text")
                 summary = core.summarize_docking_for_compound(
                     out_dir=dock_out_dir, compound=compound, smiles=smi,
                     ref_mol=ref_mol, ref_pdb_path=ref_pdb)
