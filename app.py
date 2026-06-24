@@ -93,6 +93,14 @@ except ImportError:
     _fpa    = None
     _FPA_OK = False
 
+# PubChem vendor search (local/Colab only — blocked on Streamlit Cloud)
+try:
+    import pubchem_vendor_search as _pvs
+    _PVS_OK = True
+except ImportError:
+    _pvs    = None
+    _PVS_OK = False
+
 # Logo
 LOGO_URL = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/AB.svg"
 LB_URL   = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/.fig/LB.svg"
@@ -1688,6 +1696,113 @@ elif step == 3 and mode == "ligand":
                     _ci = _efl.cache_info()
                     st.caption(f"💾 {_ci['files']} files · {_ci['total_mb']:.1f} MB")
 
+        # ── PubChem Vendor Fragment Search ─────────────────────────────────────
+        st.markdown("### 🏪 PubChem Fragment + Vendor Search")
+        if not _PVS_OK:
+            st.caption("ℹ️ `pubchem_vendor_search.py` not found — add to app folder.")
+        else:
+            _pvs_note = (
+                "🌐 Search PubChem for real purchasable fragments similar to your "
+                "built-in suggestions. Returns compound + **vendor catalog links** "
+                "(Sigma-Aldrich, Enamine, Combi-Blocks, etc.)."
+            )
+            info_card(_pvs_note)
+
+            _pvs_col1, _pvs_col2 = st.columns([2, 1])
+            with _pvs_col1:
+                _pvs_query = st.text_input(
+                    "Fragment SMILES to search",
+                    value="[*]c1ccncc1",
+                    placeholder="[*]c1ccncc1  (4-pyridinyl)",
+                    key="pvs_query",
+                    help="Enter a fragment SMILES with [*] attachment point"
+                )
+                _pvs_thresh = st.slider("Tanimoto similarity %", 50, 95, 70, 5, key="pvs_thresh")
+                _pvs_ro3    = st.checkbox("Rule-of-3 filter (MW≤300)", value=True, key="pvs_ro3")
+                _pvs_max    = st.slider("Max results", 5, 30, 10, 5, key="pvs_max")
+
+            with _pvs_col2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                _pvs_vendor = st.checkbox("Fetch vendor info", value=True, key="pvs_vendor",
+                                          help="Slower (~0.25s/compound) but gives catalog links")
+                _pvs_btn = st.button("🔍 Search PubChem", type="primary", key="pvs_search_btn")
+
+            if _pvs_btn and _pvs_query.strip():
+                _pvs_prog = st.progress(0.0, text="Searching PubChem…")
+                def _pvs_cb(done, total):
+                    _pvs_prog.progress(min(1.0, done/max(total,1)),
+                                       text=f"Processing {done}/{total} hits…")
+                with st.spinner("Querying PubChem similarity search…"):
+                    try:
+                        _pvs_results = _pvs.search_fragments_with_vendors(
+                            frag_smiles=_pvs_query.strip(),
+                            threshold=_pvs_thresh,
+                            max_results=_pvs_max,
+                            apply_ro3=_pvs_ro3,
+                            fetch_vendor_info=_pvs_vendor,
+                            progress_cb=_pvs_cb,
+                        )
+                        st.session_state["_pvs_results"] = _pvs_results
+                        _pvs_prog.empty()
+                    except Exception as _pvse:
+                        _pvs_prog.empty()
+                        if "403" in str(_pvse) or "Forbidden" in str(_pvse):
+                            st.warning(
+                                "⚠️ PubChem blocked on this server. "
+                                "Run the **local version** to use PubChem vendor search."
+                            )
+                        else:
+                            st.error(f"PubChem search failed: {_pvse}")
+
+            _pvs_res = st.session_state.get("_pvs_results", [])
+            if _pvs_res:
+                st.markdown(f"**{len(_pvs_res)} fragments found** — click to add to generation pool:")
+                _pvs_rows = _pvs.format_vendor_table(_pvs_res)
+                _pvs_df = pd.DataFrame(_pvs_rows)
+
+                # Colour preferred vendors
+                def _pvs_style(val):
+                    return "background-color:#E6F4EA;color:#1E7E34" if val == "✅" else ""
+
+                _pvs_show = ["SMILES","Name","MW","LogP","HBD/HBA","Vendors","Top vendor","✓ Preferred","PubChem"]
+                st.dataframe(
+                    _pvs_df[[c for c in _pvs_show if c in _pvs_df.columns]].style.map(
+                        _pvs_style, subset=["✓ Preferred"]),
+                    hide_index=True, width='stretch', height=280
+                )
+
+                # Add selected to generation pool
+                if st.button("➕ Add all to fragment pool", key="pvs_add_btn"):
+                    _pvs_new = [
+                        {"smiles": r["SMILES"], "category": "aromatic",
+                         "mw": r["MW"], "source": "pubchem",
+                         "vendor_url": r.get("Vendor URL",""), "cid": r["CID"]}
+                        for r in _pvs_rows
+                        if r.get("SMILES") and Chem.MolFromSmiles(r["SMILES"])
+                    ]
+                    existing = st.session_state.get("_pvs_pool", [])
+                    seen_smi = {f["smiles"] for f in existing}
+                    added = [f for f in _pvs_new if f["smiles"] not in seen_smi]
+                    st.session_state["_pvs_pool"] = existing + added
+                    st.success(f"✅ Added {len(added)} PubChem fragments to pool")
+
+                _pvs_pool = st.session_state.get("_pvs_pool", [])
+                if _pvs_pool:
+                    st.caption(f"📦 PubChem pool: {len(_pvs_pool)} fragments ready for generation")
+
+                # Per-compound vendor expander
+                st.markdown("**Vendor details per compound:**")
+                for r in _pvs_res[:5]:
+                    if not r.get("vendors"): continue
+                    with st.expander(f"CID {r['cid']} — {r['name'][:40]} | {len(r['vendors'])} vendors"):
+                        for v in r["vendors"]:
+                            star = "⭐" if v["is_preferred"] else "·"
+                            if v.get("url"):
+                                st.markdown(f"{star} **{v['vendor']}** — `{v['catalog_id']}` "
+                                           f"[Order →]({v['url']})")
+                            else:
+                                st.markdown(f"{star} **{v['vendor']}** — `{v['catalog_id']}`")
+
         st.markdown("**Custom fragments** — one SMILES with `[*]` per line")
         st.session_state.custom_frags_text = st.text_area(
             "Custom fragments", value=st.session_state.custom_frags_text,
@@ -2682,6 +2797,24 @@ elif step == 4:
         chosen = _custom_frags   # replace entire library with user fragments
     else:
         chosen.extend(_custom_frags)   # append custom to library
+
+    # ── Merge PubChem vendor fragments if fetched ────────────────────────────────
+    _pvs_pool_raw = st.session_state.get("_pvs_pool", [])
+    if _pvs_pool_raw and not _custom_only:
+        _pvs_conv = []
+        for _pf in _pvs_pool_raw:
+            _pf_smi = f"[*]{_pf['smiles']}"
+            if Chem.MolFromSmiles(_pf_smi):
+                _pvs_conv.append(core.Frag(
+                    name=f"PC_{_pf.get('cid','?')}",
+                    smiles=_pf_smi,
+                    category=_pf.get("category","aromatic"),
+                    goal=core.G(),
+                ))
+        if _pvs_conv:
+            _exist = {f.name for f in chosen}
+            chosen.extend(f for f in _pvs_conv if f.name not in _exist)
+            hint(f"🏪 {len(_pvs_conv)} PubChem vendor fragments added to pool.")
 
     # ── Merge external fragments (ChEMBL / ZINC) if fetched ──────────────────
     _efl_raw = st.session_state.get("_efl_fragments", [])
