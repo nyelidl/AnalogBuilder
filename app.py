@@ -71,28 +71,12 @@ def _setup_bundled_openbabel() -> None:
 
 _setup_bundled_openbabel()
 
-# ── Version guard: ensure Analog Designer core.py is loaded, not ACD core ────
-import importlib.util as _iutil, sys as _sys
-_core_spec = _iutil.find_spec("core")
-if _core_spec:
-    _core_check_path = _core_spec.origin
-    try:
-        with open(_core_check_path, errors="ignore") as _cf:
-            _core_ok = "CATEGORY_BASE_GOALS" in _cf.read(5000)
-    except Exception:
-        _core_ok = False
-    if not _core_ok:
-        import urllib.request as _ur, os as _os
-        _raw = "https://raw.githubusercontent.com/nyelidl/AnalogBuilder/main/core.py"
-        try:
-            _ur.urlretrieve(_raw, _core_check_path)
-            # Force reimport
-            if "core" in _sys.modules:
-                del _sys.modules["core"]
-        except Exception:
-            pass  # will fail with the AttributeError — tells user to push core.py
-
 import core
+if not hasattr(core, "CATEGORY_BASE_GOALS"):
+    raise ImportError(
+        "The wrong 'core' module was imported. Run AnalogBuilder from its own "
+        "directory, or install it as a package (see P3-1)."
+    )
 # components imported via st.iframe
 
 # Module 2: ChemBERTa pocket-aware fragment ranker
@@ -647,7 +631,7 @@ def tier_badge_html(tier: str) -> str:
     if tier == "docking":
         return '<span class="tier-badge tier-docking">✅ Full: Docking + pKaNET + SMI</span>'
     elif tier == "pkanet":
-        return '<span class="tier-badge tier-pkanet">⚡ pKaNET + SMI (no docking)</span>'
+        return '<span class="tier-badge tier-pkanet">⚡ pKaNET + SMI + remote docking</span>'
     else:
         return '<span class="tier-badge tier-smi-only">📄 SMI only</span>'
 
@@ -1525,7 +1509,7 @@ elif step == 3 and mode == "ligand":
         elif _tier_preview == "pkanet":
             hint("21–200 analogs → Download SMI + pKaNET protonation/3D conversion.")
         else:
-            hint("> 200 analogs → SMI download only (too many for docking or 3D).")
+            hint("> 200 analogs → SMI download; reduce the set for remote docking.")
 
         st.markdown("### How adventurous?")
         risk_map = {
@@ -2979,7 +2963,7 @@ elif step == 4:
     # ── Tier info banner ────────────────────────────────────────────────────
     tier_msgs = {
         "docking":  f"✅ <strong>{n_analogs} analogs generated</strong> — Docking, pKaNET 3D conversion, and SMI download available.",
-        "pkanet":   f"⚡ <strong>{n_analogs} analogs generated</strong> — SMI download and pKaNET protonation/3D conversion available. Docking is available for ≤ 20 analogs.",
+        "pkanet":   f"⚡ <strong>{n_analogs} analogs generated</strong> — SMI download and pKaNET protonation/3D conversion available. Local CLI docking is available for ≤ 20 analogs; remote docking is available in Step 5.",
         "smi_only": f"📄 <strong>{n_analogs} analogs generated</strong> — SMI download only. Reduce to ≤ 200 for pKaNET, or ≤ 20 for docking.",
     }
     info_card(tier_msgs[tier])
@@ -3136,6 +3120,11 @@ elif step == 4:
                 go(len(steps))
 
 
+    if tier != "docking":
+        if st.button("Remote docking →", type="primary", key="remote_dock_navigation"):
+            go(5)
+        st.caption("Remote docking is available in Step 5; the 20-analog limit applies to the local CLI.")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 5 – Docking & cIFP
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3146,9 +3135,13 @@ elif step == 5:
         st.warning("No analogs yet. Go back to Step 4.")
         st.stop()
 
-    # ── Guard: tier check ────────────────────────────────────────────────────
+    backend = st.radio("Docking backend", ["Anyone Can Dock MCP (remote)", "Local ACD CLI"],
+                       key="docking_backend")
+    _use_mcp = backend == "Anyone Can Dock MCP (remote)"
+
+    # ── Guard: local CLI tier check ──────────────────────────────────────────
     n_a = len(df_analogs)
-    if analog_tier(n_a) != "docking":
+    if not _use_mcp and analog_tier(n_a) != "docking":
         st.warning(
             f"You have **{n_a} analogs** — docking is only available for ≤ 20 analogs. "
             f"Go back to Step 3 and reduce the number, or use Download SMI / pKaNET instead."
@@ -3170,22 +3163,26 @@ elif step == 5:
     dock_in   = work / "docking_inputs"
     dock_in.mkdir(parents=True, exist_ok=True)
 
-    info_card("Docking predicts how tightly each designed analog binds to the target protein. "
-              "Requires <strong>Anyone Can Dock</strong> (acd) and <strong>OpenBabel</strong>.")
+    if _use_mcp:
+        info_card("Docking runs on the Anyone Can Dock service. "
+                  "No local ACD or Open Babel installation is needed for Step 5 remote docking.")
+    else:
+        info_card("Docking predicts how tightly each designed analog binds to the target protein. "
+                  "Requires <strong>Anyone Can Dock</strong> (acd) and <strong>OpenBabel</strong>.")
 
-    bcol1, bcol2 = st.columns(2)
-    bcol1.markdown(
-        f'<div style="padding:0.6rem 1rem;border-radius:8px;'
-        f'background:{"#E6F4EA" if acd_ok else "#FDECEA"};'
-        f'color:{"#1E7E34" if acd_ok else "#B00020"};font-size:0.85rem;">'
-        f'{"✅ acd available" if acd_ok else "❌ acd not found — pip install anyonecandock"}</div>',
-        unsafe_allow_html=True)
-    bcol2.markdown(
-        f'<div style="padding:0.6rem 1rem;border-radius:8px;'
-        f'background:{"#E6F4EA" if obabel_ok else "#FDECEA"};'
-        f'color:{"#1E7E34" if obabel_ok else "#B00020"};font-size:0.85rem;">'
-        f'{"✅ obabel available" if obabel_ok else "❌ obabel not found — apt install openbabel"}</div>',
-        unsafe_allow_html=True)
+        bcol1, bcol2 = st.columns(2)
+        bcol1.markdown(
+            f'<div style="padding:0.6rem 1rem;border-radius:8px;'
+            f'background:{"#E6F4EA" if acd_ok else "#FDECEA"};'
+            f'color:{"#1E7E34" if acd_ok else "#B00020"};font-size:0.85rem;">'
+            f'{"✅ acd available" if acd_ok else "❌ acd not found — pip install anyonecandock"}</div>',
+            unsafe_allow_html=True)
+        bcol2.markdown(
+            f'<div style="padding:0.6rem 1rem;border-radius:8px;'
+            f'background:{"#E6F4EA" if obabel_ok else "#FDECEA"};'
+            f'color:{"#1E7E34" if obabel_ok else "#B00020"};font-size:0.85rem;">'
+            f'{"✅ obabel available" if obabel_ok else "❌ obabel not found — apt install openbabel"}</div>',
+            unsafe_allow_html=True)
 
     # Receptor loader (ligand track)
     if mode == "ligand" and not st.session_state.receptor_path:
@@ -3459,7 +3456,8 @@ elif step == 5:
 
                 # ── Docking box ──────────────────────────────────────────────
                 _c3 = {"x": _cx3, "y": _cy3, "z": _cz3}
-                _d3d = {"w": int(bx), "h": int(by), "d": int(bz)}
+                # Preserve fractional dimensions for the MCP request and viewer.
+                _d3d = {"w": float(bx), "h": float(by), "d": float(bz)}
                 _v3.addBox({"center": _c3, "dimensions": _d3d,
                             "color": "blue", "opacity": 0.06})
                 _v3.addBox({"center": _c3, "dimensions": _d3d,
@@ -3483,7 +3481,7 @@ elif step == 5:
                 _v3.zoom(1.1)
                 show3d(_v3, height=_d3_height)
                 st.caption(
-                    f"🔵 Cyan box = search space ({int(bx)}×{int(by)}×{int(bz)} Å)  ·  "
+                    f"🔵 Cyan box = search space ({bx:g}×{by:g}×{bz:g} Å)  ·  "
                     f"🟣 Magenta = reference ligand  ·  "
                     f"⬜ White = pocket residues inside box  ·  "
                     f"Centre [{_mode}] ({_cx3:.1f}, {_cy3:.1f}, {_cz3:.1f})"
@@ -3494,8 +3492,33 @@ elif step == 5:
                 st.warning(f"3D viewer error: {_ve3}")
     st.divider()
 
-    if acd_ok and obabel_ok and receptor:
-        if st.button("Run docking", type="primary"):
+    if _use_mcp:
+        from docking_mcp_ui import render_mcp_docking
+        render_mcp_docking(
+            receptor=receptor, reference=st.session_state.ref_ligand_path,
+            lig_df=lig_df, out_dir=dock_out_dir, box=(bx, by, bz), ph=dock_ph,
+            exhaustiveness=exhaustiveness, num_modes=num_poses,
+        )
+    elif acd_ok and obabel_ok and receptor:
+        # The pinned local CLI accepts integer boxes; never silently truncate a requested grid.
+        _local_box_valid = all(float(v).is_integer() for v in (bx, by, bz))
+        st.caption("Local CLI requires anyonecandock==1.1.6. The MCP service runs independently of this pin.")
+        import subprocess as _dock_subprocess
+        try:
+            _version_check = _dock_subprocess.run(
+                [shutil.which("acd"), "--version"], text=True, capture_output=True,
+                timeout=5, check=False,
+            )
+            _local_cli_version_ok = (_version_check.returncode == 0
+                                     and "acd 1.1.6 " in _version_check.stdout)
+        except (OSError, _dock_subprocess.TimeoutExpired):
+            _local_cli_version_ok = False
+        if not _local_cli_version_ok:
+            st.warning("The local ACD executable does not match 1.1.6. "
+                       "Use MCP or install this repository's pinned requirements in an isolated environment.")
+        if not _local_box_valid:
+            st.warning("ACD 1.1.6 only accepts integer box dimensions. Use MCP for a fractional box.")
+        if st.button("Run docking", type="primary", disabled=not (_local_box_valid and _local_cli_version_ok)):
             n = len(lig_df)
             progress = st.progress(0.0, text=f"Preparing to dock {n} compounds…")
             status = st.empty()
@@ -3972,7 +3995,7 @@ elif step == 5:
         st.download_button("⬇️ Download compounds.smi", data=smi_path.read_text(),
                            file_name="compounds.smi", mime="text/plain")
 
-    if mode == "structure" and st.session_state.protein_path:
+    if not _use_mcp and mode == "structure" and st.session_state.protein_path:
         st.divider()
         st.markdown("### 🔬 Interaction fingerprints (PLIP / cIFP)")
         hint("Compare binding interactions of parent vs each docked analog.")
@@ -4179,7 +4202,7 @@ elif step == len(steps):
         st.info(
             f"You have **{len(df)} analogs**. "
             "3D generation and pKaNET are available for ≤ 200 analogs, "
-            "and docking for ≤ 20 analogs. "
+            "and local CLI docking for ≤ 20 analogs. Remote docking has its own job limit. "
             "Go back to Step 3 to reduce the count if needed."
         )
 
