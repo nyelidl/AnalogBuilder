@@ -497,6 +497,26 @@ def get_work_dir() -> Path:
     return Path(st.session_state.work_dir)
 
 
+def sync_structure_analysis():
+    """Invalidate structure-derived results when coordinates or ligand change."""
+    import hashlib
+    digest = hashlib.sha256()
+    for key in ("protein_path", "complex_path", "ref_ligand_path"):
+        value = st.session_state.get(key)
+        if value and Path(value).is_file():
+            digest.update(key.encode())
+            digest.update(Path(value).read_bytes())
+    context = digest.hexdigest()
+    if st.session_state.get("_analysis_context") != context:
+        for key, value in {"_plip_df": None, "_plip_tag_counts": {}, "_plip_rec": None,
+                           "_plip_parent_feats": [], "_analog_plip": {}, "_fpocket_pockets": [],
+                           "_fpocket_selected": {}, "_pocket_df_override": None,
+                           "_void_subpockets": [], "_ligand_atoms_for_void": [],
+                           "_pocket_tag_counts": {}, "pocket_frags": []}.items():
+            st.session_state[key] = value
+        st.session_state["_analysis_context"] = context
+
+
 def go(step: int):
     st.session_state.step = step
     st.rerun()
@@ -796,8 +816,8 @@ def _render_step1_receptor_and_continue(smiles: str, name: str):
 # Sidebar – progress tracker
 # ─────────────────────────────────────────────────────────────────────────────
 
-LIGAND_STEPS = ["Parent compound", "Choose atoms", "Design options", "View results", "Docking", "Export"]
-STRUCT_STEPS = ["Parent + receptor", "Choose atoms", "Pocket guidance", "View results", "Docking & cIFP", "Export"]
+LIGAND_STEPS = ["Parent compound", "Choose edit sites", "Design options", "View results", "Docking", "Export"]
+STRUCT_STEPS = ["Parent + receptor", "Choose edit sites", "Pocket guidance", "View results", "Docking & cIFP", "Export"]
 
 
 def render_sidebar():
@@ -883,6 +903,15 @@ def _step_complete(step: int) -> bool:
     if step == 1:
         return st.session_state.parent_mol is not None
     if step == 2:
+        if st.session_state.get("analog_edit_mode", "Append fragments") != "Append fragments":
+            if st.session_state.parent_mol is None:
+                return False
+            from brics_ui import selected_edit
+            try:
+                selected_edit(st.session_state.parent_mol)
+                return True
+            except ValueError:
+                return False
         return len(st.session_state.selected_atoms) > 0
     if step == 3:
         return True
@@ -1230,6 +1259,27 @@ elif step == 2:
         st.warning("Go back to Step 1 and load a compound first.")
         st.stop()
 
+    from brics_ui import EDIT_MODES, render_cut_picker
+    _saved_operation = st.session_state.get("analog_edit_mode", EDIT_MODES[0])
+    _edit_operation = st.radio("Edit operation", EDIT_MODES,
+                               index=EDIT_MODES.index(_saved_operation) if _saved_operation in EDIT_MODES else 0,
+                               key="analog_edit_mode_widget")
+    st.session_state["analog_edit_mode"] = _edit_operation
+    if st.session_state.get("_last_edit_operation") != _edit_operation:
+        st.session_state.analogs_df = None
+        st.session_state["_last_edit_operation"] = _edit_operation
+    if _edit_operation != "Append fragments":
+        st.info("Choose one BRICS bond and which side to retain. Review the cut before continuing.")
+        _brics_ready = render_cut_picker(mol)
+        _back, _next = st.columns([1, 4])
+        with _back:
+            if st.button("← Back"):
+                go(1)
+        with _next:
+            if st.button("Continue →", type="primary", disabled=not _brics_ready):
+                go(3)
+        st.stop()
+
     attachable = core.attachable_atom_indices(mol, carbon_only=False)
     c_only     = core.attachable_atom_indices(mol, carbon_only=True)
 
@@ -1239,6 +1289,7 @@ elif step == 2:
         _ref_lig   = st.session_state.ref_ligand_path or ""
         _cpx_path  = st.session_state.complex_path or ""
 
+        sync_structure_analysis()
         # Auto-run PLIP if not yet done and complex is available
         if (st.session_state.get("_plip_df") is None
                 and _cpx_path and os.path.exists(str(_cpx_path))
@@ -1249,7 +1300,7 @@ elif step == 2:
                         str(_cpx_path), str(get_work_dir() / "plip_step2"), "auto")
                     if _xml:
                         _plip_df_auto = _pa.parse_plip_to_table(_xml)
-                        _tags_auto    = _pa.plip_to_residue_tags(_plip_df_auto)
+                        _tags_auto, _ = _pa.plip_to_residue_tags(_plip_df_auto, core.AA_TAGS)
                         st.session_state["_plip_df"]         = _plip_df_auto
                         st.session_state["_plip_tag_counts"] = _tags_auto
             except Exception:
@@ -1485,8 +1536,12 @@ elif step == 2:
 # ─────────────────────────────────────────────────────────────────────────────
 
 elif step == 3 and mode == "ligand":
-    info_card("These settings control what kinds of groups are added and how the results are ranked. "
-              "The defaults work well — you can leave them and click Generate.")
+    if st.session_state.get("analog_edit_mode", "Append fragments") == "Append fragments":
+        info_card("These settings control what kinds of groups are added and how the results are ranked. "
+                  "The defaults work well — you can leave them and click Generate.")
+    else:
+        info_card("Your BRICS cut was selected in Step 2. Categories and size settings choose replacement fragments; "
+                  "trim ignores the fragment pool. Structural filters still apply, and BRICS ranking is chosen in Step 4.")
 
     col_a, col_b = st.columns(2, gap="large")
 
@@ -1530,12 +1585,17 @@ elif step == 3 and mode == "ligand":
             "Best predicted solubility":           "Solubility (ESOL)",
             "Easiest to synthesise":               "Synthetic feasibility",
         }
-        rank_labels = list(rank_map.keys())
-        current_label = st.session_state.rank_by if st.session_state.rank_by in rank_labels else rank_labels[0]
-        rank_label = st.radio("Sort analogs by", rank_labels,
-                               index=rank_labels.index(current_label))
-        st.session_state.rank_by   = rank_label
-        st.session_state.rank_code = rank_map[rank_label]
+        if st.session_state.get("analog_edit_mode", "Append fragments") == "Append fragments":
+            rank_labels = list(rank_map.keys())
+            current_label = st.session_state.rank_by if st.session_state.rank_by in rank_labels else rank_labels[0]
+            rank_label = st.radio("Sort analogs by", rank_labels,
+                                   index=rank_labels.index(current_label))
+            st.session_state.rank_by   = rank_label
+            st.session_state.rank_code = rank_map[rank_label]
+
+        else:
+            st.caption("BRICS edits use the ranking property selected in Step 4. "
+                       "The fragment-category and structural filters here still apply.")
 
         st.markdown("### Fragment categories")
         hint("Uncheck any group types you want to exclude.")
@@ -1649,12 +1709,16 @@ elif step == 3 and mode == "ligand":
             st.session_state.avoid_toxic    = st.checkbox("Remove toxic flags",     value=st.session_state.avoid_toxic)
             st.session_state.max_MW = st.number_input("Max molecular weight (Da)", value=st.session_state.max_MW, step=25.0)
         with adv2:
-            st.markdown("**Goal weights** (must sum to ~100)")
-            w = st.session_state.weights
-            new_w = {}
-            for k in w:
-                new_w[k] = st.slider(k.capitalize(), 0, 100, int(w[k]), step=5, key=f"w_{k}")
-            st.session_state.weights = new_w
+            if st.session_state.get("analog_edit_mode", "Append fragments") == "Append fragments":
+                st.markdown("**Goal weights** (must sum to ~100)")
+                w = st.session_state.weights
+                new_w = {}
+                for k in w:
+                    new_w[k] = st.slider(k.capitalize(), 0, 100, int(w[k]), step=5, key=f"w_{k}")
+                st.session_state.weights = new_w
+
+            else:
+                st.caption("Append-mode goal weights are not used for BRICS edits.")
 
         # ── External Fragment Libraries ───────────────────────────────────────
         st.markdown("### 🌐 External fragment libraries")
@@ -1863,6 +1927,7 @@ elif step == 3 and mode == "ligand":
 # ─────────────────────────────────────────────────────────────────────────────
 
 elif step == 3 and mode == "structure":
+    sync_structure_analysis()
     info_card("We'll analyse which residues are near the binding site and suggest the best functional groups to add.")
 
     # ── Mode B: dock ligand first if not yet done ────────────────────────────
@@ -2238,11 +2303,12 @@ elif step == 3 and mode == "structure":
     else:
         st.warning("No receptor file found. Go back to Step 1 and load a receptor.")
 
+    sync_structure_analysis()
     # ── PLIP interaction analysis ───────────────────────────────────────────
     if st.session_state.complex_path and os.path.exists(str(st.session_state.complex_path)):
         st.divider()
         st.markdown("### 🔬 Protein–Ligand Interaction Analysis (PLIP)")
-        plip_ok = bool(shutil.which("plipcmd") or shutil.which("plip"))
+        plip_ok = bool(_PA_OK and _pa.plip_available())
 
         if not plip_ok:
             st.info(
@@ -2258,19 +2324,22 @@ elif step == 3 and mode == "structure":
                 name = st.session_state.parent_name or "ligand"
 
                 with st.spinner("Running PLIP interaction analysis…"):
+                    xml_path = None
                     if plip_ok:
                         xml_path, err, log = _pa.run_plip_on_complex(
                             cpx, str(work / "plip_out"), name)
                         if xml_path:
                             plip_df = _pa.parse_plip_to_table(xml_path)
                         else:
-                            st.warning(f"PLIP failed: {err} — using distance fallback")
+                            st.warning(f"PLIP analysis failed: {err} — using distance fallback")
+                            with st.expander("PLIP diagnostic log"):
+                                st.code(log or err)
                             plip_df = pd.DataFrame()
                     else:
                         plip_df = pd.DataFrame()
 
                     # Fallback: distance-based cIFP
-                    if plip_df.empty:
+                    if not xml_path:
                         feats = _pa.distance_cifp_features(cpx, cutoff=4.0)
                         st.session_state["_plip_parent_feats"] = feats
                         st.session_state["_plip_df"] = pd.DataFrame(
@@ -2370,26 +2439,42 @@ elif step == 3 and mode == "structure":
 
     # ── fpocket real pocket detection ────────────────────────────────────
     _prot_pdb_fp = (st.session_state.protein_path or
-                    st.session_state.receptor_path or "")
-    _fpocket_available = _FPA_OK if _fpa else False
+                    st.session_state.complex_path or st.session_state.receptor_path or "")
+    _fpocket_available = bool(_fpa and _fpa._find_fpocket())
 
     if _prot_pdb_fp and os.path.exists(str(_prot_pdb_fp)):
         st.divider()
-        st.markdown("### 🕳️ Real pocket detection (fpocket)")
+        st.markdown("### 🕳️ Pocket detection (fpocket)")
 
         if not _fpocket_available:
             info_card(
-                "<strong>fpocket not installed.</strong> "
-                "Install with <code>sudo apt install fpocket</code> (Linux) "
-                "or <code>brew install fpocket</code> (macOS). "
-                "Until then, pocket residues are detected by distance from ligand only."
+                "<strong>fpocket binary is unavailable in this deployment.</strong> "
+                "Pocket detection needs a separate executable; installing Python requirements alone "
+                "does not provide it. Distance-shell analysis remains available below."
             )
+            st.caption("Install a pinned fpocket 4.2.3 build in this app workspace. "
+                       "Requires git, make and a C/C++ compiler; downloads source from GitHub.")
+            if st.button("Install fpocket in app workspace", key="fpocket_install"):
+                import subprocess as _install_sp
+                import sys as _install_sys
+                with st.spinner("Building fpocket 4.2.3…"):
+                    try:
+                        _install = _install_sp.run(
+                            [_install_sys.executable, str(Path(__file__).parent / "scripts/install_fpocket.py")],
+                            capture_output=True, text=True, timeout=450)
+                        if _install.returncode == 0:
+                            st.rerun()
+                        else:
+                            st.error("fpocket installation failed. See the build log below.")
+                            st.code((_install.stdout + _install.stderr)[-16000:])
+                    except (_install_sp.TimeoutExpired, OSError) as exc:
+                        st.error(f"fpocket installation could not finish: {exc}")
         else:
             info_card(
                 "fpocket uses <strong>Voronoi tessellation + alpha-sphere algorithm</strong> "
-                "to detect all druggable pockets — no ligand needed. "
+                "to detect candidate cavities — no ligand needed. "
                 "The pocket <strong>nearest to the co-crystal ligand</strong> is auto-selected "
-                "for void analysis and ML fragment ranking."
+                "for void analysis and rule-based fragment ranking."
             )
 
             _fp_c1, _fp_c2 = st.columns([3, 1])
@@ -2399,7 +2484,15 @@ elif step == 3 and mode == "structure":
             with _fp_c2:
                 st.markdown("<br>", unsafe_allow_html=True)
                 if st.button("🔍 Run fpocket", type="primary", key="fpocket_run_btn"):
-                    _lig_atoms_fp = st.session_state.get("_ligand_atoms_for_void", [])
+                    _lig_atoms_fp = []
+                    if st.session_state.ref_ligand_path and os.path.exists(str(st.session_state.ref_ligand_path)):
+                        _ref_prot, _ref_het = core.read_complex_atoms_for_pocket(str(st.session_state.ref_ligand_path))
+                        _lig_atoms_fp = _ref_het or _ref_prot
+                    elif st.session_state.complex_path:
+                        _, _lig_atoms_fp = core.read_complex_atoms_for_pocket(str(st.session_state.complex_path))
+                    st.session_state["_ligand_atoms_for_void"] = _lig_atoms_fp
+                    for _key in ("_fpocket_pockets", "_fpocket_selected", "_pocket_df_override"):
+                        st.session_state.pop(_key, None)
                     with st.spinner("Running fpocket pocket detection…"):
                         _fp_res_df, _fp_all, _fp_sel, _fp_msg = _fpa.fpocket_pocket_analysis(
                             _prot_pdb_fp,
@@ -2408,6 +2501,7 @@ elif step == 3 and mode == "structure":
                             min_sphere=_fp_min,
                             max_sphere=_fp_max,
                         )
+                    st.session_state["_fpocket_pockets"] = _fp_all
                     if _fp_res_df is not None and not _fp_res_df.empty:
                         st.session_state["_fpocket_pockets"]    = _fp_all
                         st.session_state["_fpocket_selected"]   = _fp_sel
@@ -2436,8 +2530,8 @@ elif step == 3 and mode == "structure":
                     "":                  "✅ selected" if p.get("pocket_id") == _fp_sel_id else "",
                 } for p in _fp_cached]
                 st.dataframe(pd.DataFrame(_fp_rows), hide_index=True, width='stretch')
-                hint("Druggability ≥ 0.5 indicates a well-defined druggable pocket. "
-                     "The selected pocket's residues are used for void analysis and ChemBERTa ML ranking.")
+                hint("Scores are fpocket estimates, not evidence of binding. "
+                     "The selected cavity supplies residues for void analysis; this does not implement SINCHO/P2C.")
 
                 # Override button — let user pick a different pocket
                 _alt_ids = [f"Pocket {p['pocket_id']}" for p in _fp_cached]
@@ -2451,7 +2545,7 @@ elif step == 3 and mode == "structure":
                         _new_sel = next(p for p in _fp_cached
                                         if p["pocket_id"] == _override_id)
                         st.session_state["_fpocket_selected"]   = _new_sel
-                        st.session_state["_pocket_df_override"] = _fpa.pocket_residues_df(_new_sel)
+                        st.session_state["_pocket_df_override"] = _fpa.pocket_residues_df(_new_sel, st.session_state.get("_ligand_atoms_for_void"))
                         st.rerun()
 
     # ── Void / unoccupied space analysis ─────────────────────────────────
@@ -2482,7 +2576,7 @@ elif step == 3 and mode == "structure":
                     _fp_ov = st.session_state.get("_pocket_df_override")
                     if _fp_ov is not None and not _fp_ov.empty:
                         p_df = _fp_ov.copy()
-                        g_df = _fp_ov.copy()
+                        g_df = _fp_ov[_fp_ov["is_noncontact_growth_residue"]].copy()
                         st.caption("ℹ️ Using fpocket-detected pocket residues for void analysis.")
                     # Store ligand atoms for fpocket (used if fpocket runs later)
                     if lig_atoms:
@@ -2787,6 +2881,12 @@ elif step == 3 and mode == "structure":
 
 elif step == 4:
     mol = st.session_state.parent_mol
+    _edit_operation = st.session_state.get("analog_edit_mode", "Append fragments")
+    if _edit_operation != "Append fragments":
+        from brics_ui import render_generation_controls, generation_key
+        from brics_editor import generate_brics_analogs
+        _brics_edit, _brics_rank, _brics_cap = render_generation_controls(mol, _edit_operation)
+
 
     size_cap = {"Conservative": 4, "Moderate": 8, "Exploratory": 14}[st.session_state.risk]
     active_lib = [
@@ -2903,7 +3003,7 @@ elif step == 4:
         and (allow_het or mol.GetAtomWithIdx(s).GetAtomicNum() == 6)
     ]
 
-    if not valid_sites:
+    if not valid_sites and _edit_operation == "Append fragments":
         st.error("No valid attachment sites. Go back to Step 2 and select atoms.")
         if st.button("← Back to atom selection"):
             go(2)
@@ -2924,32 +3024,67 @@ elif step == 4:
         "epoxide":           st.session_state.avoid_toxic,
     }
 
+    if _edit_operation != "Append fragments":
+        _brics_config = generation_key(
+            mol, _brics_edit, _edit_operation, chosen, _brics_rank, _brics_cap,
+            st.session_state.max_MW, st.session_state.n_analogs, avoid_opts,
+        )
+        if st.session_state.get("_brics_generation_key") != _brics_config:
+            st.session_state.analogs_df = None
+            st.session_state["_brics_generation_key"] = _brics_config
+
     if st.session_state.analogs_df is None:
-        if _custom_only:
+        if _edit_operation != "Append fragments":
+            _spinner_msg = f"Generating {_edit_operation} products at {_brics_edit.key}…"
+        elif _custom_only:
             _spinner_msg = f"Generating analogs from {len(chosen)} custom fragment(s) — all rules bypassed…"
         else:
             _spinner_msg = f"Generating up to {st.session_state.n_analogs} analogs from {len(chosen):,} fragments…"
         with st.spinner(_spinner_msg):
-            df = core.generate_analogs(
-                mol,
-                selected_atoms=list(selected),
-                chosen_frags=chosen,
-                site_groups=site_groups,
-                # Custom-only: no weights, no MW filter, no avoid rules, no cap
-                weights=({k: 1.0 for k in weights} if _custom_only else weights),
-                avoid_opts=({k: False for k in avoid_opts} if _custom_only else avoid_opts),
-                max_MW=(9999 if _custom_only else st.session_state.max_MW),
-                max_analogs=(999999 if _custom_only else st.session_state.n_analogs),
-                rank_by=("none" if _custom_only else st.session_state.get("rank_code", "Balanced (100-pt weights)")),
-            )
+            if _edit_operation != "Append fragments":
+                _brics_progress = st.progress(0.0, text="Testing BRICS-compatible edits…")
+                def _update_brics(done, total):
+                    _brics_progress.progress(done / max(1, total), text=f"BRICS attempts: {done} / {total}")
+                try:
+                    df = generate_brics_analogs(
+                        mol, [_brics_edit.key], chosen,
+                        mode="trim" if _edit_operation == "BRICS trim" else "replace",
+                        max_MW=st.session_state.max_MW, max_analogs=st.session_state.n_analogs,
+                        avoid_opts=avoid_opts, max_attempts=_brics_cap, rank_by=_brics_rank,
+                        on_progress=_update_brics,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                    st.stop()
+                _brics_progress.progress(1.0, text="BRICS enumeration finished")
+            else:
+                df = core.generate_analogs(
+                    mol,
+                    selected_atoms=list(selected),
+                    chosen_frags=chosen,
+                    site_groups=site_groups,
+                    # Custom-only: no weights, no MW filter, no avoid rules, no cap
+                    weights=({k: 1.0 for k in weights} if _custom_only else weights),
+                    avoid_opts=({k: False for k in avoid_opts} if _custom_only else avoid_opts),
+                    max_MW=(9999 if _custom_only else st.session_state.max_MW),
+                    max_analogs=(999999 if _custom_only else st.session_state.n_analogs),
+                    rank_by=("none" if _custom_only else st.session_state.get("rank_code", "Balanced (100-pt weights)")),
+                )
         st.session_state.analogs_df = df
-        if _custom_only and df is not None and not df.empty:
+        if _edit_operation == "Append fragments" and _custom_only and df is not None and not df.empty:
             st.info(
                 f"✅ Generated **{len(df)} analogs** from {len(chosen)} custom fragment(s). "
                 "All property filters and goal weights were bypassed."
             )
 
     df = st.session_state.analogs_df
+    if _edit_operation != "Append fragments" and df is not None:
+        with st.expander("BRICS generation counts"):
+            st.json(df.attrs.get("filter_counts", {}))
+        if df.attrs.get("attempt_cap_reached"):
+            st.warning("The replacement-attempt cap was reached. Only the first candidates in the selected pool were tested.")
+        if not df.empty and (df.unspecified_stereocenters + df.unspecified_stereobonds).gt(0).any():
+            st.warning("Some products contain unspecified atom or double-bond stereochemistry. Review their SMILES; stereoisomers were not enumerated.")
 
     if df is None or df.empty:
         st.error("No analogs were generated. Try relaxing your filters in Step 3.")
@@ -2982,7 +3117,8 @@ elif step == 4:
     # ── Filter bar ───────────────────────────────────────────────────────────
     with st.expander("🔍 Filter results"):
         fc1, fc2, fc3 = st.columns(3)
-        mw_max  = fc1.slider("Max MW", 200.0, 900.0, float(df.MW.max()), 10.0)
+        # BRICS trimming can produce compounds below the old 200 Da slider minimum.
+        mw_max  = fc1.slider("Max MW", 0.0, max(900.0, float(df.MW.max())), float(df.MW.max()), 10.0)
         qed_min = fc2.slider("Min QED", 0.0, 1.0, 0.0, 0.05)
         cats_f  = fc3.multiselect("Category", sorted(df.fragment_category.unique()),
                                    default=sorted(df.fragment_category.unique()))
@@ -2994,6 +3130,8 @@ elif step == 4:
 
     with tab_tbl:
         cols_show = ["change", "fragment_category", "MW", "logP", "QED", "ESOL", "SA", "sim", "smiles"]
+        if _edit_operation != "Append fragments":
+            cols_show = ["mode", "cut_bond", "removed_fragment", "fragment_name", "unspecified_stereocenters", "unspecified_stereobonds"] + cols_show
         st.dataframe(df_show[[c for c in cols_show if c in df_show.columns]],
                      width='stretch', height=380, hide_index=True)
 
@@ -4000,7 +4138,7 @@ elif step == 5:
         st.markdown("### 🔬 Interaction fingerprints (PLIP / cIFP)")
         hint("Compare binding interactions of parent vs each docked analog.")
 
-        plip_available = bool(shutil.which("plipcmd") or shutil.which("plip"))
+        plip_available = bool(_PA_OK and _pa.plip_available())
         if not plip_available:
             st.caption("PLIP not installed — using distance-based cIFP as fallback.")
 
@@ -4026,6 +4164,7 @@ elif step == 5:
 
                     feats = []
                     method = "distance"
+                    xml_path = None
                     if plip_available and _PA_OK:
                         xml_path, err, _ = _pa.run_plip_on_complex(
                             cpx, str(work / "plip_cifp" / "plip_out"), p.stem)
@@ -4037,7 +4176,7 @@ elif step == 5:
                             ] if not plip_tbl.empty else []
                             method = "PLIP"
 
-                    if not feats and _PA_OK:
+                    if not xml_path and _PA_OK:
                         feats = _pa.distance_cifp_features(cpx, cutoff=4.0)
 
                     analog_feats_map[p.stem] = feats

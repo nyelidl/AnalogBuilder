@@ -18,54 +18,18 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-# ── Auto-patch PLIP supplemental.py for numpy≥2 compatibility ────────────────
-def _patch_plip_supplemental():
-    """Fix OverflowError: np.uint32(negative) on numpy≥2 in PLIP 2.3.x."""
-    try:
-        import plip.basic.supplemental as _sup
-        import inspect as _insp
-        _src = _insp.getsourcefile(_sup)
-        if _src is None:
-            return
-        with open(_src) as _f:
-            _txt = _f.read()
-        _old = (
-            "    dct = {}\n"
-            "    if int32 == 4294967295:  # Special case in some structures (note, this is just a workaround)\n"
-            "        return -1\n"
-            "    for i in range(-1000, -1):\n"
-            "        dct[np.uint32(i)] = i\n"
-            "    if int32 in dct:\n"
-            "        return dct[int32]\n"
-            "    else:\n"
-            "        return int32"
-        )
-        _new = (
-            "    if int32 == 4294967295:\n"
-            "        return -1\n"
-            "    try:\n"
-            "        if int32 >= 2**31:\n"
-            "            return int(int32) - 2**32\n"
-            "        return int(int32)\n"
-            "    except Exception:\n"
-            "        return int(int32)"
-        )
-        if _old in _txt:
-            with open(_src, 'w') as _f:
-                _f.write(_txt.replace(_old, _new))
-            # Reload the module
-            import importlib as _imp
-            _imp.reload(_sup)
-    except Exception:
-        pass
+import importlib.util
+import subprocess
+import sys
+import tempfile
 
-_patch_plip_supplemental()
-# ─────────────────────────────────────────────────────────────────────────────
 
+def plip_available():
+    """PLIP must be installed in the application's Python environment."""
+    return importlib.util.find_spec("plip") is not None
 
 
 import numpy as np
@@ -120,12 +84,13 @@ def run_plip_on_complex(
     (xml_path, error_msg, log_text)
     xml_path is None if PLIP failed or is not installed.
     """
-    plip_exe = shutil.which("plipcmd") or shutil.which("plip")
-    if plip_exe is None:
-        return None, "PLIP not installed (pip install plip)", ""
+    if not plip_available():
+        return None, "PLIP unavailable in app Python; install requirements.txt", ""
 
-    od = Path(out_dir) / name
-    od.mkdir(parents=True, exist_ok=True)
+    root = Path(out_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    # A fresh directory prevents failed reruns from returning stale XML.
+    od = Path(tempfile.mkdtemp(prefix="plip_", dir=root))
 
     # Verify complex has both protein (ATOM) and ligand (HETATM)
     _has_atom   = False
@@ -149,15 +114,22 @@ def run_plip_on_complex(
             "PLIP needs a protein-ligand complex (both ATOM and HETATM lines)."
         ), ""
 
-    import subprocess
-    cmd = [plip_exe, "-f", str(complex_pdb), "-x", "-o", str(od), "--nohydro"]
-    res = subprocess.run(
-        cmd, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        timeout=120,
-        check=False,
-    )
-    log = res.stdout or ""
+    worker = Path(__file__).with_name("plip_worker.py")
+    cmd = [sys.executable, str(worker), "-f", str(Path(complex_pdb).resolve()),
+           "-x", "-o", str(od)]
+    # Let PLIP add hydrogens: uploaded complexes need not contain them.
+    try:
+        res = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, timeout=120, check=False)
+        log = res.stdout or ""
+    except subprocess.TimeoutExpired as exc:
+        log = exc.stdout or ""
+        if isinstance(log, bytes):
+            log = log.decode(errors="replace")
+        (od / "plip_log.txt").write_text(log)
+        return None, "PLIP timed out after 120 seconds", log
+    except OSError as exc:
+        return None, f"Could not start PLIP: {exc}", str(exc)
     (od / "plip_log.txt").write_text(log)
 
     xmls = sorted(od.glob("*.xml")) + sorted(od.glob("**/*.xml"))
@@ -165,8 +137,14 @@ def run_plip_on_complex(
         # Extract meaningful error from log
         _err_lines = [l for l in log.split("\n") if "ERROR" in l or "error" in l.lower()]
         _err_hint  = _err_lines[-1] if _err_lines else f"exit {res.returncode}"
-        return None, f"PLIP failed: {_err_hint}", log
+        return None, _err_hint, log
 
+    try:
+        report = ET.parse(xmls[0]).getroot()
+        if not any(elem.tag.split("}")[-1] == "bindingsite" for elem in report.iter()):
+            return None, "PLIP recognized no ligand binding site in this complex", log
+    except (ET.ParseError, OSError) as exc:
+        return None, f"PLIP produced an unreadable XML report: {exc}", log
     return str(xmls[0]), None, log
 
 
@@ -203,7 +181,7 @@ def parse_plip_to_table(xml_path: str) -> pd.DataFrame:
     rows = []
     for elem in root.iter():
         tag = elem.tag.split("}")[-1].lower()
-        itype = next((v for k, v in type_map.items() if k in tag), None)
+        itype = next((v for k, v in type_map.items() if k == tag), None)
         if itype is None:
             continue
 
@@ -242,7 +220,8 @@ def parse_plip_to_table(xml_path: str) -> pd.DataFrame:
         })
 
     if not rows:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["type", "chain", "resname", "resnum",
+                                     "residue", "distance_A", "is_key"])
 
     df = pd.DataFrame(rows).drop_duplicates(subset=["type","chain","resname","resnum"])
     return df.sort_values(["is_key","type"], ascending=[False, True]).reset_index(drop=True)

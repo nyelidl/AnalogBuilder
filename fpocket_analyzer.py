@@ -5,7 +5,7 @@ Run fpocket on a protein structure and parse results.
 Identifies the pocket nearest to the co-crystal ligand (if available).
 
 Dependencies:
-  - fpocket binary (auto-installed by setup or via apt/conda)
+  - fpocket binary (installed explicitly with scripts/install_fpocket.py or conda)
   - numpy, pandas (always available)
 
 Main entry points:
@@ -25,12 +25,17 @@ import pandas as pd
 
 # ── Find fpocket binary ───────────────────────────────────────────────────────
 def _find_fpocket() -> Optional[str]:
+    configured = os.environ.get("FPOCKET_BIN")
+    local = Path(__file__).parent / ".tools/fpocket/bin/fpocket"
+    for candidate in (configured, str(local)):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return str(Path(candidate).resolve())
     for name in ("fpocket", "fpocket4", "fpocket3"):
         exe = shutil.which(name)
         if exe:
             return exe
     # Common manual install locations
-    for path in ("/usr/local/bin/fpocket", "/opt/fpocket/bin/fpocket",
+    for path in ("/opt/homebrew/bin/fpocket", "/usr/local/bin/fpocket", "/opt/fpocket/bin/fpocket",
                  str(Path.home() / ".local/bin/fpocket")):
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
@@ -65,56 +70,46 @@ def run_fpocket(
     log:     raw fpocket stdout
     error:   error message string (empty if OK)
     """
-    if not FPOCKET_OK:
-        return [], "", "fpocket not installed. Install with: sudo apt install fpocket"
-
-    protein_pdb = str(protein_pdb)
-    if not os.path.exists(protein_pdb):
-        return [], "", f"Protein PDB not found: {protein_pdb}"
-
-    # fpocket writes output next to the input file — use a temp copy
-    tmp_dir  = tempfile.mkdtemp()
-    pdb_copy = os.path.join(tmp_dir, "protein.pdb")
-    shutil.copy2(protein_pdb, pdb_copy)
-
-    cmd = [
-        FPOCKET_EXE,
-        "-f", pdb_copy,
-        "-m", str(min_sphere),
-        "-M", str(max_sphere),
-    ]
-
+    exe = _find_fpocket()
+    if not exe:
+        return [], "", "fpocket unavailable; run python scripts/install_fpocket.py or conda install -c conda-forge fpocket"
+    if not (0 < min_sphere < max_sphere):
+        return [], "", "Alpha-sphere radii must satisfy 0 < min < max."
+    source = Path(protein_pdb)
+    if not source.is_file():
+        return [], "", f"Protein PDB not found: {source}"
+    if source.suffix.lower() != ".pdb":
+        return [], "", "fpocket requires PDB coordinates; select a protein .pdb, not PDBQT/mmCIF."
+    # Keep each run's results in its own directory: returned paths stay valid,
+    # and a failed run cannot pick up output from an earlier run.
+    root = Path(out_dir).resolve() if out_dir else Path(tempfile.gettempdir())
+    root.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix="fpocket_", dir=root))
+    pdb_copy = run_dir / "protein.pdb"
+    protein_lines = []
+    for line in source.read_text(errors="replace").splitlines(True):
+        if line.startswith("ENDMDL"):
+            break
+        if line.startswith(("ATOM  ", "TER   ")):
+            protein_lines.append(line)
+    if not any(line.startswith("ATOM  ") for line in protein_lines):
+        return [], "", "No protein ATOM records found in input PDB."
+    pdb_copy.write_text("".join(protein_lines) + "END\n")
+    cmd = [exe, "-f", str(pdb_copy), "-m", str(min_sphere), "-M", str(max_sphere)]
     try:
-        res = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, cwd=tmp_dir
-        )
-        log = res.stdout + res.stderr
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=run_dir)
+        log = (res.stdout or "") + (res.stderr or "")
     except subprocess.TimeoutExpired:
         return [], "", f"fpocket timed out after {timeout}s"
-    except Exception as e:
-        return [], "", f"fpocket error: {e}"
-
-    # fpocket writes to protein_out/ relative to the PDB location
-    fp_out = os.path.join(tmp_dir, "protein_out")
-    if not os.path.isdir(fp_out):
+    except OSError as exc:
+        return [], "", f"Could not start fpocket: {exc}"
+    (run_dir / "fpocket_log.txt").write_text(log)
+    if res.returncode:
+        return [], log, f"fpocket exited with status {res.returncode}; inspect the run log."
+    fp_out = run_dir / "protein_out"
+    if not fp_out.is_dir():
         return [], log, "fpocket produced no output directory"
-
-    pockets = _parse_fpocket_output(fp_out)
-
-    # Copy to user-specified out_dir if provided
-    if out_dir:
-        import shutil as _sh
-        os.makedirs(out_dir, exist_ok=True)
-        _sh.copytree(fp_out, os.path.join(out_dir, "fpocket_out"),
-                     dirs_exist_ok=True)
-        # Write pocket PDB paths relative to out_dir
-        for p in pockets:
-            for k in ("atm_pdb", "vert_pdb"):
-                if p.get(k):
-                    rel = os.path.relpath(p[k], tmp_dir)
-                    p[f"{k}_out"] = os.path.join(out_dir, "fpocket_out",
-                                                   os.path.basename(p[k]))
-
+    pockets = _parse_fpocket_output(str(fp_out))
     return pockets, log, ""
 
 
@@ -142,21 +137,22 @@ def _parse_fpocket_output(fp_out: str) -> List[Dict]:
         pid = int(m.group(1))
         residues = _parse_pocket_atm_pdb(str(atm_pdb))
 
-        # Get centroid from residue atoms
-        if residues:
-            xyz = np.array([[r["x"], r["y"], r["z"]] for r in residues])
-            centroid = xyz.mean(axis=0).tolist()
-        else:
-            centroid = [0.0, 0.0, 0.0]
-
-        # Alpha-sphere PDB (pocket vertices)
-        vert_pdb = str(atm_pdb).replace("_atm.pdb", "_vert.pdb")
+        # fpocket 4 writes alpha spheres as PQR, not *_vert.pdb.
+        vert_pdb = next((str(atm_pdb.with_name(atm_pdb.name.replace("_atm.pdb", suffix)))
+                         for suffix in ("_vert.pqr", "_vert.pdb")
+                         if atm_pdb.with_name(atm_pdb.name.replace("_atm.pdb", suffix)).exists()), None)
+        spheres = _parse_pocket_atm_pdb(vert_pdb) if vert_pdb else []
+        points = spheres or residues
+        if not points:
+            continue
+        centroid = np.mean([[r["x"], r["y"], r["z"]] for r in points], axis=0).tolist()
 
         pocket = {
             "pocket_id":          pid,
             "centroid_xyz":       centroid,
             "n_residues":         len(set(f"{r['chain']}{r['resnum']}" for r in residues)),
             "residue_atoms":      residues,
+            "sphere_atoms":       spheres,
             "atm_pdb":            str(atm_pdb),
             "vert_pdb":           vert_pdb if os.path.exists(vert_pdb) else None,
             **scores_by_id.get(pid, {}),
@@ -223,8 +219,8 @@ def _parse_pocket_atm_pdb(atm_pdb: str) -> List[Dict]:
                 atoms.append({
                     "atom_name": line[12:16].strip(),
                     "resname":   line[17:20].strip(),
-                    "chain":     line[21].strip() or "A",
-                    "resnum":    line[22:26].strip(),
+                    "chain":     line[21].strip() or "_",
+                    "resnum":    line[22:26].strip() + line[26:27].strip(),
                     "x": float(line[30:38]),
                     "y": float(line[38:46]),
                     "z": float(line[46:54]),
@@ -244,7 +240,7 @@ def select_ligand_pocket(
     From a list of fpocket pockets, return the one whose centroid is
     closest to the co-crystal ligand centroid.
 
-    Falls back to the top-scored pocket if none within max_dist_A.
+    Return None if no pocket is within max_dist_A; never silently select a remote pocket.
 
     Parameters
     ----------
@@ -277,12 +273,11 @@ def select_ligand_pocket(
 
     if best_dist <= max_dist_A:
         return best
-    # None within threshold — return top scored
-    return pockets[0]
+    return None
 
 
 # ── Build residue DataFrame for selected pocket ───────────────────────────────
-def pocket_residues_df(pocket: Dict) -> pd.DataFrame:
+def pocket_residues_df(pocket: Dict, ligand_atoms=None, contact_cutoff=4.0) -> pd.DataFrame:
     """
     Convert fpocket pocket dict to a residue-level DataFrame
     compatible with the rest of Analog Designer's pocket pipeline.
@@ -313,6 +308,13 @@ def pocket_residues_df(pocket: Dict) -> pd.DataFrame:
     rows = []
     for (chain, resnum, resname), a in seen.items():
         one = AA3_TO_ONE.get(resname, "")
+        res_atoms = [r for r in atoms if (r["chain"], r["resnum"], r["resname"]) == (chain, resnum, resname)]
+        distance = None
+        if ligand_atoms:
+            xyz = np.array([[r["x"], r["y"], r["z"]] for r in res_atoms])
+            lig = np.array([r["xyz"] for r in ligand_atoms])
+            distance = float(np.linalg.norm(xyz[:, None, :] - lig[None, :, :], axis=2).min())
+        contacted = distance is not None and distance <= contact_cutoff
         rows.append({
             "resname":         resname,
             "chain":           chain,
@@ -320,10 +322,10 @@ def pocket_residues_df(pocket: Dict) -> pd.DataFrame:
             "residue_label":   f"{resname}{resnum}:{chain}",
             "aa_one":          one,
             "property_tags":   ",".join(AA_TAGS.get(one, [])) if one else "",
-            "min_dist_to_ligand_A": pocket.get("dist_to_ligand_centroid_A", 0.0),
+            "min_dist_to_ligand_A": distance,
             "is_pocket_residue":   True,
-            "is_contacted":        False,  # fpocket doesn't classify this
-            "is_noncontact_growth_residue": True,
+            "is_contacted":        contacted,
+            "is_noncontact_growth_residue": distance is not None and not contacted,
         })
 
     return pd.DataFrame(rows)
@@ -360,33 +362,12 @@ def fpocket_pocket_analysis(
     if selected is None:
         return None, pockets, {}, "Could not select a pocket near the ligand."
 
-    res_df = pocket_residues_df(selected)
+    res_df = pocket_residues_df(selected, ligand_atoms)
     return res_df, pockets, selected, log
 
 
-# ── Install helper ─────────────────────────────────────────────────────────────
+# Compatibility helper: check only; installation is an explicit setup action.
 def ensure_fpocket_installed() -> Tuple[bool, str]:
-    """
-    Check if fpocket is installed; try to install if not.
-    Returns (success, message).
-    """
-    global FPOCKET_EXE, FPOCKET_OK
-    if FPOCKET_OK:
-        return True, f"fpocket available: {FPOCKET_EXE}"
-
-    import subprocess as _sp
-    # Try apt
-    r = _sp.run(["apt-get", "install", "-y", "-q", "fpocket"],
-                capture_output=True, text=True)
     exe = _find_fpocket()
-    if exe:
-        FPOCKET_EXE = exe
-        FPOCKET_OK  = True
-        return True, f"fpocket installed via apt: {exe}"
-
-    return False, (
-        "fpocket not found. Install with:\n"
-        "  Ubuntu/Debian: sudo apt install fpocket\n"
-        "  macOS:         brew install fpocket\n"
-        "  Build source:  https://github.com/Discngine/fpocket"
-    )
+    return bool(exe), (f"fpocket available: {exe}" if exe else
+                       "Run python scripts/install_fpocket.py or conda install -c conda-forge fpocket")
