@@ -4,40 +4,21 @@ rdkit==2025.9.6
 pandas==3.0.3
 numpy==2.4.6
 matplotlib>=3.8
-# ─────────────────────────────────────────────────────────────────────────────
-# DOCKING (Step 5)
-# anyonecandock auto-downloads the AutoDock Vina 1.2.7 binary at runtime.
-# It needs the `obabel` binary AND (via plip) the openbabel Python binding.
-# We install openbabel from pip ONLY (NOT apt) — the pip wheel bundles a
-# matching obabel binary at openbabel/bin/obabel plus _openbabel.so, so the
-# binary and the Python binding are the same version.  Mixing apt's
-# libopenbabel7 3.1.1 with the pip wheel 3.2.0 caused a glibc malloc abort
-# (SIGABRT, exit 134) during receptor H-addition. packages.txt is now empty.
-# rdkit is pinned <2026 because anyonecandock -> dimorphite-dl needs rdkit<2026.
-# ─────────────────────────────────────────────────────────────────────────────
+
+# Local docking and structure preparation
+# Keep Open Babel installed through pip; do not add it to packages.txt.
 openbabel==3.2.0
 anyonecandock==1.1.6
 gemmi==0.7.5
-# ─────────────────────────────────────────────────────────────────────────────
-# 3D VIEWER (Step 3 + Step 5)
-# py3Dmol renders protein-ligand complexes in browser via WebGL.
-# ─────────────────────────────────────────────────────────────────────────────
+
+# Structure viewer and numerical analysis
 py3Dmol>=2.0.1
 scipy>=1.10
-# ─────────────────────────────────────────────────────────────────────────────
-# PLIP — interaction analysis (Step 3 + Step 5)
-# plip==2.3.0 DOES import the openbabel/pybel Python binding (despite earlier
-# notes to the contrary), so the pip openbabel wheel above is required.
-# Do NOT use plip 3.0.0 — it needs a from-source openbabel build.
-# ─────────────────────────────────────────────────────────────────────────────
+
+# Protein–ligand interaction analysis
+# Requires the new plip_worker.py for NumPy 2 compatibility.
 plip==2.3.0
 lxml>=4.2.1
-# ─────────────────────────────────────────────────────────────────────────────
-# ML fragment ranker (pocket_reference.py — Module 2)
-# transformers + torch removed — tokenizers 0.19 fails to build on Python 3.14
-# (PyO3 0.21 max supported: Python 3.12). Falls back to rule-based scoring.
-# Re-add when Python 3.14 wheels are available on PyPI.
-# ─────────────────────────────────────────────────────────────────────────────
-# transformers>=4.35,<4.45   # blocked: tokenizers build fails on Py3.14
-# torch>=2.0                 # blocked: depends on tokenizers
-# torchvision                # blocked
+
+# Fragment ranking currently uses rule-based scoring.
+# P2C, SINCHO and ChemTSv2 are not integrated yet.
