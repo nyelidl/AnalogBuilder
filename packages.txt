@@ -4,8 +4,6 @@ libxext6
 libxcb1
 libxau6
 libxdmcp6
-
-# Explicit fpocket source build (not available via Debian apt as fpocket)
 build-essential
 git
 libnetcdf-dev
